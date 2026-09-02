@@ -1226,9 +1226,13 @@ Raised from a separate conversation and brought back here for tracking: this ref
 
 - **Root/boot (#1):** Initially considered `tune2fs -U random` + per-node `fstab`/`grub` regeneration on every clone's first boot. Reconsidered once two hardware facts were confirmed: this platform's M.2 NVMe has a **fixed physical slot/BDF with no reseat risk**, and **every node in the rack shares the same unified hardware design**. Given both, `/dev/disk/by-path/pci-0015:01:00.0-nvme-1-part2` is identical *and correct* on every cloned node — unlike UUID, which is identical but meaningless as a per-node identifier. This turns the fix into a **one-time golden-image edit**, not per-node logic:
   ```bash
-  # /etc/fstab - by-path instead of by-uuid for both root and /boot/efi
-  # /etc/default/grub - GRUB_DISABLE_LINUX_UUID=true
+  sudo sed -i \
+    -e 's|/dev/disk/by-uuid/[0-9a-f-]*[[:space:]]*/[[:space:]]|/dev/disk/by-path/pci-0015:01:00.0-nvme-1-part2 /  |' \
+    -e 's|/dev/disk/by-uuid/[0-9A-F-]*[[:space:]]*/boot/efi|/dev/disk/by-path/pci-0015:01:00.0-nvme-1-part1 /boot/efi|' \
+    /etc/fstab
+  sudo sed -i 's/^#GRUB_DISABLE_LINUX_UUID=.*/GRUB_DISABLE_LINUX_UUID=true/' /etc/default/grub
   sudo update-grub
+  grep -q 'root=/dev/disk/by-path' /boot/grub/grub.cfg && echo "OK: by-path root confirmed in grub.cfg"
   ```
   **Confirmed working on this reference node** — post-reboot `/proc/cmdline` shows `root=/dev/nvme0n1p2`, no `UUID=` anywhere. Note: the kernel cmdline shows the resolved device node, not the literal by-path string from `fstab` — that's normal `grub-probe` behavior (resolves the mounted device to its real underlying node), not a sign the by-path config didn't take effect. `/dev/nvme0n1p2`'s own stability (as opposed to `by-path`'s) relies specifically on this platform having exactly one NVMe controller — true here, would need revisiting on a multi-NVMe-controller platform.
   **If the hardware-uniformity assumption ever breaks** (board revision changes M.2 placement, hot-swap bays introduced, a drive physically moved between slots during repair) — this needs to revert to UUID-based addressing with real per-node regeneration.
