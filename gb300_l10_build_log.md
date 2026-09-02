@@ -1,7 +1,7 @@
 # GB300 NVL L10 Reference Layout — Build Log
 
 **Reference:** NVIDIA 2.0 release, GB300 L10 reference layout — MNNVL Bring-Up Guide, Release 1.15
-**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.3.1
+**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.4.4
 
 ## 0. Host Software Components — Version Matrix (source of truth)
 
@@ -16,6 +16,7 @@ Pinned versions per NVIDIA 2.0 release matrix. Confirmed `DOCA_Host` here (3.4.1
 | MFT Tools | `4.36.0-147` |
 | WinOF-2 | `26.4.27095` |
 | DOCA_Host | `3.4.1-010000` |
+| Fabric Manager (GFM) | `580.173.04` |
 | NMX-M | `20v85.1.1100_85.1.1100.pdf` |
 | BF3 (firmware) | `32.49.1118` |
 
@@ -794,6 +795,173 @@ pega@carlonext:~$ sudo mlxconfig -d /dev/mst/mt4131_pciconf0 q | grep -iE 'num_o
 `NUM_OF_PF=2` and `NUM_OF_PLANES_P1=0` confirmed matching the playbook's staged values. CX8 was already Ethernet-mode by default (unlike BF3), so no link-layer flip was needed there — only the parameter values themselves needed confirming.
 
 *Status: complete. Both BF3 and CX8 (all 4 cards) confirmed in Ethernet mode with target config applied, ready for NV L10 partner diagnostics. Open follow-up: fix the CX8 device-discovery regex duplicate-match bug before this playbook is used as the reference version.*
+
+## 14. gb300_l10_sw_checklist.sh — First Full Run + Bugfixes
+
+**Run 1 (as `pega`, no sudo):** `22 OK | 3 NEEDS REVIEW | 12 MISSING`. Several `MISSING` results were false negatives from lacking root — `BMC/BIOS`, `System Product Name`, `IOMMU Enabled`, `MFT Tools Version`, `BF3 Firmware Version` — `dmidecode`/`mst`/`flint` all silently fail without privilege.
+
+**Run 2 (as root):** `26 OK | 2 NEEDS REVIEW | 9 MISSING`. Confirmed:
+- `BMC/BIOS`: `00.56.02`
+- `System Product Name`: `Carlo_Next MaxQ`
+- `MFT Tools Version`: `4.36.0-147` — matches §0/§6a target
+- `BF3 Firmware Version`: `32.49.1118` — matches §11's confirmed flash
+
+**Remaining `MISSING` after root run — expected, matches known open work:** Fabric Manager Service/Version, DCGM Version, Docker/containerd/nvidia-container-toolkit/Default Runtime, `nvcc` (CUDA toolkit — see below).
+
+**`NVSwitch Devices`: still `MISSING`** even as root. Not yet resolved either way — plausibly expected for a single un-racked L10 unit with no switch tray/fabric attached (same reasoning applied elsewhere in this log to IMEX/NVLink), but not confirmed. Flagged as open, not assumed benign.
+
+**Two script bugs found and fixed (now v0.4.2):**
+
+1. **`IOMMU Enabled` — false negative on this platform.** Script checked `dmesg | grep -m1 -i 'IOMMU enabled'`, an x86-style log string that Grace/ARM never emits (SMMU is enabled via ACPI IORT tables, not a boot-time log line). Investigated directly before concluding it was a script bug rather than a real gap:
+   - `dmesg | grep -iE 'smmu|arm.*iommu'` → confirmed 27+ `arm-smmu-v3-pmcg` PMU instances registered across multiple PCIe root complexes (hardware present/probed, but PMCG alone doesn't prove translation is active)
+   - `ls /sys/kernel/iommu_groups/ | wc -l` → **90** populated groups — definitive confirmation IOMMU/SMMU translation is genuinely active and enforcing isolation, not just probed.
+   - Fixed: check now uses the `/sys/kernel/iommu_groups/` population count directly (architecture-agnostic) instead of a platform-specific log string.
+
+2. **`CUDA Version (driver)` — invalid query field.** `nvidia-smi --query-gpu=cuda_version` returned `Field "cuda_version" is not a valid field to query.` on this driver/nvidia-smi build. Fixed: now parses `CUDA Version: X.Y` out of plain `nvidia-smi`'s header output instead of the `--query-gpu` field list.
+
+**Not yet fixed — flagged for follow-up:**
+- **`nvcc (CUDA toolkit)`: `MISSING`.** This is the deferred CUDA verification from §9 finally surfacing a real result: `nvcc` is not on `PATH`. Toolkit installed correctly (`update-alternatives` set `/usr/local/cuda` → `/usr/local/cuda-13.0` per §9), but `/usr/local/cuda/bin` was never added to `PATH`. Fix identified, not yet applied:
+  ```bash
+  echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
+  ```
+- **`MOFED Version` shows `CHECK`** — actual installed value `OFED-internal-26.04-1.0.9` vs. script's `EXPECTED_MOFED="24.10"`. Same stale-matrix pattern as the CUDA 12.8→13.0.2 correction in §0 — `24.10` was never verified against NVOnline 1160245 the way driver/CUDA/DOCA/MFT/BF3-FW were. **Resolved in §17.**
+
+*Status: script bugs fixed (v0.4.2). Real findings (`nvcc` PATH, `EXPECTED_MOFED` staleness, `NVSwitch Devices`) still open, not yet resolved.*
+
+## 15. nvcc PATH Fix (system-wide, for reference hand-off)
+
+**Context:** `nvcc` MISSING in §14's checklist runs. Root cause: `cuda-toolkit-13-0` (§9) correctly set `/usr/local/cuda` → `/usr/local/cuda-13.0` via `update-alternatives`, but never added `/usr/local/cuda/bin` to `PATH`.
+
+**Why not `~/.bashrc`:** since this build is intended as a reference layout for hand-off, a per-user dotfile fix wouldn't apply to other users, root, or non-interactive/scripted shells. Used a system-wide `/etc/profile.d/` drop-in instead:
+
+```bash
+cat <<'EOF' | sudo tee /etc/profile.d/cuda.sh
+export PATH=/usr/local/cuda/bin:$PATH
+EOF
+sudo chmod 644 /etc/profile.d/cuda.sh
+```
+
+**Runtime library check (not just the binary):** confirmed `cuda-cudart`'s install already registered the CUDA lib path with `ldconfig` correctly — no additional `/etc/ld.so.conf.d/` entry needed.
+
+```
+pega@carlonext:~$ ldconfig -p | grep -i cudart
+        libcudart.so.13 (libc6,AArch64) => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13
+        libcudart.so (libc6,AArch64) => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so
+```
+
+**Verification:**
+
+```
+pega@carlonext:~$ nvcc --version
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Wed_Aug_20_01:57:39_PM_PDT_2025
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+```
+
+`release 13.0, V13.0.88` — matches the `13.0.2` toolkit installed in §9.
+
+*Status: complete. §9's deferred CUDA verification is now fully closed out (compiler confirmed working, not just the packages installed).*
+
+## 15a. Checklist Hang During Active MODS Session — Expected, Not a Defect
+
+During partner-diag prep, `gb300_l10_sw_checklist.sh` was run while a MODS-related setup step from the partner diagnostics package (`629-24059-0000-FLD-60004-rev23.tgz`, `mods_mapping.json`) had already been executed. The checklist hung indefinitely on the `NVIDIA Driver / CUDA / GPU` section — specifically the `nvidia-smi`-based checks — because MODS setup unloads/blacklists the `nvidia` driver for exclusive low-level GPU access, and the checklist script has no timeout on any of its checks (a real gap, worth fixing separately, but out of scope here). Once the MODS-related driver state cleared, a subsequent run completed normally with no hang.
+
+**Takeaway for future runs:** don't run `gb300_l10_sw_checklist.sh` during an active MODS/partnerdiag session — it fundamentally can't produce meaningful driver/GPU results while the driver is deliberately out of the picture, and will hang rather than fail fast.
+
+*Status: understood as expected interaction between MODS and the checklist, not a script defect. Missing-timeout-on-checks noted as a real, separate follow-up for the script.*
+
+## 15b. Checklist Confirmation Run — Post §15 Fix
+
+```
+ CUDA Version (driver)            : 13.0                                   [OK]
+ nvcc (CUDA toolkit)              : Cuda compilation tools, release 13.0, V13.0.88 [OK]
+ ...
+ Summary: 29 OK | 1 NEEDS REVIEW | 7 MISSING
+```
+
+`nvcc` now `OK`, confirming §15's `/etc/profile.d/cuda.sh` fix end-to-end via the checklist itself (not just the manual `nvcc --version` spot check). Best result to date. Remaining `MISSING` rows (Fabric Manager, DCGM, Docker/containerd/nvidia-container-toolkit/default runtime) are all legitimately pending — matches the known open-items list, not new findings. `NVSwitch Devices` (`MISSING`) and `MOFED Version` (`CHECK`) remain the two unresolved items from §14.
+
+*Status: complete.*
+
+## 16. nvcc PATH — Round 2: Non-Interactive/sudo Invocation
+
+**Symptom:** after §15's fix (`/etc/profile.d/cuda.sh`) and re-login, `nvcc` was reported lost again.
+
+**First diagnosis:** re-login was via a **non-login shell** (`echo $0` → `/bin/bash`, no leading `-`; `shopt login_shell` → `off`). `/etc/profile.d/` only loads for login shells, so it never ran. Fixed by also adding the `PATH` export to `/etc/bash.bashrc`, which covers all interactive bash shells (login or not):
+
+```bash
+grep -q '/usr/local/cuda/bin' /etc/bash.bashrc || \
+  echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee -a /etc/bash.bashrc
+```
+
+Verified working in a plain non-login subshell (`bash` → `which nvcc` → `/usr/local/cuda/bin/nvcc`).
+
+**Second failure — different mechanism, not a regression:** running `sudo bash ./gb300_l10_sw_checklist.sh` right after still showed `nvcc: MISSING`. Root cause is distinct from the login-shell issue:
+- `bash script.sh` is a **non-interactive** shell — non-interactive script execution never sources `/etc/profile.d/`, `/etc/bash.bashrc`, or `~/.bashrc` at all, regardless of login/non-login status.
+- `sudo` additionally resets `PATH` via its own `secure_path` setting in `/etc/sudoers`, independent of whatever the calling shell's environment was.
+
+Since the checklist script's own documented usage is `sudo ./gb300_l10_sw_checklist.sh`, it can never reliably depend on the caller's shell environment — the correct fix is inside the script itself, not another layer of shell rc files. Patched (now v0.4.3):
+
+```bash
+[[ -d /usr/local/cuda/bin ]] && PATH="/usr/local/cuda/bin:$PATH"
+```
+
+Added immediately after `set -uo pipefail`, so it applies before any checks run regardless of how the script is invoked (interactive, non-interactive, login, non-login, cron, etc).
+
+*Status: complete. Three layers now in place: `/etc/profile.d/cuda.sh` (login shells), `/etc/bash.bashrc` (all interactive shells), and the script's own defensive PATH line (non-interactive/sudo invocation, covers the checklist script regardless of caller environment).
+
+**Confirmed via `sudo bash ./gb300_l10_sw_checklist.sh`** — the exact invocation that was failing:
+```
+ nvcc (CUDA toolkit)              : Cuda compilation tools, release 13.0, V13.0.88 [OK]
+ ...
+ Summary: 29 OK | 1 NEEDS REVIEW | 7 MISSING
+```
+`nvcc` now `OK` regardless of how the script is invoked. All three PATH layers verified working end-to-end.*
+
+## 17. EXPECTED_MOFED / EXPECTED_FM Resolved via NVOnline 1160245 Raw JSON
+
+**Source used:** raw JSON export of NVOnline 1160245 (`GB300MaxQNVL_72x1_2.0.0RC4`, milestone `2.0.0-build25`, BoardSKU `P4059`) — a higher-confidence source than the earlier Table 2 screenshot, since it's the full structured component list rather than a single public-links excerpt.
+
+**Method:** parsed every `Component`/`Version` pair in the file rather than searching for MOFED specifically, to avoid missing it under a different name:
+
+```
+BF3_BFB: 32.49.1118        BFB: 3.4.1-11              BMC: 260710.1.0_custom
+CPLD: 0.22                 CX8: 40.49.1118             DOCA_Host: 3.4.1-010000
+GFM: 580.173.04             GPU: 97.10.7D.00.0D        MFT Tools: 4.36.0-147
+NMX-C: 4.21.156             NMX-T: 4.20.9              NVOS: 25.02.4463
+SBIOS: 02.06.06             VBIOS: 97.10.7D.00.0D       WinOF-2: 26.4.27095
+(+ several BMC/CPLD/EROT/SMR/SM variants)
+```
+
+**Finding 1 — MOFED has no independent version entry in this release.** Confirmed by exhaustive check, not just absence-of-evidence: `DOCA_Host: 3.4.1-010000` is the only OFED-adjacent line item anywhere in the file. MOFED is absorbed into `DOCA_Host` rather than tracked separately in this release train. `EXPECTED_MOFED="24.10"` was checking against a target that no longer exists as an independent value.
+
+**Fix:** removed `EXPECTED_MOFED` entirely rather than replacing it with the installed value (`26.04-1.0.9`) — setting it to "whatever's installed" would just reintroduce the same category of unverified-assumption problem the CUDA fix was meant to close. `MOFED Version` is now an informational-only row (no PASS/FAIL comparison).
+
+**Finding 2 — `EXPECTED_FM="570"` was also stale**, found opportunistically while reviewing the full list. `GFM: 580.173.04` is the confirmed Fabric Manager target. Corrected in the same pass and added to the §0 matrix (previously had no Fabric Manager row at all).
+
+**Not corrected — noted, not acted on:** `VBIOS: 97.10.7D.00.0D` in this source file doesn't obviously match the already-confirmed-installed `97.10.59.00.13` from earlier checklist runs, but the two use different notation (this file's value appears to be raw hex bytes) and there's no `EXPECTED_VBIOS` variable in the script to correct either way. Flagged for awareness only — not treated as a discrepancy without understanding the notation difference first.
+
+```bash
+# gb300_l10_sw_checklist.sh changes (v0.4.3 -> v0.4.4)
+EXPECTED_FM="580.173.04"       # was "570"
+# EXPECTED_MOFED removed
+```
+
+*Status: complete. `EXPECTED_FM` corrected and added to §0. `EXPECTED_MOFED` removed (no longer a valid independent target per source of truth); `MOFED Version` check is now informational. `NVSwitch Devices` remains the one still-open item from §14, unconfirmed either way (expected for un-racked L10 vs. real gap).*
+
+## 17a. Checklist Confirmation Run — Post §17 Fix
+
+```
+ MOFED Version                    : OFED-internal-26.04-1.0.9:             [OK]
+ ...
+ Summary: 30 OK | 0 NEEDS REVIEW | 7 MISSING
+```
+
+`MOFED Version` now `[OK]` (informational, no stale-target false flag). `CHECK` column at zero for the first time. Remaining `MISSING` rows are all legitimately pending installs (Fabric Manager, DCGM, Docker/containerd/nvidia-container-toolkit/default runtime) plus `NVSwitch Devices`, the one still-unresolved item.
+
+*Status: complete.*
 
 ## 8. Next Steps (not yet started)
 
