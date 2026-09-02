@@ -130,9 +130,184 @@
 #                       verified on the NVSwitch/NVOS side of bring-up, not by
 #                       this script. Value is now referenced in the N/A row's
 #                       message as a pointer for whoever does that check.
+#   0.4.7  2026-08-10  Added explicit root-privilege check (exits with a
+#                       clear error if EUID != 0) instead of relying solely
+#                       on the "Run as root (or with sudo)" line in the
+#                       Usage/Notes header comment. Several checks fail
+#                       silently without root (dmidecode, mstflint/flint,
+#                       DCGM, some /sys and PCIe config-space reads) and
+#                       previously would just report as [MISSING] with no
+#                       indication that privilege - not an actual absent
+#                       component - was the cause.
+#   0.4.8  2026-08-11  Added "IMEX Service"/"IMEX Version" checks - this had
+#                       never been in the script at any prior version, not
+#                       dropped by an earlier edit. Placed in the NVLink/
+#                       NVSwitch/Fabric Manager section, right after the
+#                       Fabric Manager N/A rows. EXPECTED_IMEX="580.173.02",
+#                       same value as EXPECTED_DRIVER, since IMEX is installed
+#                       via nvidia-imex-aarch64-580.173.02.run alongside the
+#                       driver .run (build log §7) rather than as an
+#                       independently-versioned package.
+#                       Unlike Fabric Manager, this is a real check() row, not
+#                       note_na(): the daemon/service genuinely install and
+#                       run on this compute-tray host at any bring-up stage -
+#                       IMEX just can't do anything *useful* without NVLink
+#                       domain peers to export/import GPU memory with on a
+#                       single un-racked L10 tray. "Can't work alone" affects
+#                       what IMEX *does*, not whether it's installed/queryable
+#                       here, so MISSING here would be a real problem, not a
+#                       structural non-applicability like Fabric Manager.
+#                       Version parsed from `nvidia-imex --version` output
+#                       ("IMEX version is: X.Y") per NVIDIA's MNNVL User
+#                       Guide verification doc.
+#   0.4.9  2026-08-11  Fixed "IMEX Service" to compare against "active"
+#                       instead of accepting any non-empty output. Same bug
+#                       shape as the pre-v0.4.6 Fabric Manager rows, just
+#                       inverted: a live run came back `inactive [OK]` -
+#                       check() marks any non-empty systemctl output OK when
+#                       no expected value is given, same as the intentional
+#                       "unattended-upgrades" pattern where inactive IS the
+#                       desired state. For IMEX it isn't; the omission was a
+#                       genuine oversight, not a deliberate N/A/informational
+#                       choice like Fabric Manager. Root cause of the
+#                       inactive service itself (why it stopped after the
+#                       §7 install) is a separate, real investigation - this
+#                       fix only makes the checklist actually catch it going
+#                       forward instead of silently reporting OK.
+#   0.4.10 2026-08-11  v0.4.9's fix didn't actually work - re-ran with the
+#                       same expected="active" and IMEX Service still showed
+#                       `inactive [OK]`. Root cause: check() does a SUBSTRING
+#                       match (`$out == *"$expected"*`), and "inactive"
+#                       literally contains "active" as a substring (in +
+#                       active). Any expected="active" comparison against an
+#                       inactive/failed/activating systemd state beginning or
+#                       containing that substring will silently pass. Fixed
+#                       by rewriting the command itself to do an exact
+#                       comparison and only echo "active" on a true match,
+#                       same boolean-echo pattern already used for "IOMMU
+#                       Enabled" - empty output (MISSING) on anything else,
+#                       rather than relying on check()'s substring compare at
+#                       all. Verified against the actual check() function
+#                       (not just eyeballed) with active/inactive/failed
+#                       systemctl states before shipping this fix - v0.4.9
+#                       was shipped without that verification, which is how
+#                       the substring bug got through.
+#                       Not fixed globally in check() itself (leaving
+#                       substring matching as the default) since several
+#                       existing rows depend on substring matching on purpose
+#                       (e.g. version strings with surrounding text like
+#                       "Cuda compilation tools, release 13.0, V13.0.88").
+#                       Worth revisiting if another exact-match-sensitive
+#                       case like this one shows up.
+#   0.4.11 2026-08-11  v0.4.10's fix was technically correct but checking the
+#                       wrong thing. Build log §7/§7c already documented,
+#                       before this checklist row even existed, that
+#                       `inactive (dead)` is IMEX's *expected* clean-exit
+#                       state at L10 - it finds no NVSwitch/GFM fabric peers
+#                       on a single un-racked tray and exits rather than
+#                       staying resident, same underlying reason as Fabric
+#                       Manager. Requiring "active" meant this row would
+#                       report MISSING forever on any un-racked L10 unit,
+#                       even when everything is working exactly as designed -
+#                       a false negative, not a real problem.
+#                       Split "IMEX Service" into two separate checks that
+#                       ask different questions instead of one conflated
+#                       one: "IMEX Service (enabled)" checks systemd
+#                       enablement (`systemctl is-enabled`, expects
+#                       "enabled") - this IS meaningful at any bring-up
+#                       stage and a real MISSING here would be a real
+#                       problem, unlike Fabric Manager. "IMEX Active State"
+#                       is now note_na(), same treatment as Fabric Manager,
+#                       since "active" genuinely isn't meaningful pre-rack.
+#   0.4.12 2026-08-11  Refined the "IMEX Active State" N/A message: "active"
+#                       requires two separate conditions, not just "racked" -
+#                       GFM actually functioning on the NVSwitch tray, AND
+#                       this node's IMEX peer config populated with the
+#                       NVLink domain member IPs (nodes_config.cfg). Message-
+#                       only change, no logic difference from v0.4.11.
+#   0.4.13 2026-08-11  Fixed BF3/CX8 Firmware Version showing MISSING after
+#                       a routine reboot (this time triggered by a BIOS/BMC
+#                       update, but root cause is unrelated to that content).
+#                       Root cause: build log §10 ran `mst start` for the
+#                       firmware burn, then explicitly `mst stop`'d
+#                       afterward - the /dev/mst/* device tree it creates is
+#                       ephemeral and was never set up to persist across a
+#                       reboot. The script itself never called `mst start`
+#                       either; it just assumed /dev/mst/* already existed
+#                       from residual manual state (someone running it
+#                       during §12's Ansible work, etc.) - explains why
+#                       earlier runs showed OK and this one didn't, with
+#                       nothing to do with the BIOS/BMC content itself. Will
+#                       recur after ANY reboot, not just this one, until
+#                       fixed. Added an idempotent `mst start` immediately
+#                       before the BF3/CX8 checks so the script is
+#                       self-sufficient instead of depending on leftover
+#                       state from something else.
+#   0.4.14 2026-08-11  Added "Out-of-Band Firmware (Redfish)" section -
+#                       CPLD/EROT/HMC/FPGA, confirmed out-of-band-only per
+#                       §17/§20. Discovers BMC IP in-band via `ipmitool lan
+#                       print 1`; if empty (not configured, or IPMI hidden
+#                       from host), stops and reports N/A rather than
+#                       attempting a doomed Redfish call. Uses raw curl+jq
+#                       against .../FirmwareInventory?expand=.$levels=1
+#                       (single call for all components+versions) rather
+#                       than the nvfwupd tool, per NVIDIA's own DGX GB Rack
+#                       Scale Systems Redfish command reference - avoids an
+#                       nvfwupd-binary dependency. BMC_USER/BMC_PASS default
+#                       to the MaxQ factory account (root/0penBmc, per this
+#                       unit), overridable via env var for units with
+#                       rotated credentials. Component Id strings filtered
+#                       by keyword (CPLD|EROT|HMC|FPGA|BMC) rather than
+#                       exact match, since confirmed examples varied by BMC
+#                       vendor/platform (CPLDMB_0 vs FW_CPLD_0 vs
+#                       HGX_FW_CPLD_0) and this platform's actual Id strings
+#                       aren't yet confirmed - tighten once known. -k (skip
+#                       TLS verify) used since BMCs commonly run self-signed
+#                       certs - flagged in comments, not silently bypassed.
+#   0.4.15 2026-08-11  v0.4.14's single-call ?expand=.$levels=1 confirmed NOT
+#                       honored by this unit's actual Pegatron-built BMC
+#                       (Redfish 1.17.0) - it silently returned the plain
+#                       unexpanded Members list (only @odata.id, no Id/
+#                       Version), which would have made the jq filter always
+#                       find nothing and fall through to a false "query
+#                       failed" N/A on every run. NVIDIA's doc syntax was
+#                       apparently AMI-BMC-specific, not universal - rather
+#                       than guess at another vendor-specific expand syntax
+#                       that might differ yet again elsewhere in the rack,
+#                       switched to a guaranteed-correct two-step approach:
+#                       GET the plain Members list, filter candidate URIs by
+#                       keyword, then GET each matched component
+#                       individually for its Version. ~12 HTTP calls on this
+#                       unit instead of 1 - acceptable for a one-time
+#                       checklist run, prioritizing correctness over call
+#                       count. Real component Id strings confirmed against
+#                       this unit's BMC: no Id literally contains "HMC" -
+#                       exposed as FW_BMC_0/HGX_FW_BMC_0 instead, already
+#                       caught by the BMC keyword.
+#   0.4.16 2026-08-11  Confirmed working on a real unit (12/12 components
+#                       resolved) but the single semicolon-joined row was
+#                       hard to read - split into one ROWS entry per
+#                       component ("Out-of-Band FW: <Id>" / version / OK)
+#                       instead of concatenating all 12 into one wide value
+#                       string. Summary OK count now reflects each component
+#                       individually rather than counting the whole out-of-
+#                       band block as a single row.
+#   0.4.17 2026-08-13  Added "CUDA Toolkit (meta-pkg)" row, reading the
+#                       cuda-toolkit-13-0 meta-package version via
+#                       dpkg-query (13.0.2-1). Distinct from the two
+#                       existing CUDA-related rows: "CUDA Version (driver)"
+#                       is nvidia-smi's major.minor-only field (13.0, no
+#                       update number by design), "nvcc" is nvcc's own
+#                       independently-versioned component build (13.0.88).
+#                       Neither of those could ever show "13.0.2" - this row
+#                       is the only place that update-release number
+#                       actually lives in the checklist. Confirmed
+#                       independent of the original cuda-repo-*.deb still
+#                       being present on disk - reads from dpkg/apt package
+#                       metadata, not the installer file.
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.6"
+SCRIPT_VERSION="0.4.17"
 
 set -uo pipefail
 
@@ -145,6 +320,22 @@ set -uo pipefail
 [[ -d /usr/local/cuda/bin ]] && PATH="/usr/local/cuda/bin:$PATH"
 
 # ----------------------------------------------------------------------------
+# Root check: many rows (dmidecode, mstflint/flint, DCGM, some /sys and PCIe
+# config-space reads) silently return empty rather than erroring when run
+# unprivileged, so a non-root run doesn't fail loudly - it just quietly
+# reports a wall of false [MISSING] rows instead. Enforce here rather than
+# leaving this as a comment in the Usage/Notes header, since that's easy to
+# skim past.
+# ----------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: this script must be run as root (sudo)." >&2
+  echo "       Several checks (dmidecode, mstflint/flint, DCGM, PCIe config-space" >&2
+  echo "       reads) fail silently without root and will misreport as [MISSING]." >&2
+  echo "       Re-run as: sudo $0 $*" >&2
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------
 # 0. Config: expected versions (edit to match your NVIDIA 2.0 release matrix)
 # ----------------------------------------------------------------------------
 EXPECTED_OS="24.04"
@@ -154,6 +345,9 @@ EXPECTED_KERNEL="nvidia-64k"   # Grace requires the 64k-page HWE kernel flavor;
 EXPECTED_DRIVER="580.173.02"   # per Host Software Components matrix
                                 # (NVIDIA-kernel-module-source-580.173.02)
 EXPECTED_CUDA="13.0"          # corrected from stale 12.8 - confirmed via NVOnline 1160245
+EXPECTED_CUDA_TOOLKIT="13.0.2" # cuda-toolkit-13-0 meta-package version, per the
+                                # local-repo .deb this was installed from
+                                # (cuda-repo-...-13-0-local_13.0.2-580.95.05-1)
                                 # Table 2, paired with Datacenter Driver 580.173.02 (exact
                                 # match to installed driver) -> CUDA Toolkit 13.0.2
 EXPECTED_FM="580.173.04"       # corrected from stale "570" - confirmed via NVOnline
@@ -171,6 +365,10 @@ EXPECTED_MFT="4.36.0"          # per Host Software Components matrix (4.36.0-147
 EXPECTED_BF3_FW="32.49.1118"   # per Host Software Components matrix
 EXPECTED_CX8_FW="40.49.1118"   # per Host Software Components matrix (CX8 entry,
                                 # NVOnline 1160245); confirmed via ibstat mlx5_5
+EXPECTED_IMEX="580.173.02"     # matches EXPECTED_DRIVER - installed via
+                                # nvidia-imex-aarch64-580.173.02.run (build log §7),
+                                # same version as the driver .run, not a separate
+                                # release train
 
 LOGFILE=""
 while getopts "o:v" opt; do
@@ -253,6 +451,17 @@ section "NVIDIA Driver / CUDA / GPU"
 check "NVIDIA Driver Version" "nvidia-smi --query-gpu=driver_version --format=csv,noheader -i 0" "$EXPECTED_DRIVER"
 check "CUDA Version (driver)" "nvidia-smi | grep -oP 'CUDA Version:\s*\K[0-9.]+' | head -n1" "$EXPECTED_CUDA"
 check "nvcc (CUDA toolkit)"   "nvcc --version | grep release"
+# Distinct from both rows above: "CUDA Version (driver)" is nvidia-smi's
+# major.minor-only driver-supported API version (never carries an update
+# number, by design - not a gap, just what that field is). "nvcc" carries
+# nvcc's own independently-versioned component build (13.0.88 for Update 2,
+# per NVIDIA's CUDA 13.0 Update 2 component table - doesn't share a digit
+# with the update number, that's normal). This row is the actual toolkit
+# meta-package version (13.0.2-1) - reads from dpkg, independent of whether
+# the original cuda-repo-*.deb is still present on disk (that .deb only
+# registers a local apt repo under /var/cuda-repo-.../, separate from the
+# installed package's own version metadata).
+check "CUDA Toolkit (meta-pkg)" "dpkg-query -W -f='\${Version}' cuda-toolkit-13-0 2>/dev/null" "$EXPECTED_CUDA_TOOLKIT"
 check "GPU Count"             "nvidia-smi --query-gpu=count --format=csv,noheader -i 0"
 check "GPU Name"              "nvidia-smi --query-gpu=name --format=csv,noheader -i 0"
 check "VBIOS Version"         "nvidia-smi --query-gpu=vbios_version --format=csv,noheader -i 0"
@@ -271,6 +480,18 @@ section "NVLink / NVSwitch / Fabric Manager"
 # NVSwitch/NVOS side of bring-up instead.
 note_na "Fabric Manager Service" "runs on NVSwitch tray (NVOS), not this host"
 note_na "Fabric Manager Version" "verify via NVOS, target $EXPECTED_FM"
+# IMEX: installed via nvidia-imex-aarch64-<ver>.run alongside the driver (§7),
+# and the daemon/service exist and are queryable on this host regardless of
+# bring-up stage - unlike Fabric Manager, this is NOT an N/A case for
+# *installation*. Split into two checks that ask different questions:
+# "enabled" (systemd registered the unit at boot - meaningful at any stage,
+# a real MISSING here is a real problem) vs. "active" (requires NVSwitch/GFM
+# fabric peers to have anything to do - NOT meaningful pre-rack, see §19 of
+# the build log; a single un-racked L10 tray finds no peers and cleanly
+# exits to inactive by design, confirmed in §7/§7c).
+check "IMEX Service (enabled)" "systemctl is-enabled nvidia-imex" "enabled"
+note_na "IMEX Active State" "requires GFM active on NVSwitch tray + peer config populated - neither applies pre-rack"
+check "IMEX Version"           "nvidia-imex --version | grep -oP 'IMEX version is:\s*\K[0-9.]+'" "$EXPECTED_IMEX"
 check "NVLink Active Links"    "nvidia-smi nvlink -s -i 0 | grep -c 'Active'"
 check "NVSwitch Devices"       "nvidia-smi -q | grep -m1 -i 'NVSwitch'"
 check "GPU Topology (summary)" "nvidia-smi topo -m | head -1"
@@ -285,6 +506,17 @@ check "RDMA Link Status"       "rdma link show | head -1"
 check "DOCA Version"           "doca_version 2>/dev/null || dpkg -l | grep -m1 doca-runtime" "$EXPECTED_DOCA"
 check "BlueField DPU Detected" "lspci | grep -m1 -i 'BlueField'"
 check "MFT Tools Version"      "mst version 2>/dev/null || flint -v 2>/dev/null | head -1" "$EXPECTED_MFT"
+# mst's /dev/mst/* device tree is ephemeral - `mst start` creates it on demand
+# and it does NOT persist across a reboot (build log §10 ran `mst start` for
+# the firmware burn, then explicitly `mst stop`'d afterward; never set up as
+# a persistent boot-time service). Every prior "OK" run relied on someone
+# having manually run `mst start` in the meantime - after any reboot,
+# including an unrelated BIOS/BMC update, the device tree is gone again and
+# BF3/CX8 Firmware Version below would silently read MISSING. Start it here
+# so the check is self-sufficient rather than depending on leftover state
+# from something else. Safe/idempotent if already started; requires root,
+# which the script's own EUID check (v0.4.7) already guarantees by this point.
+mst start >/dev/null 2>&1
 check "BF3 Firmware Version"   "flint -d /dev/mst/mt41692_pciconf0 q 2>/dev/null | grep -m1 'FW Version'" "$EXPECTED_BF3_FW"
 check "CX8 Firmware Version"   "flint -d /dev/mst/mt4131_pciconf0 q 2>/dev/null | grep -m1 'FW Version'" "$EXPECTED_CX8_FW"
     # NOTE: /dev/mst/mt41692_pciconf0 and /dev/mst/mt4131_pciconf0 are placeholder
@@ -308,6 +540,72 @@ check "Docker Version"         "docker --version"
 check "containerd Version"     "containerd --version"
 check "nvidia-container-toolkit" "nvidia-ctk --version"
 check "Default Runtime = nvidia" "docker info 2>/dev/null | grep -m1 'Default Runtime'"
+
+# ----------------------------------------------------------------------------
+# 6b. Out-of-Band Firmware (CPLD/EROT/HMC/FPGA) via Redfish
+# Confirms §17/§20's finding that these four are out-of-band-only. Discovers
+# the BMC IP in-band via `ipmitool lan print`; if that comes back empty
+# (not configured, or IPMI hidden from host per BMC config), stops there and
+# reports N/A rather than attempting a Redfish call that can't succeed -
+# same principle as the Fabric Manager / IMEX Active State N/A rows.
+# Uses raw curl+Redfish rather than the `nvfwupd` tool, since curl/jq are far
+# more likely to already be present than nvfwupd.
+# v0.4.14 originally tried a single-call ?expand=.$levels=1 (per NVIDIA's DGX
+# GB Rack Scale Systems doc, AMI-based BMC example) but confirmed against
+# this unit's actual Pegatron-built BMC (Redfish 1.17.0) that expand syntax
+# is NOT honored here - it silently falls back to returning the plain
+# unexpanded Members list (only @odata.id, no Id/Version). Rather than keep
+# guessing at vendor-specific expand syntax that may differ again on other
+# nodes in the rack, v0.4.15 switched to a guaranteed-correct two-step
+# approach: GET the plain list, filter candidate URIs by keyword, then GET
+# each matched component individually for its Version. More HTTP calls
+# (~12 on this unit), but zero syntax ambiguity.
+# Real component Id strings confirmed against this unit's BMC (2026-08-11):
+# no Id literally contains "HMC" - it's exposed as FW_BMC_0/HGX_FW_BMC_0
+# instead, caught by the existing BMC keyword. Confirmed matches: FW_BMC_0,
+# FW_E1S_CPLD_0/1, HGX_FW_BMC_0, HGX_FW_CPLD_0, HGX_FW_ERoT_BMC_0,
+# HGX_FW_ERoT_CPU_0/1, HGX_FW_ERoT_FPGA_0/1, HGX_FW_FPGA_0/1.
+# -k (skip TLS verify) is standard for BMC Redfish since they commonly run
+# self-signed certs - flagged here explicitly rather than silently bypassed.
+# ----------------------------------------------------------------------------
+section "Out-of-Band Firmware (Redfish)"
+BMC_USER="${BMC_USER:-root}"
+BMC_PASS="${BMC_PASS:-0penBmc}"   # MaxQ factory default - override via env var
+                                   # (export BMC_USER/BMC_PASS before running)
+                                   # once this unit's BMC credentials are
+                                   # rotated. Do NOT assume this stays valid
+                                   # on any node whose BMC password changed.
+
+BMC_IP=$(ipmitool lan print 1 2>/dev/null | grep -E '^IP Address\s*:' | awk -F': ' '{print $2}' | tr -d ' ')
+
+if [[ -z "$BMC_IP" || "$BMC_IP" == "0.0.0.0" ]]; then
+  note_na "Out-of-Band FW (CPLD/EROT/HMC/FPGA)" "BMC IP not discoverable via ipmitool - not polled"
+else
+  BMC_FW_URIS=$(curl -sk -u "${BMC_USER}:${BMC_PASS}" -X GET \
+    "https://${BMC_IP}/redfish/v1/UpdateService/FirmwareInventory" 2>/dev/null \
+    | jq -r '.Members[]?."@odata.id"' 2>/dev/null \
+    | grep -iE 'CPLD|EROT|HMC|BMC|FPGA')
+
+  if [[ -z "$BMC_FW_URIS" ]]; then
+    note_na "Out-of-Band FW (CPLD/EROT/HMC/FPGA)" "BMC IP=$BMC_IP found but Redfish query failed - check creds/reachability"
+  else
+    BMC_FW_FOUND=0
+    while IFS= read -r uri; do
+      [[ -z "$uri" ]] && continue
+      comp_json=$(curl -sk -u "${BMC_USER}:${BMC_PASS}" -X GET "https://${BMC_IP}${uri}" 2>/dev/null)
+      comp_id=$(echo "$comp_json" | jq -r '.Id // empty' 2>/dev/null)
+      comp_ver=$(echo "$comp_json" | jq -r '.Version // empty' 2>/dev/null)
+      if [[ -n "$comp_id" && -n "$comp_ver" ]]; then
+        ROWS+=("Out-of-Band FW: ${comp_id}|${comp_ver}|OK")
+        BMC_FW_FOUND=1
+      fi
+    done <<< "$BMC_FW_URIS"
+
+    if [[ "$BMC_FW_FOUND" -eq 0 ]]; then
+      note_na "Out-of-Band FW (CPLD/EROT/HMC/FPGA)" "BMC IP=$BMC_IP found, component list matched, but per-component GET failed"
+    fi
+  fi
+fi
 
 # ----------------------------------------------------------------------------
 # 7. Print summary table

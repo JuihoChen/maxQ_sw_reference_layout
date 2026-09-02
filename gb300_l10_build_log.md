@@ -337,7 +337,7 @@ sudo flint -d 0012:03:00.0 q | grep -i psid
 
 **Note: `flint ... burn` is a production-line step, not executed during this L10 reference bring-up.** This section documents the staged firmware, confirmed PSID match, and the exact command sequence for the production line's diag/flashing process to consume — the burn itself is out of scope for this build session.
 
-*Status: firmware staged and verified, burn commands documented for production line. Executed as a bare-metal validation pass in §11 (not a production-line flash) — confirmed 40.49.1118 on all 4 cards.*
+*Status: firmware staged and verified, burn commands documented for production line. Executed as a bare-metal validation pass in §10 (not a production-line flash) — confirmed 40.49.1118 on all 4 cards.*
 
 **File placement verified on disk:**
 
@@ -401,7 +401,7 @@ Full NVOnline 1159833 tarball contents include **two** BF3 `.bfb` bundles, not o
 
 Actual `bfb-install` execution is a production-line step, out of scope for this L10 reference bring-up session. This section documents staging only.
 
-*Status: BF3 firmware staged (firmware-only bundle, correct per diag). Leading explanation: NIC-mode design; final confirmation with diag still pending — flashed successfully in §11 as a bare-metal validation pass (confirmed 32.49.1118 via `ibstat mlx5_8`), but that confirms the firmware-only bundle installs and runs correctly, not that the NIC-mode explanation itself is diag-confirmed.*
+*Status: BF3 firmware staged (firmware-only bundle, correct per diag). Leading explanation: NIC-mode design; final confirmation with diag still pending — flashed successfully in §10 as a bare-metal validation pass (confirmed 32.49.1118 via `ibstat mlx5_8`), but that confirms the firmware-only bundle installs and runs correctly, not that the NIC-mode explanation itself is diag-confirmed.*
 
 ## 7. NVIDIA GPU Driver + IMEX (§3.3.3.5.4)
 
@@ -540,7 +540,7 @@ Aug 07 03:21:45 carlonext systemd[1]: Started nvidia-imex.service - NVIDIA IMEX 
 
 Guide note: only required for partner diagnostics. Originally logged as skipped outright (no partner-diagnostics package present at that point in the build). Superseded — NV L10 partner diag is now in scope for this unit, so this step is folded into that upcoming work rather than tracked as a separate, closed-out decision here.
 
-*Status: deferred — see partner diag prep (§13+) rather than treated as resolved/skipped.*
+*Status: deferred — see partner diag prep (§18) rather than treated as resolved/skipped.*
 
 ## 7e. Reboot the Compute Tray (§3.3.3.6.8)
 
@@ -579,7 +579,7 @@ Device node present with correct major/minor — the modprobe config wasn't just
 
 *Status: complete. §3.3.3.6 (Configure NVIDIA Packages, 6.1–6.8) fully done.*
 
-## 9. CUDA Toolkit Install
+## 8. CUDA Toolkit Install
 
 Per corrected §0 matrix (`13.0.2`, confirmed via NVOnline 1160245 — see §0 note) and the public CUDA download selector (Linux / arm64-sbsa / Ubuntu 24.04 / deb (local)).
 
@@ -601,9 +601,9 @@ sudo apt-get -y install cuda-toolkit-13-0
 
 **Verification — deferred, not yet run.** `nvcc --version` and a post-install `nvidia-smi` check (confirm driver still reports `580.173.02` unchanged) still need to be run before this step is considered fully closed out.
 
-*Status: toolkit installed successfully. Verification pending — run `nvcc --version` and `nvidia-smi` before marking §9 fully complete.*
+*Status: toolkit installed successfully. Verification pending — run `nvcc --version` and `nvidia-smi` before marking §8 fully complete.*
 
-## 10. Linux Kernel Tool Install List
+## 9. Linux Kernel Tool Install List
 
 Per internal "Installation - Linux kernel tool install list" slide. Two items needed disambiguation before install:
 
@@ -634,9 +634,9 @@ flint, mft 4.36.0-147. Git SHA Hash: 7a24adf8c
 
 `mstvpd` present via the new `mstflint` package. `flint` confirmed still resolving to the NVIDIA MFT build (4.36.0-147), not the apt-repo mstflint's own `flint` — §6a firmware workflow unaffected.
 
-*Status: complete. §10 done.*
+*Status: complete. §9 done.*
 
-## 11. ConnectX-8 / BlueField-3 Firmware Flash — Bare-Metal Validation Pass
+## 10. ConnectX-8 / BlueField-3 Firmware Flash — Bare-Metal Validation Pass
 
 **Context:** §6a and §6c originally scoped the CX8 burn and BF3 flash as production-line-only steps, staged and documented but explicitly not executed during the L10 reference build. This section is a deliberate reversal of that scoping — **executed as a validation/practice pass on this bring-up unit prior to handing off the reference software layout**, to confirm the documented procedure is actually correct before it goes out as the standard path. Not a production-line flash of a shipping unit.
 
@@ -718,7 +718,7 @@ CA 'mlx5_8'
 
 *Status: complete. Firmware confirmed updated and correct on both CX8 and BF3. Validated as a practice pass ahead of reference hand-off — procedure in §6a/§6c confirmed correct, with the host-power-cycle requirement (vs. plain reboot) now captured for anyone following this as the reference path.*
 
-## 12. Ansible Install
+## 11. Ansible Install
 
 ```bash
 apt install ansible-core
@@ -728,7 +728,7 @@ Installed `ansible-core` (2.16.3-0ubuntu2) and the full `ansible` metapackage (9
 
 *Status: complete.*
 
-## 13. CX8 / BF3 Ethernet Mode Configuration (Ansible)
+## 12. CX8 / BF3 Ethernet Mode Configuration (Ansible)
 
 **Context:** Prep for NV L10 partner diagnostics — both CX8 and BF3 need to be in Ethernet mode. Executed via `CX8_BF3_config.yml` (attached playbook), which uses `mlxconfig` to reset and reconfigure both device types.
 
@@ -765,8 +765,8 @@ PLAY RECAP: ok=5  changed=2  unreachable=0  failed=0
 **Applying the change — this took three attempts:**
 
 1. `sudo reboot` (OS-level) — **insufficient.** Post-reboot, `mlxconfig -d /dev/mst/mt41692_pciconf0 q` showed the staged value (`LINK_TYPE_P1/P2 = ETH(2)`), but `ibstat mlx5_8` still reported live `Link layer: InfiniBand` — config written but not actually loaded by BF3's firmware.
-2. `sudo mlxfwreset -d /dev/mst/mt41692_pciconf0 -y reset` — **stalled**, ran far longer than expected with no completion. Likely cause (not confirmed via `ps`/`dmesg` before cutting over): `rshim` was still active from §11 and may have held the device open, blocking `mlxfwreset`'s exclusive-access requirement. Worth checking `systemctl stop rshim` before `mlxfwreset` on BF3 in future runs.
-3. `sudo ipmitool chassis power cycle` (DC power cycle via BMC) — **worked.** Same mechanism required for the firmware load in §11.
+2. `sudo mlxfwreset -d /dev/mst/mt41692_pciconf0 -y reset` — **stalled**, ran far longer than expected with no completion. Likely cause (not confirmed via `ps`/`dmesg` before cutting over): `rshim` was still active from §10 and may have held the device open, blocking `mlxfwreset`'s exclusive-access requirement. Worth checking `systemctl stop rshim` before `mlxfwreset` on BF3 in future runs.
+3. `sudo ipmitool chassis power cycle` (DC power cycle via BMC) — **worked.** Same mechanism required for the firmware load in §10.
 
 **Post-power-cycle verification:**
 
@@ -796,7 +796,7 @@ pega@carlonext:~$ sudo mlxconfig -d /dev/mst/mt4131_pciconf0 q | grep -iE 'num_o
 
 *Status: complete. Both BF3 and CX8 (all 4 cards) confirmed in Ethernet mode with target config applied, ready for NV L10 partner diagnostics. Open follow-up: fix the CX8 device-discovery regex duplicate-match bug before this playbook is used as the reference version.*
 
-## 14. gb300_l10_sw_checklist.sh — First Full Run + Bugfixes
+## 13. gb300_l10_sw_checklist.sh — First Full Run + Bugfixes
 
 **Run 1 (as `pega`, no sudo):** `22 OK | 3 NEEDS REVIEW | 12 MISSING`. Several `MISSING` results were false negatives from lacking root — `BMC/BIOS`, `System Product Name`, `IOMMU Enabled`, `MFT Tools Version`, `BF3 Firmware Version` — `dmidecode`/`mst`/`flint` all silently fail without privilege.
 
@@ -804,7 +804,7 @@ pega@carlonext:~$ sudo mlxconfig -d /dev/mst/mt4131_pciconf0 q | grep -iE 'num_o
 - `BMC/BIOS`: `00.56.02`
 - `System Product Name`: `Carlo_Next MaxQ`
 - `MFT Tools Version`: `4.36.0-147` — matches §0/§6a target
-- `BF3 Firmware Version`: `32.49.1118` — matches §11's confirmed flash
+- `BF3 Firmware Version`: `32.49.1118` — matches §10's confirmed flash
 
 **Remaining `MISSING` after root run — expected, matches known open work:** Fabric Manager Service/Version, DCGM Version, Docker/containerd/nvidia-container-toolkit/Default Runtime, `nvcc` (CUDA toolkit — see below).
 
@@ -820,17 +820,17 @@ pega@carlonext:~$ sudo mlxconfig -d /dev/mst/mt4131_pciconf0 q | grep -iE 'num_o
 2. **`CUDA Version (driver)` — invalid query field.** `nvidia-smi --query-gpu=cuda_version` returned `Field "cuda_version" is not a valid field to query.` on this driver/nvidia-smi build. Fixed: now parses `CUDA Version: X.Y` out of plain `nvidia-smi`'s header output instead of the `--query-gpu` field list.
 
 **Not yet fixed — flagged for follow-up:**
-- **`nvcc (CUDA toolkit)`: `MISSING`.** This is the deferred CUDA verification from §9 finally surfacing a real result: `nvcc` is not on `PATH`. Toolkit installed correctly (`update-alternatives` set `/usr/local/cuda` → `/usr/local/cuda-13.0` per §9), but `/usr/local/cuda/bin` was never added to `PATH`. Fix identified, not yet applied:
+- **`nvcc (CUDA toolkit)`: `MISSING`.** This is the deferred CUDA verification from §8 finally surfacing a real result: `nvcc` is not on `PATH`. Toolkit installed correctly (`update-alternatives` set `/usr/local/cuda` → `/usr/local/cuda-13.0` per §8), but `/usr/local/cuda/bin` was never added to `PATH`. Fix identified, not yet applied:
   ```bash
   echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
   ```
-- **`MOFED Version` shows `CHECK`** — actual installed value `OFED-internal-26.04-1.0.9` vs. script's `EXPECTED_MOFED="24.10"`. Same stale-matrix pattern as the CUDA 12.8→13.0.2 correction in §0 — `24.10` was never verified against NVOnline 1160245 the way driver/CUDA/DOCA/MFT/BF3-FW were. **Resolved in §17.**
+- **`MOFED Version` shows `CHECK`** — actual installed value `OFED-internal-26.04-1.0.9` vs. script's `EXPECTED_MOFED="24.10"`. Same stale-matrix pattern as the CUDA 12.8→13.0.2 correction in §0 — `24.10` was never verified against NVOnline 1160245 the way driver/CUDA/DOCA/MFT/BF3-FW were. **Resolved in §16.**
 
 *Status: script bugs fixed (v0.4.2). Real findings (`nvcc` PATH, `EXPECTED_MOFED` staleness, `NVSwitch Devices`) still open, not yet resolved.*
 
-## 15. nvcc PATH Fix (system-wide, for reference hand-off)
+## 14. nvcc PATH Fix (system-wide, for reference hand-off)
 
-`nvcc` was MISSING in checklist runs — toolkit installed correctly (§9), but `/usr/local/cuda/bin` was never added to `PATH`. Used a system-wide `/etc/profile.d/` drop-in rather than `~/.bashrc`, since this build is meant for hand-off:
+`nvcc` was MISSING in checklist runs — toolkit installed correctly (§8), but `/usr/local/cuda/bin` was never added to `PATH`. Used a system-wide `/etc/profile.d/` drop-in rather than `~/.bashrc`, since this build is meant for hand-off:
 
 ```bash
 echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh
@@ -843,9 +843,9 @@ sudo chmod 644 /etc/profile.d/cuda.sh
 
 *Status: complete.*
 
-## 16. nvcc PATH — Round 2: Non-Interactive/sudo Invocation
+## 15. nvcc PATH — Round 2: Non-Interactive/sudo Invocation
 
-**Symptom:** after §15's fix (`/etc/profile.d/cuda.sh`) and re-login, `nvcc` was reported lost again.
+**Symptom:** after §14's fix (`/etc/profile.d/cuda.sh`) and re-login, `nvcc` was reported lost again.
 
 **First diagnosis:** re-login was via a **non-login shell** (`echo $0` → `/bin/bash`, no leading `-`; `shopt login_shell` → `off`). `/etc/profile.d/` only loads for login shells, so it never ran. Fixed by also adding the `PATH` export to `/etc/bash.bashrc`, which covers all interactive bash shells (login or not):
 
@@ -878,7 +878,7 @@ Added immediately after `set -uo pipefail`, so it applies before any checks run 
 ```
 `nvcc` now `OK` regardless of how the script is invoked. All three PATH layers verified working end-to-end.*
 
-## 17. EXPECTED_MOFED / EXPECTED_FM Resolved via NVOnline 1160245 Raw JSON
+## 16. EXPECTED_MOFED / EXPECTED_FM Resolved via NVOnline 1160245 Raw JSON
 
 **Source used:** raw JSON export of NVOnline 1160245 (`GB300MaxQNVL_72x1_2.0.0RC4`, milestone `2.0.0-build25`, BoardSKU `P4059`) — a higher-confidence source than the earlier Table 2 screenshot, since it's the full structured component list rather than a single public-links excerpt.
 
@@ -907,9 +907,9 @@ EXPECTED_FM="580.173.04"       # was "570"
 # EXPECTED_MOFED removed
 ```
 
-*Status: complete. `EXPECTED_FM` corrected and added to §0. `EXPECTED_MOFED` removed (no longer a valid independent target per source of truth); `MOFED Version` check is now informational. `NVSwitch Devices` remains the one still-open item from §14, unconfirmed either way (expected for un-racked L10 vs. real gap).*
+*Status: complete. `EXPECTED_FM` corrected and added to §0. `EXPECTED_MOFED` removed (no longer a valid independent target per source of truth); `MOFED Version` check is now informational. `NVSwitch Devices` remains the one still-open item from §13, unconfirmed either way (expected for un-racked L10 vs. real gap).*
 
-## 17a. Checklist Confirmation Run — Post §17 Fix
+## 16a. Checklist Confirmation Run — Post §16 Fix
 
 ```
  MOFED Version                    : OFED-internal-26.04-1.0.9:             [OK]
@@ -921,7 +921,7 @@ EXPECTED_FM="580.173.04"       # was "570"
 
 *Status: complete.*
 
-## 18. CPLD / EROT / HMC / FPGA Readout — In-Band vs. Out-of-Band
+## 17. CPLD / EROT / HMC / FPGA Readout — In-Band vs. Out-of-Band
 
 Checked whether CPLD, EROT, HMC, FPGA (per NVOnline component table) are readable in-band, same as SBIOS (`dmidecode -t 0`) and GPU/VBIOS (`nvidia-smi`).
 
@@ -929,23 +929,294 @@ Checked whether CPLD, EROT, HMC, FPGA (per NVOnline component table) are readabl
 
 **Separately confirmed as an accepted, known gap (not investigated further):** HMC version mismatch against the NVOnline reference table — firmware update not yet available for this component.
 
-*Status: closed — BMC IP required for these four; not pursued further per decision above.*
+*Status: superseded — see §22, this was actually implemented and resolved rather than staying closed.*
 
-## 8. Next Steps (not yet started)
+## 18. L10 Partner Manufacturing Diag — Config Reference (partnerdiag)
+
+Two files synced late, after most of the bring-up above was already logged: `spec_gb300_nvl_2_4_board_pc_partner_mfg.json` and `sku_gb300_nvl_2_4_board_pc_partner_mfg.json`. This is the diag referenced back in §7d ("NV L10 partner diag is now in scope for this unit") — logging it here now rather than retroactively editing §7d.
+
+**What these two files are:**
+- `spec_...json` — the diag action list, run via MODS (`DiagType: partner_mfg`, `GB300-NVL L10 Partner Manufacturing Diag`). Defines every test step, thresholds, timeouts, and which subtests are enabled vs. `skip_test: true` for this run profile. Board identity is set via `BaseboardsPciIds` (`0009/0008/0019/0018:06:00.0`) and `gpu_pci_ids_loc_info_map`, which assigns `logical_id 0-3` to `sxm_id 1-4` respectively.
+- `sku_...json` — the expected-inventory manifest the spec's `Inventory` action (`Level0`) validates the physical board against: 2 CPUs × 144 cores (`NUMA_NODE0_CPU 0-71` / `NUMA_NODE1_CPU 72-143`), 2 × 480 GB DIMMs (960 GB total), 4 GPUs at the same PCI IDs as the spec's baseboard map.
+
+**Cross-check against what's already confirmed elsewhere in this log:** only GPU count lines up with something independently confirmed so far — checklist script's `GPU Count: 4 [OK]`. CPU core count, DIMM/memory total, and the specific GPU PCI IDs (`0008/0009/0018/0019:06:00.0`) haven't been independently verified against `lscpu`/`free`/`lspci` output anywhere in this log yet — worth a quick confirm before relying on the SKU file as a passive cross-check rather than running the diag's own `Inventory` action to do it.
+
+**Test coverage this run profile actually exercises** (i.e. not `skip_test: true`): inforom/checkinforom, `Inventory` (Level0), `HbmScreen`, PCIe properties for CX8 (Gen5 + Gen6), BF3 (data + mgmt), SSD (E1.S), USB; Grace CPU/memory/C2C-link diags (`TegraCpu`, `TegraMemory`, `CpuMemorySweep`, `TegraClink`); `Gpustress`/`Gpumem` (Level0); `PerfBenchmark_GEMM` (`pass_on_fail: true` — informational, doesn't fail the run); `Pcie` (Level0); `Connectivity` (with `nvlink`/`i2c`/`powercable` explicitly skipped inside that action); `NvlBwStress`/`NvlBwStressBg610`/`C2C`; `CpuGpuSyncPulsePower` + `ThermalSteadyState` (with DRA thermal-limit checks against all 4 GPU BDFs); `CxeyegradeStart`/`Stop` (SerDes eye/BER margin on CX8 + BF3 ports); `Ssd` (fio read/write/randread/randwrite thresholds against `/dev/nvme0n1` → `/`); and the syslog/kern.log/dmesg error + AER scrapers.
+
+**Explicitly skipped in this run profile** (`skip_test: true`) — worth calling out so "diag passed" doesn't get read as "everything ran": `DisableAcs`; all four GPUDirect RDMA subtests (`Cx8GpuDirectLoopback_ETH`, `Cx8GpuDirectExtLoopback_ETH`, `Cx8GpuDirectCrossNIC_ETH`, `Cx8GpuDirectCrossNIC_IB`); all four CPU-path IB/Ethernet bandwidth subtests (`Cx8CpuCrissCrossNIC_ETH`, `Cx8CpuCrossNIC_ETH`, `Cx8CpuCrossNIC_IB`, `Cx8CpuLoopback_ETH`, Level1); `BF3PcieInterfaceTraffic` (dpudiag against the BF3 at `172.16.0.151`); and the `DNM6` workload (4× 900 s runs). None of the IB/RDMA bandwidth subtests run in this profile — consistent with this being a single, un-racked compute tray with no fabric peers, same reasoning already applied to Fabric Manager and `NVSwitch Devices` elsewhere in this log.
+
+**Not included in these two files: actual execution results.** Both are diag *definitions* — a test spec and an expected-inventory manifest — not a results/report output. No pass/fail data to log from this sync; that still needs to come from an actual diag run.
+
+*Status: reference-only, logged for traceability ahead of provisioning. Diag has not been executed yet — see Next Steps.*
+
+## 18a. MaxQ SKU — Required Diag JSON Modifications (Reference for Others)
+
+This unit is confirmed `GPU Name: NVIDIA GB300 Max-Q` (checklist §13/17a). The stock `spec_gb300_nvl_2_4_board_pc_partner_mfg.json` / `sku_gb300_nvl_2_4_board_pc_partner_mfg.json` from §18 are for the standard (non-MaxQ) board and **will misreport a MaxQ unit as failing `Inventory`/`BfPcieProperties`/`BfMgmtPcieProperties` if used as-is**. Diffed the standard files against the MaxQ-specific ones (`spec_gb300_nvl_2_4_board_pc_partner_mfg_maxQ.json`, `sku_gb300_nvl_2_4_board_pc_partner_mfg.json` — same filename as before, content replaced) to isolate exactly what changes. Logging the deltas here as a checklist for anyone repeating this on another MaxQ unit, rather than just swapping files silently.
+
+**SKU manifest (`sku_...json`) — GPU PCI IDs, all 4 entries (`0008/0009/0018/0019:06:00.0`):**
+
+| Field | Standard | MaxQ |
+|---|---|---|
+| `DeviceID` | `31c2` | `31a1` |
+| `DeviceName` | `Device 31c2` | `Device 31a1` |
+| `SSDeviceID` | `21f1` | `2274` |
+
+Everything else in the SKU file — CPU count/cores, DIMM quantity/size, `VendorID`, `PCIID`, `RetimerCount` — is identical between the two. This is purely the GPU die/subsystem ID differing by power/binning SKU, not a topology change.
+
+**Diag spec (`spec_...json`) — three categories of change, not just one:**
+
+1. **Global timeout added** — top-level `global_args` goes from `[]` to `["timeout_ms=30000"]`. Applies diag-wide, not tied to a specific test.
+
+2. **BF3 BDFs move buses** — `BfPcieProperties` and `BfMgmtPcieProperties` target `0016:03:00.{0,1,2}` on the standard board but `0016:01:00.{0,1,2}` on MaxQ. This is a real topology difference (different PCIe bus enumeration on the MaxQ board layout), not a cosmetic rename — using the standard BDFs against a MaxQ unit will simply not find the device rather than fail a threshold check.
+
+3. **Seven previously-skipped tests are enabled** (`skip_test: true → false`): `DisableAcs`, `Cx8GpuDirectLoopback_ETH`, `Cx8GpuDirectExtLoopback_ETH`, `Cx8GpuDirectCrossNIC_ETH`, `Cx8CpuCrossNIC_ETH`, `Cx8CpuLoopback_ETH`, `BF3PcieInterfaceTraffic`. Four remain skipped in both profiles: `Cx8GpuDirectCrossNIC_IB`, `Cx8CpuCrissCrossNIC_ETH`, `Cx8CpuCrossNIC_IB`, `DNM6`. Net effect: the MaxQ profile actually exercises GPUDirect RDMA loopback/cross-NIC-Ethernet and CPU-path Ethernet bandwidth, on top of everything §18 already listed as common to both profiles.
+
+4. **`BF3PcieInterfaceTraffic` itself is restructured, not just re-timed.** Beyond the longer `timeout_sec` (240→450) and `duration` (30→300):
+   ```
+   standard:  "players": [{ "bf": { "ip": "172.16.0.151", "username": "root",
+                                     "password": "SuperNvidia1", "pci": "0016:03:00", "sd_pci": null } }]
+   maxQ:      "players": [{ "cx": { "pci": "0016:01:00", "sd_pci": null } }]
+   ```
+   Standard targets a `bf` player — SSH into the BlueField's own DPU-side OS at a management IP. MaxQ targets a `cx` player — PCI-only, no SSH, no DPU-side OS credentials. This lines up with §6c/§18: this build's BF3 runs in NIC mode with no DPU-side OS on the Arm cores (same reasoning behind waiving the "BF3 DPU OS version" checklist row), so a diag step that assumes an SSH-reachable DPU OS would have been structurally wrong here regardless of thresholds — the MaxQ spec's `cx`-player version is actually the *only* variant of this test that fits this unit's configuration, not just a MaxQ-specific preference.
+
+**Practical takeaway for the checklist:** don't treat "MaxQ" as a single value substitution — it's a different SKU manifest, a different BF3 PCI topology, a wider enabled-test set, and one test's execution mechanism changes because it now correctly matches this unit's NIC-mode BF3 rather than assuming a DPU OS exists.
+
+*Status: reference-only, both MaxQ-specific files now on file for the diag run planned in §18's Next Steps item.*
+
+## 18b. L10 Partner Diag — PASS Result (run.log)
+
+Actual execution of the MaxQ-profile diag configured in §18/§18a.
+
+```
+Command Line: onediagfield.r9.343.7 --run_on_error --no_bmc --force_product=titania_gb110 --dra
+              --run_spec=spec_gb300_nvl_2_4_board_pc_partner_mfg_maxQ.json
+              --skip_os_check --skip_id=SsdPciePropertiesE1S --auto_repair
+```
+
+**Board identity confirmed by the diag itself** — consistent with §0/checklist confirmations already in this log:
+
+| Field | Diag-reported |
+|---|---|
+| Product | Carlo_Next MaxQ |
+| Product Version | DVT |
+| Family | MGX |
+| SKU | RA4802-72N2 |
+| Serial Number | 267548730004 |
+
+**Result: `Final Result: PASS`.** Start `Mon, 10 Aug 2026 01:26:06`, end `04:06:43`, elapsed `160:37s` (~2h 40m). Every enabled test completed with no `FAIL`.
+
+**Two `IGNORED` results, not a gap** — `PerfBenchmark_GEMM` and `CxeyegradeStop` both report `IGNORED` rather than `OK`/`SKIPPED`. That's the diag's status label for the spec's `pass_on_fail: true` steps (both carry that flag per §18). `CxeyegradeStop`'s own per-connection detail table shows `OK` underneath — `IGNORED` only means the result doesn't gate the overall pass/fail, not that it didn't run.
+
+**Five skips, for two different reasons — worth keeping distinct:**
+- `Cx8GpuDirectCrossNIC_IB`, `Cx8CpuCrissCrossNIC_ETH`, `Cx8CpuCrossNIC_IB`, `DNM6` — skipped per the MaxQ spec's own `skip_test: true` (§18a already documented these as still-disabled even in the MaxQ profile).
+- `SsdPciePropertiesE1S` — skipped via the **command line** (`--skip_id=SsdPciePropertiesE1S`), not the spec file. The spec doesn't mark this test skipped by default, so this was an operator decision on this specific run, not a MaxQ-vs-standard spec difference — §18a's diff wouldn't have caught it since it isn't in the JSON at all. A future MaxQ run without that flag would exercise it.
+
+**`--auto_repair` had nothing to do** — `AutomaticRepair OK - Nothing to repair`, confirming no corrective action was triggered during the run.
+
+*Status: complete — diag PASS, board identity self-confirmed, no failures or unexplained skips. Cleared for provisioning per this log's own gating criteria.*
+
+## 19. IMEX Service Inactive — Resolved: Expected L10 Behavior, Not a Bug
+
+`gb300_l10_sw_checklist.sh` v0.4.8 added `IMEX Service`/`IMEX Version` rows, checking for `active`. v0.4.8's version had a bug that reported `IMEX Service: inactive [OK]` as a false pass (no exact-match comparison). v0.4.9's attempted fix (`expected="active"`) didn't work either — substring match means `"inactive"` passes against `expected="active"` since it literally contains that substring. v0.4.10 fixed the comparison mechanics correctly and the checklist started reporting the true state: `IMEX Service: - [MISSING]`.
+
+**That MISSING was then wrongly treated as an open bug in this section's original text.** It isn't one — §7 and §7c, written *before* this checklist row even existed, already documented that `inactive (dead)` is IMEX's expected clean-exit state at L10. More precisely than "no fabric peers": IMEX only goes and stays active once **two separate conditions** are both met — (1) GFM is actually up and functioning on the NVSwitch tray's NVOS (§16's Fabric Manager `N/A` rows — this host can't provide that), and (2) this node's own IMEX peer config (`/etc/nvidia-imex/config.cfg`, staged but not populated per §7) is filled in with the actual NVLink domain member IPs, typically via `nodes_config.cfg`. Neither is meaningful or achievable on a single un-racked L10 compute tray. The bug was in what v0.4.8–v0.4.10 chose to *check for* (`active`), not in the system itself.
+
+**v0.4.11 corrects the checklist** to ask two separate questions instead of one conflated one: `IMEX Service (enabled)` (checks `systemctl is-enabled`, meaningful at any bring-up stage — a real `MISSING` here would be a real problem) and `IMEX Active State` (now `N/A`, same treatment as `Fabric Manager`, since `active` genuinely isn't meaningful until racked).
+
+*Status: resolved — no root cause to chase. Closing out; §7/§7c already had the answer, this section just hadn't cross-referenced them before flagging it as open.*
+
+## 20. mst Device Tree Not Persistent Across Reboot
+
+Found via a routine BIOS/BMC upgrade (`00.56.02` → `00.58.03`) and reboot: `gb300_l10_sw_checklist.sh` came back with `BF3 Firmware Version`/`CX8 Firmware Version` both `[MISSING]`, having previously been `[OK]` on every prior run.
+
+**Not caused by the BIOS/BMC update content.** `MFT Tools Version`, `BlueField DPU Detected`, and `IB Devices` (`mlx5_0`–`mlx5_9`, all present) were all still `[OK]` — the cards themselves are fine, still enumerated, still queryable via the standard `ibstat`/`rdma-core` paths. Only the two checks that go through `flint -d /dev/mst/...` broke.
+
+**Root cause:** §10's firmware-burn procedure ran `sudo mst start` (creates the `/dev/mst/*` device tree), did the burn, then explicitly `sudo mst stop`'d afterward — deliberate cleanup at the time, but `mst start` was never set up as a persistent boot-time service anywhere in this bring-up. The device tree it creates is ephemeral by design; it does not survive a reboot on its own. The checklist script itself compounded this — it queries `/dev/mst/mt41692_pciconf0`/`mt4131_pciconf0` directly but never called `mst start` first, just assuming the device tree already existed. Every prior checklist run showing `OK` was relying on residual manual state (most likely someone running `mst start` incidentally during §12's Ansible CX8/BF3 config work) rather than anything actually persistent. **This will recur after any reboot** — this BIOS/BMC update just happened to be the reboot that exposed it, not a special trigger.
+
+**Fix — `gb300_l10_sw_checklist.sh` v0.4.13:** added an idempotent `mst start >/dev/null 2>&1` immediately before the BF3/CX8 checks, so the script no longer depends on leftover state from something else:
+
+```bash
+mst start >/dev/null 2>&1
+check "BF3 Firmware Version"   "flint -d /dev/mst/mt41692_pciconf0 q 2>/dev/null | grep -m1 'FW Version'" "$EXPECTED_BF3_FW"
+check "CX8 Firmware Version"   "flint -d /dev/mst/mt4131_pciconf0 q 2>/dev/null | grep -m1 'FW Version'" "$EXPECTED_CX8_FW"
+```
+
+**Worth knowing beyond just the checklist script:** anything else on this node that assumes `/dev/mst/*` is present — other MFT-based tooling, manual `mlxconfig`/`mlxfwmanager` invocations, future firmware re-verification — will hit the same silent gap after a fresh reboot unless it also calls `mst start` first (or unless `mst start` gets made a genuinely persistent boot-time service, which hasn't been done here — the checklist fix works around the gap rather than closing it at the source). Relevant for §16's rack-wide cloning plan too: whoever clones this reference layout to the other 17 compute trays will hit this exact same thing on their first reboot post-image unless they know to run `mst start` (or apply this same checklist fix) first.
+
+**Two unrelated but real identity changes also observed from this same BIOS/BMC upgrade, confirmed intentional-looking rather than a mis-flash but not independently verified against release notes:**
+
+| Field | Before (`00.56.02`) | After (`00.58.03`) |
+|---|---|---|
+| System Product Name | `Carlo_Next MaxQ` | `CARLO_NEXT-T1` |
+| VBIOS Version | `97.10.59.00.13` | `97.10.7D.00.0D` |
+
+`GPU Name` still correctly reports `NVIDIA GB300 Max-Q` throughout, so the underlying hardware/SKU hasn't changed — this looks like a DMI/system-identity table string change and a bundled GPU VBIOS capsule update shipped together in the same `00.58.03` release, not a hardware swap or wrong-image flash. Not chased further here since it didn't block anything, but worth a sanity check against the BIOS/BMC release notes if this System Product Name string is depended on anywhere downstream (inventory tooling, asset tags, etc.) — a string change like `Carlo_Next MaxQ` → `CARLO_NEXT-T1` could silently break exact-match lookups elsewhere.
+
+*Status: resolved for the checklist script (v0.4.13). Not resolved at the source — `mst start` still isn't a persistent boot-time service, so any tooling outside this checklist that assumes `/dev/mst/*` exists remains exposed to the same gap after a reboot.*
+
+## 21. Field-Site Offline Kernel Upgrade Procedure (6.14 → 6.17.0-1029-nvidia-64k)
+
+Customer request: bring field-deployed units (shipped with the Grace 4KB-page-era `6.14` nvidia kernel) up to this reference layout's kernel — `6.17.0-1029-nvidia-64k`, `6.17.0-1029.29` — but field sites have no internet access. Package acquisition has to happen on a connected staging machine, then be carried in and installed offline. Logging the procedure here since this is the kind of thing that's easy to half-remember and get subtly wrong (wrong version pinned, missing DKMS prerequisites, dependency-resolution gaps) on a repeat.
+
+**Good news up front:** this kernel comes from the plain Ubuntu archive, not NVIDIA's private NVOnline repo — §3 installed it with a bare `apt install linux-nvidia-64k-hwe-24.04`, no special repo added beforehand. No NVOnline credentials needed for this part, only for the driver/DOCA/CUDA pieces covered elsewhere in this log.
+
+**1. Stage on a connected machine with matching OS + arch.** Ubuntu 24.04, `arm64`/aarch64. Doesn't need to be a GB300 itself — any Ubuntu 24.04 aarch64 box or container with internet access works, since this is just resolving and downloading `.deb`s from the standard archive.
+
+**1a. Staging from an x86 laptop specifically.** Confirmed workable, with a caveat on *how*, not *whether* — and importantly, **this never touches the reference layout at all**. It's pure package acquisition on a separate machine; the GB300 reference node isn't involved in staging, only as the source of the pinned version number (`6.17.0-1029.29`) being matched.
+
+Why the plain approach doesn't work: `linux-nvidia-64k-hwe-24.04` and its siblings are arm64-only (the 64KB-page kernel flavor doesn't exist for x86_64 — it's a Grace/ARM-server thing). A stock x86_64 laptop's default apt sources don't even index that architecture, so a bare `apt install` fails outright with `Unable to locate package`, not a wrong-architecture download. Ubuntu's arm64 packages also live on a different mirror (`ports.ubuntu.com`) than the default amd64 mirror (`archive.ubuntu.com`).
+
+Two ways around it:
+
+- **Docker + QEMU emulation (recommended).** Works regardless of the laptop's host OS (Windows/Mac/Linux) — Docker Desktop or Docker Engine is enough. Gives a real arm64 apt environment, so `install --download-only` resolves the *full* dependency tree correctly, same as step 2 below assumes:
+  ```bash
+  # one-time: enable QEMU emulation for cross-arch containers
+  docker run --rm --privileged tonistiigi/binfmt --install arm64
+
+  # arm64 Ubuntu 24.04 container, host directory mounted so the .debs land
+  # directly on the laptop's filesystem
+  docker run --rm -it --platform=linux/arm64 \
+    -v "$(pwd)/gb300-kernel-repo:/out" ubuntu:24.04 bash
+
+  # inside the container - same download command as step 2 below:
+  apt-get update
+  apt-get install -y --download-only \
+    linux-nvidia-64k-hwe-24.04=6.17.0-1029.29 \
+    linux-image-nvidia-64k-hwe-24.04=6.17.0-1029.29 \
+    linux-headers-nvidia-64k-hwe-24.04=6.17.0-1029.29
+  cp /var/cache/apt/archives/*.deb /out/
+  exit
+  ```
+  Then continue directly at step 3 below (bundle into a local repo) using the `.deb`s now sitting in `~/gb300-kernel-repo/` on the laptop.
+
+- **Native multi-arch apt, only if the laptop itself runs Ubuntu/Debian x86_64:**
+  ```bash
+  sudo dpkg --add-architecture arm64
+  echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse" \
+    | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+  sudo apt-get update
+  sudo apt-get download \
+    linux-nvidia-64k-hwe-24.04:arm64=6.17.0-1029.29 \
+    linux-image-nvidia-64k-hwe-24.04:arm64=6.17.0-1029.29 \
+    linux-headers-nvidia-64k-hwe-24.04:arm64=6.17.0-1029.29
+  ```
+  Real caveat: `apt-get download` (unlike `install --download-only`) only fetches the exact packages named — it does **not** walk the dependency tree. Missing dependencies would have to be resolved and downloaded manually (e.g. via `apt-cache depends`/`apt-rdepends`), which is easy to get wrong and quietly ship an incomplete bundle. The Docker route above avoids this failure mode entirely, which is why it's the recommended one.
+
+**2. Download the exact pinned version this reference layout uses — not whatever HWE happens to be current at build time.** Field units need to land on the same build (`6.17.0-1029.29`, per §3's verification table), not a newer HWE point release that might land between now and when the bundle gets built:
+
+```bash
+sudo apt-get update
+sudo apt-get install --download-only \
+  linux-nvidia-64k-hwe-24.04=6.17.0-1029.29 \
+  linux-image-nvidia-64k-hwe-24.04=6.17.0-1029.29 \
+  linux-headers-nvidia-64k-hwe-24.04=6.17.0-1029.29
+```
+
+`--download-only` pulls the *full resolved dependency tree* into `/var/cache/apt/archives/`, not just the three named packages. This matters — a manual per-package `dpkg -i` will hit unmet-dependency errors offline with no way to fetch the missing pieces, unlike on a connected system.
+
+**3. Turn the download cache into a portable local apt repo, not loose `.deb`s.** This preserves dependency resolution on the air-gapped side instead of manually figuring out install order:
+
+```bash
+mkdir -p ~/gb300-kernel-repo && cp /var/cache/apt/archives/*.deb ~/gb300-kernel-repo/
+cd ~/gb300-kernel-repo
+dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz
+sha256sum * > SHA256SUMS   # checksum before transfer - no internet at the far
+                            # end to re-verify against upstream if something
+                            # got corrupted in transit
+```
+
+**4. Transfer via removable media**, then on the field unit:
+
+```bash
+echo "deb [trusted=yes] file:///path/to/gb300-kernel-repo ./" | sudo tee /etc/apt/sources.list.d/local-kernel.list
+sudo apt-get update   # only touches the local repo, no internet needed
+sudo apt-get install linux-nvidia-64k-hwe-24.04=6.17.0-1029.29 \
+                      linux-image-nvidia-64k-hwe-24.04=6.17.0-1029.29 \
+                      linux-headers-nvidia-64k-hwe-24.04=6.17.0-1029.29
+sudo reboot
+```
+
+**5. DKMS prerequisite — confirm BEFORE shipping the bundle, not after.** The NVIDIA driver on this reference layout was installed with `--dkms` (§7), so it needs to rebuild its kernel module against the new 6.17 headers after the swap. That rebuild is normally triggered automatically by the kernel package's postinst DKMS hook — but it needs `dkms`, `gcc`, and `make` (§5, "Kernel Build Packages") **already present on the 6.14 field system before the upgrade**, since there's no internet there to fetch them if missing. Check `dpkg -l | grep -E 'dkms|build-essential'` on a representative field unit ahead of time — if those are missing, they need to go into the same offline repo bundle in step 3, not be assumed present.
+
+**6. Post-reboot verification, mirroring §3/§4's original bring-up hygiene:**
+
+- `uname -r` → `6.17.0-1029-nvidia-64k`
+- `dkms status` → NVIDIA module shows built/installed against the new kernel
+- Purge the old `6.14` kernel packages the same way §3 cleaned up the stale generic kernel (check for leftover `/lib/modules/<old>/` directories, dangling headers, `apt autoremove`)
+- Re-apply the same `apt-mark hold` from §4 (`linux-nvidia-64k-hwe-24.04`, `linux-image-nvidia-64k-hwe-24.04`, `linux-headers-nvidia-64k-hwe-24.04`) so nothing drifts again
+- Run `gb300_l10_sw_checklist.sh` as the final gate — it already checks kernel version, page size, held-package state, and GPU kernel module version in one pass (`OS / Kernel / Platform` and `NVIDIA Driver / CUDA / GPU` sections)
+
+**Open items not yet resolved, to fill in on the first real field attempt:**
+- Staging method now documented (§21 step 1a, Docker+QEMU on an x86 laptop) but not yet actually run — first real attempt should confirm the emulated arm64 apt environment resolves cleanly end-to-end.
+- Confirmed presence (or absence) of `dkms`/`build-essential` on the actual 6.14 field-shipped image — step 5 assumes this needs checking, not yet confirmed against a real unit.
+
+*Status: procedure drafted, not yet executed against a real field unit. Treat as a reference plan to validate on the first attempt, not a confirmed-working runbook yet.*
+
+## 22. Out-of-Band Firmware via Redfish — §17 Resolved
+
+Triggered by an HMC firmware release-notes screenshot (bundle `nvfw_GB300-P4059-0311_0044_260710.1.0_custom_prod-signed.fwpkg`, version `260710.1.0_custom`) showing `CPLD: 0.22`, `GPU: 97.10.7D.00.0D`, `EROT: 01.04.0055.0000_n04`, `HMC: GB200Nvl-26.07-1`, `SBIOS: 02.06.06`, `FPGA: 1.66`. The `GPU` value matched the checklist's post-`00.58.03`-upgrade reading exactly, confirming that VBIOS change from §20 was intentional bundle content, not a mis-flash — that part of §20's open item is now closed.
+
+**`ipmitool` confirmed not a substitute for this.** CPLD/EROT/FPGA as individually-versioned components is a Redfish/PLDM `FirmwareInventory` concept with no classic-IPMI equivalent — `ipmitool mc info` can only reach the BMC's own version (roughly the `HMC` row), and even that may be blocked depending on the BMC's "IPMI visibility for Host" setting.
+
+**Implemented directly in `gb300_l10_sw_checklist.sh` (v0.4.14 → v0.4.17), not just discussed:**
+- BMC IP discovered in-band via `ipmitool lan print 1`; reports `N/A` (not `MISSING`) if empty — same principle as `Fabric Manager`/`IMEX Active State`, never attempts a doomed Redfish call.
+- v0.4.14's first attempt used a single-call `?expand=.$levels=1`, per NVIDIA's DGX GB Rack Scale Systems doc — confirmed against this unit's actual Pegatron-built BMC (Redfish 1.17.0) that the expand syntax is **not honored**; it silently returns the plain unexpanded list instead. NVIDIA's documented syntax was apparently AMI-BMC-specific, not universal.
+- v0.4.15 switched to a guaranteed-correct two-step approach: plain `Members` list → filter by keyword (`CPLD|EROT|HMC|BMC|FPGA`) → `GET` each matched component individually. ~12 HTTP calls instead of 1, prioritizing correctness over call count.
+- v0.4.16 split the result into one row per component instead of one long semicolon-joined string, for readability.
+- Credentials default to `root`/`0penBmc` (MaxQ factory account), overridable via `BMC_USER`/`BMC_PASS` env vars for units with rotated credentials.
+
+**Real confirmed data from this unit (2026-08-11)** — 12 of 30 total `FirmwareInventory` members matched the filter:
+
+| Component Id | Version |
+|---|---|
+| `FW_BMC_0` | `carlonext-bmc_0.82.03` |
+| `FW_E1S_CPLD_0` | `0b.04.02` |
+| `FW_E1S_CPLD_1` | `0b.04.02` |
+| `HGX_FW_BMC_0` | `GB200Nvl-26.07-1` |
+| `HGX_FW_CPLD_0` | `0.22` |
+| `HGX_FW_ERoT_BMC_0` | `01.04.0055.0000_n04` |
+| `HGX_FW_ERoT_CPU_0` | `01.04.0055.0000_n04` |
+| `HGX_FW_ERoT_CPU_1` | `01.04.0055.0000_n04` |
+| `HGX_FW_ERoT_FPGA_0` | `01.04.0055.0000_n04` |
+| `HGX_FW_ERoT_FPGA_1` | `01.04.0055.0000_n04` |
+| `HGX_FW_FPGA_0` | `1.66` |
+| `HGX_FW_FPGA_1` | `1.66` |
+
+**Cross-checked against the HMC bundle screenshot — all four match:** `HGX_FW_CPLD_0=0.22` ↔ bundle `CPLD 0.22`; `HGX_FW_ERoT_*=01.04.0055.0000_n04` ↔ bundle `EROT 01.04.0055.0000_n04`; `HGX_FW_BMC_0=GB200Nvl-26.07-1` ↔ bundle `HMC GB200Nvl-26.07-1`; `HGX_FW_FPGA_*=1.66` ↔ bundle `FPGA 1.66`.
+
+**One real distinction the live data revealed, worth keeping straight going forward:** two separate "BMC" identities exist on this platform — `FW_BMC_0` (`carlonext-bmc_0.82.03`, this compute tray's own BMC firmware, versioned independently) vs. `HGX_FW_BMC_0`/`HGX_FW_ERoT_BMC_0` (the HGX baseboard's BMC-domain components, matching the HMC bundle's own versioning track). They are not the same firmware and don't share a version number — don't conflate them when reading future output. Also worth noting: no component `Id` on this BMC literally contains the string `"HMC"` — the concept is exposed via `BMC` naming instead.
+
+*Status: resolved. §17's "closed, not pursued further" is superseded — this is now implemented, tested against the real unit, and producing accurate data on every checklist run.*
+
+## 23. CUDA Version Fields — Why Three Different Numbers Are All Correct
+
+Recurring point of confusion worth a permanent reference entry, since it came up directly in review. The checklist shows three different CUDA-related version strings, and none of them are wrong or inconsistent with each other:
+
+| Row | Value | What it actually is |
+|---|---|---|
+| `CUDA Version (driver)` | `13.0` | `nvidia-smi`'s driver-supported API version. Major.minor only, by design — this field has never been capable of showing an update number, regardless of what's installed. |
+| `nvcc (CUDA toolkit)` | `V13.0.88` | nvcc's own independently-versioned component build. Per NVIDIA's CUDA Toolkit component-versioning scheme (independent since CUDA 11), this doesn't share a digit with the toolkit's update-release number — confirmed against NVIDIA's official CUDA 13.0 Update 2 release notes, where `CUDA NVCC: 13.0.88` is the documented, correct value for that exact release. |
+| `CUDA Toolkit (meta-pkg)` (added v0.4.17) | `13.0.2-1` | The actual toolkit meta-package version (`cuda-toolkit-13-0`), via `dpkg-query`. The only row where the toolkit's "Update 2" designation is literally visible — matches the original `cuda-repo-ubuntu2404-13-0-local_13.0.2-580.95.05-1_arm64.deb` this was installed from. |
+
+Confirmed independent of whether that original local-repo `.deb` is still on disk (it was deleted per the disk-cleanup pass earlier in this log) — the apt repo it registered lives separately under `/var/cuda-repo-ubuntu2404-13-0-local/`, and installed package version metadata comes from dpkg, not the installer file.
+
+*Status: reference entry, not an action item — logging so this doesn't need re-investigating if the same three-numbers-look-inconsistent question comes up again later.*
+
+## 24. Next Steps (not yet started)
 
 - [x] NVIDIA kernel build packages (gcc, dkms, make) — see §5
 - [x] NVIDIA datacenter driver install — 580.173.02 confirmed via `nvidia-smi`, see §7
 - [x] IMEX service enabled + verified (expected inactive/clean-exit at L10, see §7)
-- [x] Enable/start `rshim` service (see §6 open follow-ups) — done in §11
-- [x] ConnectX-8 firmware burn — executed as bare-metal validation pass, confirmed 40.49.1118 on all 4 cards, see §11
-- [x] BlueField-3 firmware flash — executed as bare-metal validation pass, confirmed 32.49.1118, see §11
+- [x] Enable/start `rshim` service (see §6 open follow-ups) — done in §10
+- [x] ConnectX-8 firmware burn — executed as bare-metal validation pass, confirmed 40.49.1118 on all 4 cards, see §10
+- [x] BlueField-3 firmware flash — executed as bare-metal validation pass, confirmed 32.49.1118, see §10
 - [x] Configure NVIDIA packages (§7a: profiling, IMEX control channel) — executed, see §7a
 - [x] Persistence daemon enabled + verified (survives reboot) — see §7b
 - [x] IMEX daemon confirmed enabled (already done in §7) — see §7c
 - [x] Extended GPU memory — skipped, not applicable (no partner diagnostics) — see §7d
 - [x] Post-§3.3.3.6 reboot + verification — see §7e
 - [ ] IMEX peer config — deferred to rack-level (see §7a)
-- [~] CUDA toolkit install — installed (13.0.2), verification (`nvcc --version`, post-install `nvidia-smi`) still pending, see §9
+- [~] CUDA toolkit install — installed (13.0.2), verification (`nvcc --version`, post-install `nvidia-smi`) still pending, see §8
 - [ ] Fabric Manager install + service enable
 - [ ] NVLink/NVSwitch topology validation (`nvidia-smi topo -m`)
 - [x] MOFED install — bundled via `doca-all` (`mlnx-ofed-kernel-dkms`, see §6)
@@ -956,6 +1227,11 @@ Checked whether CPLD, EROT, HMC, FPGA (per NVOnline component table) are readabl
 - [ ] Container runtime (`nvidia-container-toolkit`) + default runtime config
 - [x] Clean up stale generic kernel packages (see §3)
 - [ ] Run `gb300_l10_sw_checklist.sh` for full pass/fail against NVIDIA 2.0 matrix
+- [ ] Consider making `mst start` a genuine persistent boot-time service rather than relying on the checklist-script workaround in §20
+- [ ] Confirm System Product Name / VBIOS changes from the `00.58.03` BIOS/BMC update (§20) against release notes, especially if `System Product Name` is depended on by any downstream inventory/asset tooling
+- [ ] Validate field-site offline kernel upgrade procedure (§21) against a real field unit; confirm dkms/build-essential presence assumption
+- [x] IMEX Service inactive finding (§19) — resolved, expected L10 behavior (no fabric peers pre-rack), not a defect. No provisioning blocker.
+- [x] Run L10 partner mfg diag (partnerdiag) — MaxQ-specific spec/SKU config (§18, §18a) run against this unit, `Final Result: PASS`, see §18b
 
 ---
 
