@@ -1202,7 +1202,55 @@ Confirmed independent of whether that original local-repo `.deb` is still on dis
 
 *Status: reference entry, not an action item — logging so this doesn't need re-investigating if the same three-numbers-look-inconsistent question comes up again later.*
 
-## 24. Next Steps (not yet started)
+## 24. SBIOS Version Discrepancy — Resolved, Same Pattern as §23
+
+Follow-up to §22's HMC bundle cross-check: the bundle screenshot listed `SBIOS: 02.06.06`, but the checklist's `BMC/BIOS (dmidecode)` row has consistently read `00.58.03` (via `dmidecode -s bios-version`) — apparent mismatch, worth checking before assuming either was wrong.
+
+Confirmed via a direct Redfish query against the `UEFI` component (`GET /redfish/v1/UpdateService/FirmwareInventory/UEFI`, `Manufacturer: PEGATRON`) — it also reports `Version: 00.58.03`, exactly matching `dmidecode`. Two independent sources (in-band and out-of-band) agree, so `dmidecode` was never wrong. Per Pegatron directly: **`00.58.03` is their own internal combined BIOS/BMC release/build number** — a vendor packaging version, distinct from `02.06.06`, which is the underlying SBIOS component's own version *within* that Pegatron release. Same shape of distinction as §23's CUDA finding: a release/bundle-level version number and a component-level version number, both correct, tracking different layers — not a bug, not a partial update.
+
+No script change made — `BMC/BIOS (dmidecode)` was already reading the correct, consistent value; nothing was actually missing.
+
+*Status: resolved, no action taken. Logged as a reference entry — same "looks like two numbers disagree, actually two different things" pattern as §23, worth recognizing quickly if it recurs.*
+
+## 25. Production Golden-Image Cloning — UUID / machine-id / SSH Host Key Duplication
+
+Raised from a separate conversation and brought back here for tracking: this reference layout is the source image for production units, which are duplicated via a **ROM writer** (block-level disk cloning), not PXE/`curtin` per-node install (PXE is a possible future direction, not the current path). Block-level cloning duplicates everything on the golden disk byte-for-byte — including several pieces of state that are only supposed to be unique per machine.
+
+**Three separate issues identified, not one:**
+
+1. **Root/boot device addressing (`root=UUID=...` in the kernel cmdline).** The original concern: every cloned unit would boot with an identical filesystem UUID, and the goal was specifically to eliminate `UUID=` as a boot dependency so duplicate/ambiguous UUIDs could never be *why* a node fails to find root — not just a cosmetic fleet-management annoyance.
+2. **`machine-id`** — identical across every clone unless addressed.
+3. **SSH host keys** — identical across every clone unless addressed; the more serious of the three, since a compromised key on one node could be used to MITM connections to any other node sharing it.
+
+**Resolution differs by issue, and it matters which mechanism applies to which:**
+
+- **Root/boot (#1):** Initially considered `tune2fs -U random` + per-node `fstab`/`grub` regeneration on every clone's first boot. Reconsidered once two hardware facts were confirmed: this platform's M.2 NVMe has a **fixed physical slot/BDF with no reseat risk**, and **every node in the rack shares the same unified hardware design**. Given both, `/dev/disk/by-path/pci-0015:01:00.0-nvme-1-part2` is identical *and correct* on every cloned node — unlike UUID, which is identical but meaningless as a per-node identifier. This turns the fix into a **one-time golden-image edit**, not per-node logic:
+  ```bash
+  # /etc/fstab - by-path instead of by-uuid for both root and /boot/efi
+  # /etc/default/grub - GRUB_DISABLE_LINUX_UUID=true
+  sudo update-grub
+  ```
+  **Confirmed working on this reference node** — post-reboot `/proc/cmdline` shows `root=/dev/nvme0n1p2`, no `UUID=` anywhere. Note: the kernel cmdline shows the resolved device node, not the literal by-path string from `fstab` — that's normal `grub-probe` behavior (resolves the mounted device to its real underlying node), not a sign the by-path config didn't take effect. `/dev/nvme0n1p2`'s own stability (as opposed to `by-path`'s) relies specifically on this platform having exactly one NVMe controller — true here, would need revisiting on a multi-NVMe-controller platform.
+  **If the hardware-uniformity assumption ever breaks** (board revision changes M.2 placement, hot-swap bays introduced, a drive physically moved between slots during repair) — this needs to revert to UUID-based addressing with real per-node regeneration.
+
+- **`machine-id` (#2):** No custom mechanism needed. `systemd` auto-regenerates it at boot whenever the file is present but *empty* (not missing) — standard convention already used by Ubuntu's own cloud images. Golden-image prep: `sudo truncate -s 0 /etc/machine-id` before capture.
+
+- **SSH host keys (#3):** No custom mechanism needed either. Ubuntu's `ssh.service` dependency chain regenerates any *missing* host key type automatically at boot. Golden-image prep: `sudo rm -f /etc/ssh/ssh_host_*` before capture.
+
+**Deliverables produced** (not just discussed — actual files, delivered as artifacts):
+- `golden-image-prep-checklist.md` — the full one-time prep sequence to run on this reference node immediately before ROM-writer capture (by-path fstab/grub edit, machine-id truncation, SSH host key removal, and why the EFI partition's own volume ID is deliberately left alone), plus what happens automatically on each clone's actual first boot.
+- `first-boot-regen.sh` / `first-boot-regen.service` — a self-triggering, self-disabling systemd oneshot unit (`ConditionPathExists=!/var/lib/first-boot-regen-done`) that fires once per cloned node. After the by-path decision, this no longer does anything boot-critical — it only gives each node a genuinely unique filesystem UUID for asset-tracking/tooling clarity (no `fstab`/`grub` edit, no reboot, since boot no longer depends on that value at all).
+
+**Zero production-line touch required** — every regeneration step happens automatically on each unit's own first boot; the only manual work is the one-time golden-image prep on this reference node before the ROM writer captures it.
+
+**Open items — not yet validated end-to-end:**
+- Root/boot by-path change is confirmed working on *this* node's own reboot — but the full first-boot sequence (regen service, `machine-id`, SSH host keys) hasn't yet been exercised against an actual ROM-writer-cloned unit. First real clone should be watched through the whole sequence before trusting this at scale.
+- Whether the ROM writer performs an offline block-level copy (assumed) vs. some other mechanism that might behave differently — not independently confirmed.
+- "Unified hardware design across the rack" — the load-bearing assumption for the entire by-path approach — hasn't been explicitly confirmed by whoever owns the hardware BOM/board revisions, only assumed reasonable.
+
+*Status: designed, partially validated (root/boot confirmed on this node), not yet validated end-to-end against a real clone. Do not treat as production-proven until the first actual ROM-writer unit has been walked through the full first-boot sequence.*
+
+## 26. Next Steps (not yet started)
 
 - [x] NVIDIA kernel build packages (gcc, dkms, make) — see §5
 - [x] NVIDIA datacenter driver install — 580.173.02 confirmed via `nvidia-smi`, see §7
