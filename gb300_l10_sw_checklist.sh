@@ -85,9 +85,54 @@
 #                       since holding it to a target that doesn't exist in the
 #                       source of truth would just reintroduce a different
 #                       false "CHECK"/stale-value problem.
+#   0.4.5  2026-08-10  Added "CX8 Firmware Version" check (EXPECTED_CX8_FW =
+#                       40.49.1118, per Host Software Components matrix /
+#                       NVOnline 1160245 "CX8" entry) - previously only BF3
+#                       firmware had a version check, with no ConnectX-8
+#                       equivalent despite CX8 FW being tracked elsewhere in
+#                       the build log. Queries mt4131_pciconf0 (card 1 of 4;
+#                       same placeholder-path caveat as the existing BF3
+#                       check applies - confirm via `mst status` and adjust,
+#                       or extend to loop over all 4 cards if per-card
+#                       drift matters).
+#                       Deliberately NOT adding a "BF3 DPU OS version" check:
+#                       this build uses the firmware-only BF3 bundle (not the
+#                       OS+firmware bundle) because BF3 is configured in NIC
+#                       mode, where the DPU's Arm cores don't run a
+#                       customer-facing OS. There is no OS version to read on
+#                       this design, so the row would always read MISSING
+#                       with no fix available. Waived for now; revisit only
+#                       if BF3 mode changes to embedded/DPU mode.
+#   0.4.6  2026-08-10  "Fabric Manager Service"/"Fabric Manager Version"
+#                       reclassified from MISSING to a new N/A status (added
+#                       note_na() helper + blue [N/A] row, excluded from the
+#                       MISSING tally). Root cause: on the GB300 NVL72
+#                       rack-scale design, the NVLink switch trays are
+#                       self-contained managed switches running their own
+#                       NVOS - fabric management lives there, not on the
+#                       compute tray host. This host will never run
+#                       `nvidia-fabricmanager`/`nv-fabricmanager` regardless
+#                       of bring-up stage, racked or not, so treating it as
+#                       MISSING was a structural false-negative, not
+#                       deferred work (same category as "NVSwitch Devices",
+#                       left as-is for now since it's a single-row informal
+#                       case rather than a second N/A conversion in this
+#                       pass). Simply dropping the EXPECTED_FM comparison
+#                       (the MOFED v0.4.4 pattern) was considered and
+#                       rejected - MOFED was present with no target to check
+#                       against, so it resolved to OK; Fabric Manager is
+#                       structurally absent here, so it would still read
+#                       MISSING regardless of any target comparison. Needed
+#                       an actual new status, not just a dropped target.
+#                       EXPECTED_FM retained (not removed like EXPECTED_MOFED)
+#                       since GFM 580.173.04 is still a real, valid component
+#                       version per the NVOnline source of truth - it's just
+#                       verified on the NVSwitch/NVOS side of bring-up, not by
+#                       this script. Value is now referenced in the N/A row's
+#                       message as a pointer for whoever does that check.
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.4"
+SCRIPT_VERSION="0.4.6"
 
 set -uo pipefail
 
@@ -112,7 +157,10 @@ EXPECTED_CUDA="13.0"          # corrected from stale 12.8 - confirmed via NVOnli
                                 # Table 2, paired with Datacenter Driver 580.173.02 (exact
                                 # match to installed driver) -> CUDA Toolkit 13.0.2
 EXPECTED_FM="580.173.04"       # corrected from stale "570" - confirmed via NVOnline
-                                # 1160245 source file (GFM: 580.173.04)
+                                # 1160245 source file (GFM: 580.173.04). Kept as a
+                                # documentation reference only as of v0.4.6 - GFM lives
+                                # on the NVSwitch tray's NVOS, not this compute host, so
+                                # the checks below no longer compare against it.
 # EXPECTED_MOFED removed - confirmed via NVOnline 1160245 (full component list
 # checked) that MOFED/OFED is NOT independently versioned in this release; it
 # is absorbed into DOCA_Host (3.4.1-010000, already correct above). The
@@ -121,6 +169,8 @@ EXPECTED_DOCA="3.4.1"          # per Host Software Components matrix (3.4.1-0100
 EXPECTED_DCGM="3.3"
 EXPECTED_MFT="4.36.0"          # per Host Software Components matrix (4.36.0-147)
 EXPECTED_BF3_FW="32.49.1118"   # per Host Software Components matrix
+EXPECTED_CX8_FW="40.49.1118"   # per Host Software Components matrix (CX8 entry,
+                                # NVOnline 1160245); confirmed via ibstat mlx5_5
 
 LOGFILE=""
 while getopts "o:v" opt; do
@@ -134,7 +184,7 @@ done
 # ----------------------------------------------------------------------------
 # 1. Helpers
 # ----------------------------------------------------------------------------
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BOLD='\033[1m'; NC='\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
 declare -a ROWS=()   # accumulates rows for final summary table
 
@@ -155,11 +205,21 @@ check() {
   ROWS+=("${name}|${out}|${status}")
 }
 
+note_na() {
+  # note_na "Component" "reason" - for components that are structurally not
+  # present on this host (e.g. owned by a different tray/OS), rather than
+  # genuinely-pending bring-up work. Excluded from the MISSING count so it
+  # doesn't read as a false-negative failure.
+  local name="$1" reason="$2"
+  ROWS+=("${name}|${reason}|N/A")
+}
+
 print_row() {
   local name="$1" val="$2" status="$3" color
   case "$status" in
     OK)      color="$GREEN" ;;
     MISSING) color="$RED" ;;
+    N/A)     color="$BLUE" ;;
     *)       color="$YELLOW" ;;
   esac
   printf " %-32s : %-38s [${color}%s${NC}]\n" "$name" "$val" "$status"
@@ -203,8 +263,14 @@ check "GPU Kernel Module"     "modinfo nvidia | grep -m1 ^version"
 # 4. Collect: NVLink / NVSwitch / Fabric Manager
 # ----------------------------------------------------------------------------
 section "NVLink / NVSwitch / Fabric Manager"
-check "Fabric Manager Service" "systemctl is-active nvidia-fabricmanager"
-check "Fabric Manager Version" "nv-fabricmanager --version" "$EXPECTED_FM"
+# Fabric Manager: reclassified N/A as of v0.4.6, not a MISSING/failure. On the
+# GB300 NVL72 rack-scale design, fabric management runs on the NVSwitch
+# tray's own NVOS, not this compute host - `nvidia-fabricmanager`/
+# `nv-fabricmanager` are not expected to exist here at any bring-up stage,
+# racked or not. Verify GFM version (target: $EXPECTED_FM) on the
+# NVSwitch/NVOS side of bring-up instead.
+note_na "Fabric Manager Service" "runs on NVSwitch tray (NVOS), not this host"
+note_na "Fabric Manager Version" "verify via NVOS, target $EXPECTED_FM"
 check "NVLink Active Links"    "nvidia-smi nvlink -s -i 0 | grep -c 'Active'"
 check "NVSwitch Devices"       "nvidia-smi -q | grep -m1 -i 'NVSwitch'"
 check "GPU Topology (summary)" "nvidia-smi topo -m | head -1"
@@ -220,8 +286,17 @@ check "DOCA Version"           "doca_version 2>/dev/null || dpkg -l | grep -m1 d
 check "BlueField DPU Detected" "lspci | grep -m1 -i 'BlueField'"
 check "MFT Tools Version"      "mst version 2>/dev/null || flint -v 2>/dev/null | head -1" "$EXPECTED_MFT"
 check "BF3 Firmware Version"   "flint -d /dev/mst/mt41692_pciconf0 q 2>/dev/null | grep -m1 'FW Version'" "$EXPECTED_BF3_FW"
-    # NOTE: /dev/mst/mt41692_pciconf0 is a placeholder mst device path - confirm
-    # actual device name via `mst status` once MFT tools are installed and adjust.
+check "CX8 Firmware Version"   "flint -d /dev/mst/mt4131_pciconf0 q 2>/dev/null | grep -m1 'FW Version'" "$EXPECTED_CX8_FW"
+    # NOTE: /dev/mst/mt41692_pciconf0 and /dev/mst/mt4131_pciconf0 are placeholder
+    # mst device paths - confirm actual device names via `mst status` once MFT
+    # tools are installed and adjust. CX8 check above only covers card 1 of 4;
+    # extend to loop over all cards if per-card firmware drift is a concern.
+    #
+    # NOTE: no "BF3 DPU OS version" check - waived deliberately, not an
+    # oversight. This build uses the firmware-only BF3 bundle (NIC mode), so
+    # the DPU Arm cores never run a customer-facing OS; there is no OS
+    # version to read here. Revisit only if BF3 mode changes to embedded/DPU
+    # mode with a full OS+firmware bundle.
 
 # ----------------------------------------------------------------------------
 # 6. Collect: DCGM / Container Runtime / Orchestration
@@ -242,19 +317,20 @@ echo -e "${BOLD}================================================================
 echo -e "${BOLD} GB300 NVL L10 SYSTEM SOFTWARE CHECKLIST  v${SCRIPT_VERSION}  ($(date '+%Y-%m-%d %H:%M:%S'))${NC}"
 echo -e "${BOLD}==================================================================${NC}"
 
-pass=0; fail=0; check_n=0
+pass=0; fail=0; check_n=0; na=0
 for row in "${ROWS[@]}"; do
   IFS='|' read -r name val status <<< "$row"
   print_row "$name" "$val" "$status"
   case "$status" in
     OK) ((pass++)) ;;
     MISSING) ((fail++)) ;;
+    N/A) ((na++)) ;;
     *) ((check_n++)) ;;
   esac
 done
 
 echo -e "${BOLD}------------------------------------------------------------------${NC}"
-echo -e " Summary: ${GREEN}${pass} OK${NC} | ${YELLOW}${check_n} NEEDS REVIEW${NC} | ${RED}${fail} MISSING${NC}"
+echo -e " Summary: ${GREEN}${pass} OK${NC} | ${YELLOW}${check_n} NEEDS REVIEW${NC} | ${RED}${fail} MISSING${NC} | ${BLUE}${na} N/A${NC}"
 echo -e "${BOLD}==================================================================${NC}"
 
 # ----------------------------------------------------------------------------
@@ -269,7 +345,7 @@ if [[ -n "$LOGFILE" ]]; then
       printf " %-32s : %-38s [%s]\n" "$name" "$val" "$status"
     done
     echo "--------------------------------------------------------------------"
-    echo "Summary: ${pass} OK | ${check_n} NEEDS REVIEW | ${fail} MISSING"
+    echo "Summary: ${pass} OK | ${check_n} NEEDS REVIEW | ${fail} MISSING | ${na} N/A"
   } > "$LOGFILE"
   echo
   echo "Log written to: $LOGFILE"
