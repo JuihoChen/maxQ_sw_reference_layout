@@ -46,11 +46,58 @@
 #                       CUDA Toolkit 13.0.2 with Datacenter Driver 580.173.02
 #                       - an exact match to the already-installed/confirmed
 #                       driver, giving high confidence in the pairing.
+#   0.4.2  2026-08-07  Fixed two false-negative checks found during first
+#                       full run: (1) "IOMMU Enabled" checked for an x86-style
+#                       dmesg log string ('IOMMU enabled') that Grace/ARM never
+#                       emits - platform uses SMMU instead, enabled via ACPI
+#                       IORT rather than a boot-time log line. Replaced with a
+#                       populated-/sys/kernel/iommu_groups/ count check, which
+#                       is architecture-agnostic and reflects actual translation
+#                       state rather than a specific kernel log message.
+#                       (2) "CUDA Version (driver)" used
+#                       `nvidia-smi --query-gpu=cuda_version`, which errors
+#                       ("Field \"cuda_version\" is not a valid field to query")
+#                       on this driver/nvidia-smi build. Replaced with parsing
+#                       the "CUDA Version: X.Y" string from plain `nvidia-smi`
+#                       header output instead.
+#   0.4.3  2026-08-10  "nvcc (CUDA toolkit)" still reported MISSING when the
+#                       script itself was run as `sudo ./gb300_l10_sw_checklist.sh`
+#                       (its own documented Usage), even after adding
+#                       /usr/local/cuda/bin to PATH via /etc/profile.d and
+#                       /etc/bash.bashrc. Root cause: `sudo script.sh` is a
+#                       non-interactive invocation, which never sources those
+#                       files regardless of shell config - and sudo's own
+#                       secure_path resets PATH independently besides. Fixed
+#                       by adding /usr/local/cuda/bin to PATH defensively
+#                       inside the script itself rather than relying on the
+#                       caller's environment.
+#   0.4.4  2026-08-10  Two corrections against NVOnline 1160245's full raw
+#                       JSON component list (GB300MaxQNVL_72x1 2.0.0-build25),
+#                       not just the Table 2 excerpt used for CUDA/driver in
+#                       v0.4.1: (1) EXPECTED_FM corrected "570" -> "580.173.04"
+#                       to match the confirmed GFM entry. (2) EXPECTED_MOFED
+#                       removed entirely - confirmed via the full component
+#                       list (every versioned item in the milestone checked,
+#                       not just OFED-related ones) that MOFED/OFED has no
+#                       independent version entry in this release; it's
+#                       absorbed into DOCA_Host (already correct). The MOFED
+#                       check is now informational-only, no PASS/FAIL target,
+#                       since holding it to a target that doesn't exist in the
+#                       source of truth would just reintroduce a different
+#                       false "CHECK"/stale-value problem.
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.1"
+SCRIPT_VERSION="0.4.4"
 
 set -uo pipefail
+
+# Ensure the CUDA toolkit is discoverable even when this script is invoked
+# non-interactively (e.g. `sudo ./gb300_l10_sw_checklist.sh`, per the Usage
+# line above) or via cron/CI. Non-interactive shells don't source
+# /etc/profile.d/, /etc/bash.bashrc, or ~/.bashrc, and sudo's own secure_path
+# resets PATH regardless - so relying on the caller's shell environment for
+# this is not reliable. Handled defensively here instead.
+[[ -d /usr/local/cuda/bin ]] && PATH="/usr/local/cuda/bin:$PATH"
 
 # ----------------------------------------------------------------------------
 # 0. Config: expected versions (edit to match your NVIDIA 2.0 release matrix)
@@ -64,8 +111,12 @@ EXPECTED_DRIVER="580.173.02"   # per Host Software Components matrix
 EXPECTED_CUDA="13.0"          # corrected from stale 12.8 - confirmed via NVOnline 1160245
                                 # Table 2, paired with Datacenter Driver 580.173.02 (exact
                                 # match to installed driver) -> CUDA Toolkit 13.0.2
-EXPECTED_FM="570"
-EXPECTED_MOFED="24.10"
+EXPECTED_FM="580.173.04"       # corrected from stale "570" - confirmed via NVOnline
+                                # 1160245 source file (GFM: 580.173.04)
+# EXPECTED_MOFED removed - confirmed via NVOnline 1160245 (full component list
+# checked) that MOFED/OFED is NOT independently versioned in this release; it
+# is absorbed into DOCA_Host (3.4.1-010000, already correct above). The
+# "MOFED Version" check below is now informational-only (no PASS/FAIL target).
 EXPECTED_DOCA="3.4.1"          # per Host Software Components matrix (3.4.1-010000)
 EXPECTED_DCGM="3.3"
 EXPECTED_MFT="4.36.0"          # per Host Software Components matrix (4.36.0-147)
@@ -129,7 +180,7 @@ check "Kernel Page Size"      "getconf PAGE_SIZE" "65536"
 check "Architecture"          "uname -m"
 check "BMC/BIOS (dmidecode)"  "dmidecode -s bios-version"
 check "System Product Name"   "dmidecode -s system-product-name"
-check "IOMMU Enabled"         "dmesg | grep -m1 -i 'IOMMU enabled'"
+check "IOMMU Enabled"         "[ $(ls /sys/kernel/iommu_groups/ 2>/dev/null | wc -l) -gt 0 ] && echo yes"
 check "Kernel Pkgs Held (meta)"    "apt-mark showhold | grep -m1 '^linux-nvidia-64k-hwe'"
 check "Kernel Pkgs Held (image)"   "apt-mark showhold | grep -m1 '^linux-image-nvidia-64k-hwe'"
 check "Kernel Pkgs Held (headers)" "apt-mark showhold | grep -m1 '^linux-headers-nvidia-64k-hwe'"
@@ -140,7 +191,7 @@ check "unattended-upgrades"   "systemctl is-active unattended-upgrades" "inactiv
 # ----------------------------------------------------------------------------
 section "NVIDIA Driver / CUDA / GPU"
 check "NVIDIA Driver Version" "nvidia-smi --query-gpu=driver_version --format=csv,noheader -i 0" "$EXPECTED_DRIVER"
-check "CUDA Version (driver)" "nvidia-smi --query-gpu=cuda_version --format=csv,noheader -i 0" "$EXPECTED_CUDA"
+check "CUDA Version (driver)" "nvidia-smi | grep -oP 'CUDA Version:\s*\K[0-9.]+' | head -n1" "$EXPECTED_CUDA"
 check "nvcc (CUDA toolkit)"   "nvcc --version | grep release"
 check "GPU Count"             "nvidia-smi --query-gpu=count --format=csv,noheader -i 0"
 check "GPU Name"              "nvidia-smi --query-gpu=name --format=csv,noheader -i 0"
@@ -162,7 +213,7 @@ check "GPU Topology (summary)" "nvidia-smi topo -m | head -1"
 # 5. Collect: Networking (MOFED / RDMA / DOCA / BlueField)
 # ----------------------------------------------------------------------------
 section "Networking / MOFED / DOCA (BlueField)"
-check "MOFED Version"          "ofed_info -s" "$EXPECTED_MOFED"
+check "MOFED Version"          "ofed_info -s"
 check "IB Devices"             "ibstat -l | tr '\n' ' '"
 check "RDMA Link Status"       "rdma link show | head -1"
 check "DOCA Version"           "doca_version 2>/dev/null || dpkg -l | grep -m1 doca-runtime" "$EXPECTED_DOCA"

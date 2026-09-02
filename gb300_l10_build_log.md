@@ -830,58 +830,16 @@ pega@carlonext:~$ sudo mlxconfig -d /dev/mst/mt4131_pciconf0 q | grep -iE 'num_o
 
 ## 15. nvcc PATH Fix (system-wide, for reference hand-off)
 
-**Context:** `nvcc` MISSING in §14's checklist runs. Root cause: `cuda-toolkit-13-0` (§9) correctly set `/usr/local/cuda` → `/usr/local/cuda-13.0` via `update-alternatives`, but never added `/usr/local/cuda/bin` to `PATH`.
-
-**Why not `~/.bashrc`:** since this build is intended as a reference layout for hand-off, a per-user dotfile fix wouldn't apply to other users, root, or non-interactive/scripted shells. Used a system-wide `/etc/profile.d/` drop-in instead:
+`nvcc` was MISSING in checklist runs — toolkit installed correctly (§9), but `/usr/local/cuda/bin` was never added to `PATH`. Used a system-wide `/etc/profile.d/` drop-in rather than `~/.bashrc`, since this build is meant for hand-off:
 
 ```bash
-cat <<'EOF' | sudo tee /etc/profile.d/cuda.sh
-export PATH=/usr/local/cuda/bin:$PATH
-EOF
+echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh
 sudo chmod 644 /etc/profile.d/cuda.sh
 ```
 
-**Runtime library check (not just the binary):** confirmed `cuda-cudart`'s install already registered the CUDA lib path with `ldconfig` correctly — no additional `/etc/ld.so.conf.d/` entry needed.
+`ldconfig -p | grep cudart` confirmed runtime libs were already correctly registered, no extra fix needed there. Confirmed both via `nvcc --version` (`release 13.0, V13.0.88`, matching the installed toolkit) and a full checklist re-run (`nvcc` now `OK`, `29 OK | 1 CHECK | 7 MISSING`).
 
-```
-pega@carlonext:~$ ldconfig -p | grep -i cudart
-        libcudart.so.13 (libc6,AArch64) => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13
-        libcudart.so (libc6,AArch64) => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so
-```
-
-**Verification:**
-
-```
-pega@carlonext:~$ nvcc --version
-nvcc: NVIDIA (R) Cuda compiler driver
-Copyright (c) 2005-2025 NVIDIA Corporation
-Built on Wed_Aug_20_01:57:39_PM_PDT_2025
-Cuda compilation tools, release 13.0, V13.0.88
-Build cuda_13.0.r13.0/compiler.36424714_0
-```
-
-`release 13.0, V13.0.88` — matches the `13.0.2` toolkit installed in §9.
-
-*Status: complete. §9's deferred CUDA verification is now fully closed out (compiler confirmed working, not just the packages installed).*
-
-## 15a. Checklist Hang During Active MODS Session — Expected, Not a Defect
-
-During partner-diag prep, `gb300_l10_sw_checklist.sh` was run while a MODS-related setup step from the partner diagnostics package (`629-24059-0000-FLD-60004-rev23.tgz`, `mods_mapping.json`) had already been executed. The checklist hung indefinitely on the `NVIDIA Driver / CUDA / GPU` section — specifically the `nvidia-smi`-based checks — because MODS setup unloads/blacklists the `nvidia` driver for exclusive low-level GPU access, and the checklist script has no timeout on any of its checks (a real gap, worth fixing separately, but out of scope here). Once the MODS-related driver state cleared, a subsequent run completed normally with no hang.
-
-**Takeaway for future runs:** don't run `gb300_l10_sw_checklist.sh` during an active MODS/partnerdiag session — it fundamentally can't produce meaningful driver/GPU results while the driver is deliberately out of the picture, and will hang rather than fail fast.
-
-*Status: understood as expected interaction between MODS and the checklist, not a script defect. Missing-timeout-on-checks noted as a real, separate follow-up for the script.*
-
-## 15b. Checklist Confirmation Run — Post §15 Fix
-
-```
- CUDA Version (driver)            : 13.0                                   [OK]
- nvcc (CUDA toolkit)              : Cuda compilation tools, release 13.0, V13.0.88 [OK]
- ...
- Summary: 29 OK | 1 NEEDS REVIEW | 7 MISSING
-```
-
-`nvcc` now `OK`, confirming §15's `/etc/profile.d/cuda.sh` fix end-to-end via the checklist itself (not just the manual `nvcc --version` spot check). Best result to date. Remaining `MISSING` rows (Fabric Manager, DCGM, Docker/containerd/nvidia-container-toolkit/default runtime) are all legitimately pending — matches the known open-items list, not new findings. `NVSwitch Devices` (`MISSING`) and `MOFED Version` (`CHECK`) remain the two unresolved items from §14.
+**Aside — checklist hang during active MODS session:** separately, `gb300_l10_sw_checklist.sh` was found to hang indefinitely if run while a MODS-related setup step from the partner diagnostics package was already active (MODS unloads/blacklists the `nvidia` driver for exclusive GPU access, and the checklist has no timeout on its checks). Not a defect — the checklist can't produce meaningful GPU results while the driver is deliberately out of the picture. Resolved once the MODS session cleared. Missing-timeout-on-checks noted as a real, separate script follow-up.
 
 *Status: complete.*
 
@@ -962,6 +920,16 @@ EXPECTED_FM="580.173.04"       # was "570"
 `MOFED Version` now `[OK]` (informational, no stale-target false flag). `CHECK` column at zero for the first time. Remaining `MISSING` rows are all legitimately pending installs (Fabric Manager, DCGM, Docker/containerd/nvidia-container-toolkit/default runtime) plus `NVSwitch Devices`, the one still-unresolved item.
 
 *Status: complete.*
+
+## 18. CPLD / EROT / HMC / FPGA Readout — In-Band vs. Out-of-Band
+
+Checked whether CPLD, EROT, HMC, FPGA (per NVOnline component table) are readable in-band, same as SBIOS (`dmidecode -t 0`) and GPU/VBIOS (`nvidia-smi`).
+
+**Finding:** only SBIOS is genuinely in-band — CPLD/EROT/HMC/FPGA are BMC-domain firmware, not exposed to the host as PCIe/DMI devices. The standard tool for reading them (`nvfwupd`) is explicitly documented as out-of-band, requiring a BMC IP target (`-t ip=<bmc-ip> ...`) regardless of whether that IP is reached over the datacenter network or a local host↔BMC link. Decided not to pursue further since a BMC IP is required either way.
+
+**Separately confirmed as an accepted, known gap (not investigated further):** HMC version mismatch against the NVOnline reference table — firmware update not yet available for this component.
+
+*Status: closed — BMC IP required for these four; not pursued further per decision above.*
 
 ## 8. Next Steps (not yet started)
 
