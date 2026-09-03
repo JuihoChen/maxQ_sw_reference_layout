@@ -299,24 +299,37 @@ exit
 
 ### EXACT RESUME POINT — start here in the next session
 
-Image build is stable and reproducible (6f + 6g confirm it two different ways), though 6i found it's costing ~8.5 hours per build, dominated by a redundant DKMS/OFED cycle against an irrelevant kernel. 6k confirms DOCA/driver/IMEX are untouched and correct. **6l/6m: both `dgx_gb200` and `dgx_gb300` are now confirmed to build successfully — the production-named `baseos-1014-doca321` was most recently rebuilt with `--dgx-type dgx_gb300`, after a host-level `/dev` incident (6m) was resolved via reboot.** Which flag is *correct* for real GB300 NVL hardware is still open with NV; viability is not. Next:
+Image build is stable and reproducible (6f + 6g confirm it two different ways), though 6i found it's costing ~8.5 hours per build, dominated by a redundant DKMS/OFED cycle against an irrelevant kernel. 6k confirms DOCA/driver/IMEX are untouched and correct. **6l/6m: both `dgx_gb200` and `dgx_gb300` are now confirmed to build successfully — the production-named `baseos-1014-doca321` was most recently rebuilt with `--dgx-type dgx_gb300`, after a host-level `/dev` incident (6m) was resolved via reboot.** Which flag is *correct* for real GB300 NVL hardware is still open with NV; viability is not. Next, grouped by phase:
+
+**Phase 1 — Blocking verification & escalation (resolve before touching category/nodes):**
 1. **Verify, don't assume:** check whether `baseos-1014-doca321`'s current build already has the fabricmanager mask override baked in (`ls -la /etc/systemd/system/nvidia-fabricmanager.service` inside `cm-chroot-sw-img` — expect `-> /dev/null`; see 6k). If present, no further action needed on this point. If absent, apply the manual install-and-mask fix (8.3) and re-commit via `-d` before assigning this image to a category.
 2. **Escalate to NV** per 6l's updated question — which of `gb200`/`gb300` is correct for GB300 NVL, and whether `maxQ106`'s original validation ever went through this flag at all. Do not provision the 18-node rack until this is answered, given the risk is now a silent wrong-parameter choice (e.g. IOMMU/PCIe/NVLink topology), not a build failure.
-3. Optional, recommended: run the `gb200` vs `gb300` diff described in 6l (kernel params + package list) to have concrete data ready for NV, and/or for your own judgment call if NV's answer is delayed.
-4. Optional but recommended before repeating x7: check `/var/log/apt/history.log` and `/var/log/apt/term.log` inside the image (`cm-chroot-sw-img`) on the next build to nail down the exact mechanism by which the `6.8.0-106` packages vanish from `dpkg -l` despite being explicitly installed twice (see 6i) — needed for a precise NV/BCM support write-up, not needed to proceed with provisioning.
-5. Before any future rack build, if "Validating repo configuration" fails again, check the head node's own `/dev` (6m) before assuming it's a repo or `--dgx-type` problem — this failure signature now has two known, unrelated causes.
-6. Assign category to `baseos-1014-doca321` (once steps 1–2 are resolved).
-7. Assign the 18 nodes in the target rack to that category.
-8. Provision the rack, watching for the per-node identity question below (machine-id/SSH host keys/hostname) since it hasn't been confirmed to auto-resolve yet.
-9. Run L11 (rack/fabric-level) partnerdiag once provisioned.
-10. If any NEW error appears at any step, apply the same pattern used throughout Section 6: get the exact line from `/var/log/cm-create-image-baseos-1014-doca321.log` (or the equivalent node-installer log once past image-build) — don't guess from a truncated on-screen `[FAILED]` message. Remember "Finalizing cluster services" failures may be non-fatal (6j) while "Finalizing image services" failures are not (6d).
-11. **Not yet started:** investigate the proposed `hosts.suffix`/`#HOSTNAME#` fix for a `BF3PcieInterfaceTraffic` partnerdiag failure (6n) — verify the mechanism against real BCM documentation before applying anything, since it's currently unverified and unapplied.
-12. Resolve the still-open items below in parallel.
+
+**Phase 2 — Pending image-level fixes (resolve/apply before assigning nodes, not after):**
+3. **Not yet started:** investigate the proposed `hosts.suffix`/`#HOSTNAME#` fix for a `BF3PcieInterfaceTraffic` partnerdiag failure (6n/8.9) — verify the mechanism against real BCM documentation before applying anything, since it's currently unverified and unapplied.
+4. Confirm the `nsswitch.conf` SSSD-hang fix (6o/8.8) — real-node reproduction and fix now confirmed working — is actually the *intended* trade-off (i.e. local-only account resolution is correct for this cluster's access model, not just effective at stopping the hang).
+5. Decide and apply a fix for the `/swap.img` sparse-file inflation (6p) — either fix the tar sparseness (archive-creation side or `cm-create-image --tar-options`) or simply exclude `swap.img` from the image via `-o`/`--exclude-from`. Costs ~8GB per image otherwise, multiplied across 8 racks.
+
+**Phase 3 — Optional diagnostics (nice-to-have, not blocking provisioning):**
+6. Optional, recommended: run the `gb200` vs `gb300` diff described in 6l (kernel params + package list) to have concrete data ready for NV, and/or for your own judgment call if NV's answer is delayed.
+7. Optional but recommended before repeating x7: check `/var/log/apt/history.log` and `/var/log/apt/term.log` inside the image (`cm-chroot-sw-img`) on the next build to nail down the exact mechanism by which the `6.8.0-106` packages vanish from `dpkg -l` despite being explicitly installed twice (see 6i) — needed for a precise NV/BCM support write-up, not needed to proceed with provisioning.
+8. Before any future rack build, if "Validating repo configuration" fails again, check the head node's own `/dev` (6m) before assuming it's a repo or `--dgx-type` problem — this failure signature now has two known, unrelated causes.
+
+**Phase 4 — Actual provisioning (once Phases 1–2 are resolved):**
+9. Assign category to `baseos-1014-doca321`.
+10. Assign the 18 nodes in the target rack to that category.
+11. Provision the rack, watching for the per-node identity question below (machine-id/SSH host keys/hostname) since it hasn't been confirmed to auto-resolve yet.
+12. Run L11 (rack/fabric-level) partnerdiag once provisioned.
+13. If any NEW error appears at any step, apply the same pattern used throughout Section 6: get the exact line from `/var/log/cm-create-image-baseos-1014-doca321.log` (or the equivalent node-installer log once past image-build) — don't guess from a truncated on-screen `[FAILED]` message. Remember "Finalizing cluster services" failures may be non-fatal (6j) while "Finalizing image services" failures are not (6d).
+
+**Phase 5:**
+14. Resolve the still-open items below in parallel.
 
 ### Still-open, non-blocking items
 - Per-node identity regeneration (machine-id, SSH host keys, hostname) across the 18 nodes — not yet confirmed how/whether BCM's node-installer handles this automatically. Check "Assigning Images to Nodes and Post Installation Configurations" doc section.
 - Whether an off-box backup of `maxQ106`'s pre-BCM-capture state exists — still never explicitly confirmed this session.
-- **Bake missing `/etc/network/interfaces.d/` and `/etc/ntpsec/` directories into `maxQ106` before the next re-tar (8.7).** Currently only patched live on `baseos-1014-doca321`'s extracted image directory — won't survive a fresh `-a` rebuild and hasn't been applied to any of the other 7 racks' future images. Same category of fix as the fabricmanager mask override (6k) — should be done once on the reference host, not repeated per rack.
+- **Bake missing `/etc/network/interfaces.d/`, `/etc/ntpsec/` directories, and the `nsswitch.conf` SSSD-hang fix (6o) into `maxQ106` before the next re-tar (8.7/6o).** Currently only patched live on `baseos-1014-doca321`'s extracted image directory — won't survive a fresh `-a` rebuild and hasn't been applied to any of the other 7 racks' future images. Same category of fix as the fabricmanager mask override (6k) — do all of these in one pass on the reference host, not repeated per rack.
+- **`/swap.img` inflated from 8.0K (sparse) to 8.0GB (fully allocated) during image capture (6p)** — confirmed via direct `du`/`ls -lsh`/`--apparent-size` measurement, root cause (tar sparseness lost somewhere in the archive-creation or extraction path) suspected but not pinned down. No fix applied yet; decide between fixing tar sparseness (`--tar-options --sparse`) vs. simply excluding `swap.img` from the image (`-o`/`--exclude-from`). Costs ~8GB per image, multiplied across all 8 racks if left unaddressed.
 - **`6.8.0-106-generic-64k` build-time cost (6i)** — reproduces reliably (hit in both the incremental and from-archive builds) and costs real wall-clock time (~8.5hr total build observed) via redundant DKMS/OFED cycles against a kernel that's discarded either way. Exact disposal mechanism unconfirmed (see 6i); worth an NV/BCM support report regardless, given it'll recur on all 7 remaining racks unless addressed.
 - **Root cause of the 6m `devtmpfs` incident** — head node recovered via reboot, but why it happened was never established. Worth a proper post-incident review with whoever else has admin/on-call ownership of this system, separate from the rack-build work.
 - **`BF3PcieInterfaceTraffic` partnerdiag `hosts.suffix` fix (6n) — proposed only, not applied, not verified.** Do not assume this is resolved; the `#HOSTNAME#` token's behavior in particular needs confirming before running the command.
@@ -386,6 +399,64 @@ echo "127.0.1.1   #HOSTNAME#" > /cm/images/baseos-1014-doca321/etc/hosts.suffix
 - Same archive-vs-live-directory caveat as 6k/8.7: if this does turn out to be a real, verified fix, it should ultimately be baked into the `maxQ106` reference archive before the next re-tar, not left as a manual step applied only to this one image directory.
 
 **Next session: verify the BCM `hosts.suffix`/`#HOSTNAME#` mechanism against actual BCM documentation or support before running the command above, then apply, then re-run `BF3PcieInterfaceTraffic` partnerdiag and confirm pass before writing this up as resolved.**
+
+### 6o. `ls -l`/`id` hangs on non-existent UIDs — SSSD/LDAP lookup timeout, fixed via `nsswitch.conf` — ✅ real-node reproduction and fix confirmed
+
+**Symptom:** commands resolving a UID/GID not present locally (e.g. `id <uid>`, `ls -l` on files owned by an unmapped UID) hang for an extended period rather than failing fast. Root cause: `/etc/nsswitch.conf`'s default `passwd`/`group`/`netgroup` lines fall through to SSSD, which in turn attempts an LDAP lookup for the unknown ID and blocks until that lookup times out, rather than returning "unknown" immediately.
+
+**Fix, applied on `maxQ106`:**
+
+```bash
+cm-chroot-sw-img /cm/images/baseos-1014-doca321
+sed -i 's/passwd:.*/passwd:     files/' /etc/nsswitch.conf
+sed -i 's/group:.*/group:      files/' /etc/nsswitch.conf
+sed -i 's/netgroup:.*/netgroup:   files/' /etc/nsswitch.conf
+exit
+```
+
+**Important trade-off, worth confirming is actually intended before this goes into all 8 racks' images:** this doesn't just fix the hang — it **disables SSSD/LDAP-based identity resolution on the node entirely**, falling back to local (`files`-based, i.e. `/etc/passwd`/`/etc/group`) account resolution only. Correct if these compute nodes are only ever accessed via local accounts (which is typical for BCM-managed compute nodes, where identity/auth is usually handled at the head-node/login-node layer rather than per-compute-node). Would be a real regression if any operator workflow depends on LDAP/AD-resolved accounts working directly on the compute nodes themselves. **Confirm this assumption holds for this cluster's actual access model before treating this as fully settled** — the *mechanism* is now proven real-world; the *access-model trade-off* is not yet confirmed intended.
+
+**✅ Real-node confirmation (supersedes the earlier chroot-only verification concern):** the exact symptom this section describes was independently reproduced on a real, PXE-provisioned node — `ls`/`ll` on `/home/SIT/nvdiag/629-24059-0000-FLD-60002-rev3` took noticeably longer than expected to return, consistent with per-file SSSD/LDAP owner-name lookups accumulating across the directory's contents. **Confirmed resolved after the `nsswitch.conf` fix above was applied.** This closes the gap flagged below (the original chroot-based `id`/`sed` check couldn't prove the fix worked against a live SSSD daemon) — it's now been proven against a real hang on real hardware, not just a file edit inside a chroot.
+
+> ⚠️ **Recommended test UID: use `9999`, not `604`, if re-verifying this in the future.** UIDs in roughly the 100–999 range are conventionally reserved for system/service accounts, so a value like `604` risks *coincidentally* being a real, locally-resolvable UID on some systems — a poor choice for a "prove this ID is definitely unresolvable" test. A clearly-out-of-range value like `9999` is the safer convention for this kind of check:
+> ```bash
+> time id 9999
+> time getent passwd 9999
+> ```
+
+**General caution for future verification of similar fixes, still worth keeping in mind:** don't trust a check run only inside `cm-chroot-sw-img` as proof a fix works — SSSD isn't an active running daemon inside a chroot (no live network/service context), so a fast result there only confirms a config file was edited, not that the real-world symptom is gone. Real verification needs a booted node with the relevant service actually running, as was ultimately done here.
+
+**Same archive-vs-live-directory caveat as every other fix in this section:** this was applied via `cm-chroot-sw-img` directly against `/cm/images/baseos-1014-doca321` — per the pattern established in 6d/6g, `nsswitch.conf` (like the rest of the base distribution) reverts to Ubuntu's shipped default if the node/image is ever rebuilt from a fresh, unmodified `-a` extraction of `maxQ106-1014-doca321-baseos.tgz`. **To survive future re-tars and apply automatically to the remaining 7 racks, this same `sed` fix needs to be run once on `maxQ106` itself before the next archive capture** — same standing reminder as the fabricmanager mask (6k) and the missing `interfaces.d`/`ntpsec` directories (8.7). Worth doing all three in the same pass the next time `maxQ106` is re-tar'd, rather than three separate capture cycles.
+
+### 6p. `/swap.img` sparse file inflated from 8.0K to 8.0GB during image capture — confirmed root cause, fix not yet applied
+
+**Found via a `du -shc /*` comparison between `maxQ106` (29G total) and the built image `baseos-1014-doca321` (36G total) — the ~7G gap traces almost entirely to one file.**
+
+On `maxQ106`:
+```
+8.0K -rw------- 1 root root 8.0G Jun 29 12:20 /swap.img
+```
+`ls -lsh` (`8.0K` actual disk blocks vs `8.0G` logical size) and `du --apparent-size` (reads `8.0G`, matching normal `du`'s `8.0K` only if sparse) **confirm `/swap.img` is a sparse file** on the source — a conventional way to create a swap file, where the filesystem allocates real disk blocks lazily as pages actually get written to swap, not upfront. On `maxQ106` it's essentially untouched (all logical zero-holes, ~8KB of real content).
+
+Inside `/cm/images/baseos-1014-doca321/swap.img`, `du` reports a full, non-sparse **8.0GB** — meaning the archive-capture and/or `cm-create-image` extraction process **materialized every logical hole into real, physically-written zero bytes**, turning an 8KB-on-disk file into a genuinely 8GB-on-disk file. This is the single largest contributor to the size difference between the two `du` outputs — confirmed, not just theorized.
+
+**Why this matters, beyond wasted disk space:**
+- At 18 nodes/rack × 8 racks, an extra ~8GB of dead weight per image build (and per resulting PXE image sync to each node, if node-installer transfers this file) is a real, multiplied cost — both in `/cm/images` storage on the head node and in per-node provisioning time/network transfer.
+- More importantly: **a compute node's swap should typically be created/sized by the node-installer itself at provisioning time**, not shipped pre-baked inside the image. A stale, image-baked 8GB swap file could be redundant with, or conflict with, whatever BCM's own per-node swap configuration does — worth confirming this file is even supposed to be part of the captured image at all, separate from the size-inflation problem.
+
+**Root cause, not yet fully pinned down but strongly suspected:** `tar` does not preserve sparseness on extraction unless invoked with a sparse-aware flag (commonly `--sparse`/`-S` for GNU tar). If the archive itself was captured without sparse-preserving options (`tar -S` on creation) and/or `cm-create-image`'s internal extraction doesn't pass an equivalent flag on unpack, a sparse file crossing that round-trip predictably inflates to its full logical size. `cm-create-image --help` exposes a `--tar-options ...` flag specifically for passing extra options to the extraction step — worth checking whether `--sparse` needs to be added there, or whether the fix actually belongs on the archive-creation side (on `maxQ106`, whatever process built `maxQ106-1014-doca321-baseos.tgz` in the first place).
+
+**Status: root cause confirmed via direct measurement. Fix not yet identified or applied.** Next steps:
+```bash
+# Check whether the archive itself already lost sparseness (would mean the fix belongs
+# at archive-creation time on maxQ106, not at cm-create-image's extraction step)
+tar -tvf /root/pre-built-images/maxQ106-1014-doca321-baseos.tgz swap.img
+du -h --apparent-size <(tar -xOf /root/pre-built-images/maxQ106-1014-doca321-baseos.tgz swap.img) 2>/dev/null
+
+# If cm-create-image's own extraction is the culprit, --tar-options may be the fix on the next build:
+cm-create-image -a ... --tar-options --sparse ...
+```
+Simplest possible interim workaround, independent of root-causing the tar behavior: just exclude `/swap.img` from the image entirely via `-o <exclude-file>`/rsync-format exclude pattern (per `cm-create-image --help`'s `-o`/`--exclude-from` flag), since swap is arguably not something that belongs in a captured golden image regardless of the sparse-file issue — worth deciding which approach is preferred before the next build.
 
 ---
 
@@ -505,7 +576,41 @@ sudo mkdir -p /etc/ntpsec
 
 Once captured into the archive this way, every future `-a` build (this rack's next rebuild and all 7 remaining racks) gets these directories automatically, with no per-image manual step needed — exactly how the fabricmanager masked-unit override became permanent once it was captured into the archive rather than reapplied via chroot on every build. Track this alongside the fabricmanager fix as one of the standing "things the next `maxQ106` re-tar should include."
 
-### 8.8 Verify before trusting the image
+### 8.8 Fix: `ls -l`/`id` hang on unresolvable UIDs (SSSD/LDAP timeout) — ✅ confirmed working, but confirm the trade-off is intended
+
+```bash
+cm-chroot-sw-img /cm/images/<image-name>
+sed -i 's/passwd:.*/passwd:     files/' /etc/nsswitch.conf
+sed -i 's/group:.*/group:      files/' /etc/nsswitch.conf
+sed -i 's/netgroup:.*/netgroup:   files/' /etc/nsswitch.conf
+exit
+```
+
+**Before applying to a new rack, confirm this trade-off is actually wanted for this cluster's access model:** this disables SSSD/LDAP-based identity resolution on the node entirely, falling back to local (`files`-only) account resolution — correct if compute nodes are only ever accessed via local accounts, a regression if any operator workflow depends on LDAP/AD-resolved accounts directly on the compute node. Full reasoning and real-node confirmation in 6o.
+
+**Verify with a UID that's genuinely guaranteed not to exist** — avoid low numbers like `604` that risk coincidentally matching a real system/service account:
+```bash
+time id 9999
+time getent passwd 9999
+```
+(Run this on a real, provisioned, SSSD-running node if possible — a chroot session can't reproduce the actual hang, see 6o.)
+
+**Same archive-baking reminder as 8.7:** apply once on `maxQ106` before the next re-tar so it's automatic for all remaining racks, rather than reapplying per-image.
+
+### 8.9 ⚠️ Candidate fix: `BF3PcieInterfaceTraffic` partnerdiag failure — UNVERIFIED, do not apply blind
+
+```bash
+echo "127.0.1.1   #HOSTNAME#" > /cm/images/<image-name>/etc/hosts.suffix
+```
+
+**Do not run this as a routine SOP step yet.** Unlike every other fix in this section, this one has **not** been confirmed to work, and the mechanism itself hasn't been verified:
+- Whether `/etc/hosts.suffix` is a real, documented BCM convention (content appended to the node-installer's generated `/etc/hosts`) or an untested assumption about the path.
+- Whether `#HOSTNAME#` is a literal token BCM's node-installer actually substitutes per-node — if it isn't, every node would get a broken `/etc/hosts` entry containing the literal string `#HOSTNAME#`, potentially causing a *new* hostname-resolution problem rather than fixing anything.
+- Why a PCIe interface traffic test on the BF3 would depend on `/etc/hosts` content at all — not yet explained.
+
+**Before including this in a real rack build:** verify the mechanism against actual BCM documentation or NV/BCM support, apply on a single test node, and confirm `BF3PcieInterfaceTraffic` partnerdiag actually passes as a direct result — see 6n for full context. Listed here as a placeholder so it isn't forgotten, not as an endorsed step.
+
+### 8.10 Verify before trusting the image
 
 ```bash
 cm-chroot-sw-img /cm/images/<image-name>
@@ -525,6 +630,9 @@ ls -la /etc/systemd/system/nvidia-fabricmanager.service   # expect -> /dev/null
 # config directories that must exist before first PXE boot (8.7)
 ls -la /etc/network/interfaces.d/ /etc/ntpsec/
 
+# nsswitch.conf SSSD-hang fix (8.8) — expect 'files' on all three lines
+grep -E "^(passwd|group|netgroup):" /etc/nsswitch.conf
+
 exit
 ```
 
@@ -534,7 +642,7 @@ cmsh -c "softwareimage; list"    # confirm image registered with correct kernel 
 
 Do **not** treat `/cm/images/<image-name>/boot/grub/grub.cfg` (checked from the head node) as a validation signal either way — BCM's node-installer regenerates real bootloader config on each node's own disk during provisioning; this file is not authoritative (see 6f).
 
-### 8.9 Known-acceptable states (don't re-debug these on future racks)
+### 8.11 Known-acceptable states (don't re-debug these on future racks)
 
 | Symptom | Verdict |
 |---|---|

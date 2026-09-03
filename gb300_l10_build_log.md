@@ -1256,8 +1256,27 @@ sudo mkdir -p /etc/ntpsec
 
 Unlike `machine-id`/SSH host keys, there's no per-clone regeneration needed here — these are static directories, not per-node identity state, so confirming/creating them once on this reference node before capture is sufficient; no `first-boot-regen` logic required.
 
+**Fifth pre-capture check — `nvidia-fabricmanager`, preinstalled and masked, purely as future-proofing, not a functional need on `carlonext` today.**
+
+**Important distinction, worth being explicit about so this isn't mistaken for contradicting v0.4.6 of `gb300_l10_sw_checklist.sh`:** that checklist correctly and deliberately reclassified "Fabric Manager Service"/"Fabric Manager Version" as `N/A` rather than `MISSING`, because on this rack-scale design fabric management genuinely runs on the NVSwitch tray's own NVOS, never on this compute host, at any bring-up stage. **That functional reality doesn't change here** — `note_na()` in the checklist is a static, hardcoded note, not a live probe of whether the package happens to be installed, so pre-installing (and masking) `nvidia-fabricmanager` has zero effect on the checklist's output or correctness either way.
+
+**The actual reason to do this:** if `carlonext`'s captured layout is ever re-tar'd and fed into `cm-create-image` as a BCM software-image source (the way a separate reference host, `maxQ106`, already has been for a different rack's provisioning), the build's `--dgx-type` finalize stage will **unconditionally** attempt `systemctl disable nvidia-fabricmanager` — and fail the entire build if the unit doesn't exist to disable, regardless of source pipeline. This isn't specific to how `maxQ106` was built; it's inherent to `cm-create-image` itself. Pre-installing and masking the package now means that failure (and the chroot-based fix required to resolve it after the fact) never has to be rediscovered against `carlonext` later.
+
+**Version must match this reference layout's actual driver, not be copied from the other rack's fix:** `carlonext` runs driver `580.173.02` (installed via `.run`, §7) — different from the other rack's DKMS-built `580.126.20`. Confirm the matching `nvidia-fabricmanager` build is available before installing:
+
+```bash
+apt-cache madison nvidia-fabricmanager-580 2>/dev/null | grep 580.173
+# install whichever exact version string matches, e.g.:
+sudo apt-get update && sudo apt-get install -y nvidia-fabricmanager-580=<matched-580.173.02-version-string>
+sudo systemctl mask nvidia-fabricmanager
+sudo apt-mark hold nvidia-fabricmanager-580   # prevent drift on a future apt upgrade
+ls -la /etc/systemd/system/nvidia-fabricmanager.service   # confirm -> /dev/null
+```
+
+If no version matching `580.173.02` is available in the configured repos, don't force an unrelated version — flag it rather than installing a mismatched build purely to satisfy a hypothetical future finalize step (the masked unit never runs regardless, but an installed-and-broken package is its own kind of clutter worth avoiding).
+
 **Deliverables produced** (not just discussed — actual files, delivered as artifacts):
-- `golden-image-prep-checklist.md` — the full one-time prep sequence to run on this reference node immediately before ROM-writer capture (by-path fstab/grub edit, machine-id truncation, SSH host key removal, config directory presence check, and why the EFI partition's own volume ID is deliberately left alone), plus what happens automatically on each clone's actual first boot.
+- `golden-image-prep-checklist.md` — the full one-time prep sequence to run on this reference node immediately before ROM-writer capture (by-path fstab/grub edit, machine-id truncation, SSH host key removal, config directory presence check, fabricmanager preinstall+mask, and why the EFI partition's own volume ID is deliberately left alone), plus what happens automatically on each clone's actual first boot.
 - `first-boot-regen.sh` / `first-boot-regen.service` — a self-triggering, self-disabling systemd oneshot unit (`ConditionPathExists=!/var/lib/first-boot-regen-done`) that fires once per cloned node. After the by-path decision, this no longer does anything boot-critical — it only gives each node a genuinely unique filesystem UUID for asset-tracking/tooling clarity (no `fstab`/`grub` edit, no reboot, since boot no longer depends on that value at all).
 
 **Zero production-line touch required** — every regeneration step happens automatically on each unit's own first boot; the only manual work is the one-time golden-image prep on this reference node before the ROM writer captures it.
