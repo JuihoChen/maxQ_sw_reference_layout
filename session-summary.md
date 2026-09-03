@@ -392,10 +392,12 @@ rm -rf /cm/images/<image-name>
 ```bash
 cm-create-image -a /root/bcm-image-export/<source-archive>.tgz \
   -n <image-name> \
-  --dgx-type dgx_gb200 \
+  --dgx-type dgx_gb300 \
   -s \
   --no-cm-cuda-repo
 ```
+
+⚠️ **`--dgx-type dgx_gb300` shown here as the current default for copy-paste, matching what `baseos-1014-doca321` was most recently built with — but this is not yet NV-confirmed as correct for this hardware (see 6l).** Double-check 6l/Section 4 item 2 before running this on a new rack in case NV's answer has landed since this doc was last updated; if NV instead confirms `dgx_gb200`, update this value accordingly before building the remaining racks.
 
 Expect this to take up to ~8.5 hours end-to-end (6i) — dominated by two redundant DKMS/OFED build cycles against an irrelevant `6.8.0-106-generic-64k` kernel that "Installing CM packages" installs by name regardless of `-s`. This is currently accepted as a known, reproducible cost, not a failure — do not interrupt the build on this basis. If a real NV/BCM support report is wanted, check `/var/log/apt/history.log` inside the image afterward (6i) to pin the exact package-disposal mechanism first.
 
