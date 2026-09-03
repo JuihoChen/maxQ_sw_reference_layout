@@ -305,9 +305,74 @@
 #                       independent of the original cuda-repo-*.deb still
 #                       being present on disk - reads from dpkg/apt package
 #                       metadata, not the installer file.
+#   0.4.18 2026-08-XX  Added "Fabric Manager Package (if present)" check.
+#                       Does NOT change the two existing v0.4.6 Fabric
+#                       Manager N/A rows above it, and does not weaken that
+#                       finding - fabric management still genuinely runs on
+#                       the NVSwitch tray's own NVOS, never this host,
+#                       functionally unchanged. This is a *new, additional*
+#                       row for a *new* reason: build log §25 now has
+#                       `nvidia-fabricmanager` (NOTE: no "-580" suffix -
+#                       this local-repo package's naming differs from the
+#                       "-580"-suffixed package used on a different rack's
+#                       BCM pipeline; an earlier draft of this check queried
+#                       the wrong name, corrected here) matched to this
+#                       layout's 580.173.02 driver, sourced from NVOnline's
+#                       nvidia-driver-local-repo-ubuntu2404-580.173.02
+#                       package, deliberately pre-installed and masked on
+#                       this reference layout, purely as future-proofing
+#                       against a `cm-create-image` BCM finalize-stage
+#                       failure if this layout is ever used as a BCM
+#                       software-image source (unconditional `systemctl
+#                       disable nvidia-fabricmanager` fails the whole build
+#                       if no unit exists to disable - unrelated to whether
+#                       FM is functionally needed on this host, see §25 for
+#                       full reasoning). This new check is defense-in-depth
+#                       against that precaution being applied incorrectly -
+#                       specifically, installed but left un-masked, which
+#                       would be a real (if inert-until-started) problem
+#                       worth flagging, not something to bury in an N/A row.
+#                       Confirmed NOT theoretical: the package's own postinst
+#                       enables itself by default on install (creates a
+#                       multi-user.target.wants symlink) before any manual
+#                       mask step runs - if that step is ever skipped on a
+#                       future rebuild, this check is what would catch it.
+#                       Three-way result, NOT tallied as MISSING/N/A in
+#                       either the "not installed" or "masked correctly"
+#                       cases, since neither represents a problem:
+#                       package absent -> note_na() (fine, precaution is
+#                       optional, not required for this host's own
+#                       bring-up); present + masked -> OK; present but NOT
+#                       masked -> CHECK/"NEEDS REVIEW" (yellow, not
+#                       MISSING/red - package existing-but-misconfigured is
+#                       a different situation than something genuinely
+#                       absent, and conflating the two would make the
+#                       MISSING tally less trustworthy as a signal).
+#   0.4.19 2026-08-31  Fixed v0.4.18's "Fabric Manager Package (if present)"
+#                       check reporting N/A/"not installed" on a real host
+#                       where nvidia-fabricmanager WAS genuinely installed
+#                       and correctly masked. Root cause: the check used
+#                       `dpkg -l ... | grep '^ii'`, which only matches the
+#                       unheld "install, installed" status - but this same
+#                       package is meant to be `apt-mark hold`-ed per §25
+#                       (to prevent drift), which flips dpkg's status column
+#                       to `hi` ("hold, installed"), not `ii`. This is the
+#                       exact same status-parsing pitfall already worked
+#                       around elsewhere in this project's BCM-image
+#                       verification steps (`^[hi]i` used there for the
+#                       same reason, on held kernel packages) - reintroduced
+#                       here by not applying the same lesson consistently.
+#                       Fixed properly this time by switching to
+#                       `dpkg-query -W -f='${Status}' | grep "ok installed"`,
+#                       which checks the package's Status field directly and
+#                       is correct regardless of hold state, rather than
+#                       pattern-matching `dpkg -l`'s fixed-width, hold-
+#                       sensitive table columns (which `dpkg`'s own
+#                       documentation notes isn't intended for scripting in
+#                       the first place).
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.17"
+SCRIPT_VERSION="0.4.19"
 
 set -uo pipefail
 
@@ -480,6 +545,27 @@ section "NVLink / NVSwitch / Fabric Manager"
 # NVSwitch/NVOS side of bring-up instead.
 note_na "Fabric Manager Service" "runs on NVSwitch tray (NVOS), not this host"
 note_na "Fabric Manager Version" "verify via NVOS, target $EXPECTED_FM"
+# v0.4.18: defense-in-depth for the build log §25 precaution (pre-install +
+# mask nvidia-fabricmanager here, purely as future-proofing against a
+# cm-create-image BCM finalize-stage failure if this layout is ever used as
+# a BCM image source - see §25 for full reasoning). Does NOT change the
+# functional finding above: FM still never runs on this host either way.
+# Absence of the package is fine (precaution is optional); presence
+# without masking is the one state actually worth flagging. Package name
+# here is `nvidia-fabricmanager` (no "-580" suffix) - this local-repo
+# package does NOT follow the "-580"-suffixed naming used on a different
+# rack's BCM pipeline; confirm the real installed name with `dpkg -l | grep
+# fabricmanager` if this is ever adapted for a differently-sourced package.
+if dpkg-query -W -f='${Status}' nvidia-fabricmanager 2>/dev/null | grep -q "ok installed"; then
+  fm_unit_state=$(systemctl is-enabled nvidia-fabricmanager 2>&1)
+  if [[ "$fm_unit_state" == "masked" ]]; then
+    ROWS+=("Fabric Manager Package (if present)|installed, correctly masked|OK")
+  else
+    ROWS+=("Fabric Manager Package (if present)|installed but NOT masked (state: ${fm_unit_state}) - see build log §25|CHECK")
+  fi
+else
+  note_na "Fabric Manager Package (if present)" "not installed - fine, this precaution is optional/future-proofing only (§25)"
+fi
 # IMEX: installed via nvidia-imex-aarch64-<ver>.run alongside the driver (§7),
 # and the daemon/service exist and are queryable on this host regardless of
 # bring-up stage - unlike Fabric Manager, this is NOT an N/A case for

@@ -1262,18 +1262,30 @@ Unlike `machine-id`/SSH host keys, there's no per-clone regeneration needed here
 
 **The actual reason to do this:** if `carlonext`'s captured layout is ever re-tar'd and fed into `cm-create-image` as a BCM software-image source (the way a separate reference host, `maxQ106`, already has been for a different rack's provisioning), the build's `--dgx-type` finalize stage will **unconditionally** attempt `systemctl disable nvidia-fabricmanager` — and fail the entire build if the unit doesn't exist to disable, regardless of source pipeline. This isn't specific to how `maxQ106` was built; it's inherent to `cm-create-image` itself. Pre-installing and masking the package now means that failure (and the chroot-based fix required to resolve it after the fact) never has to be rediscovered against `carlonext` later.
 
-**Version must match this reference layout's actual driver, not be copied from the other rack's fix:** `carlonext` runs driver `580.173.02` (installed via `.run`, §7) — different from the other rack's DKMS-built `580.126.20`. Confirm the matching `nvidia-fabricmanager` build is available before installing:
+**Version must match this reference layout's actual driver, not be copied from the other rack's fix:** `carlonext` runs driver `580.173.02` (installed via `.run`, §7) — different from the other rack's DKMS-built `580.126.20`. **Concrete source confirmed:** NVOnline's `nvidia-driver-local-repo-ubuntu2404-580.173.02_1.0-1_arm64.deb` local-repo package contains a matching `nvidia-fabricmanager` build for this exact driver branch.
+
+**Actual commands run on `carlonext` (real transcript, not a draft):**
 
 ```bash
-apt-cache madison nvidia-fabricmanager-580 2>/dev/null | grep 580.173
-# install whichever exact version string matches, e.g.:
-sudo apt-get update && sudo apt-get install -y nvidia-fabricmanager-580=<matched-580.173.02-version-string>
+sudo dpkg -i nvidia-driver-local-repo-ubuntu2404-580.173.02_1.0-1_arm64.deb
+# GPG key warning appeared here (see below) — not resolved, install proceeded
+# via direct dpkg -i of the individual .deb rather than through apt/the repo.
+
+sudo dpkg -i /var/nvidia-driver-local-repo-ubuntu2404-580.173.02/nvidia-fabricmanager_580.173.02-1ubuntu1_arm64.deb
 sudo systemctl mask nvidia-fabricmanager
-sudo apt-mark hold nvidia-fabricmanager-580   # prevent drift on a future apt upgrade
-ls -la /etc/systemd/system/nvidia-fabricmanager.service   # confirm -> /dev/null
+sudo apt-mark hold nvidia-fabricmanager
+ls -la /etc/systemd/system/nvidia-fabricmanager.service   # confirmed -> /dev/null
 ```
 
-If no version matching `580.173.02` is available in the configured repos, don't force an unrelated version — flag it rather than installing a mismatched build purely to satisfy a hypothetical future finalize step (the masked unit never runs regardless, but an installed-and-broken package is its own kind of clutter worth avoiding).
+**Note: package name is `nvidia-fabricmanager`, no `-580` suffix** — this local-repo package doesn't follow the BCM-side `nvidia-fabricmanager-580` naming convention (different rack, different install path). `apt-mark hold` should target `nvidia-fabricmanager` only. **Confirmed correctly applied on `carlonext`:** an earlier run of this fix accidentally held the wrong name (`nvidia-fabricmanager-580`, never installed on this host) alongside the correct one; `apt-mark unhold nvidia-fabricmanager-580` cleared it, and `apt-mark showhold` now correctly shows only `nvidia-fabricmanager` (plus three pre-existing, unrelated kernel holds — `linux-headers-nvidia-64k-hwe-24.04`, `linux-image-nvidia-64k-hwe-24.04`, `linux-nvidia-64k-hwe-24.04` — present before this session's work, purpose not documented here, worth confirming intentional next time this reference layout is touched).
+
+**Two things observed worth recording, not yet fully explained:**
+- **GPG keyring step was skipped** (the `dpkg -i` of the repo package itself warned that its GPG key wasn't installed, with a suggested `cp .../keyring.gpg /usr/share/keyrings/` fix) — install proceeded anyway via direct `dpkg -i` of the individual package, bypassing `apt`'s repo/signature mechanism entirely rather than resolving the warning. Fine for this one-shot manual install; if this repo is ever used with real `apt-get install`/`apt update` in the future (rather than manual `dpkg -i`), the keyring step should actually be done first.
+- **`Could not execute systemctl: ... at /usr/bin/deb-systemd-invoke line 148` during the `nvidia-fabricmanager` package's own postinst.** This is real bare-metal hardware, not a chroot (unlike the known, explained `cm-chroot-sw-img` PID1/D-Bus limitation from 6k/6o) — so this warning is currently unexplained and worth a quick look (shell environment, PATH, or something else affecting `deb-systemd-invoke`'s ability to call `systemctl` in this session specifically) rather than assumed harmless just because the subsequent manual `mask` step worked around it.
+
+**This install also confirms exactly why the checklist's new defense-in-depth check (below) is worth having, not just theoretical:** the package's postinst created `/etc/systemd/system/multi-user.target.wants/nvidia-fabricmanager.service → .../nvidia-fabricmanager.service` **before** the manual mask step ran — i.e., **this package enables itself by default on install.** If the explicit `mask` step is ever skipped or forgotten on a future rebuild of this reference layout, the service would sit enabled and ready to start at boot, which is exactly the real-world misconfiguration risk this check exists to catch.
+
+`gb300_l10_sw_checklist.sh` v0.4.18 adds this check — reports `OK` if installed and correctly masked, flags `CHECK`/"NEEDS REVIEW" (not a hard `MISSING`) if the package is present but *not* masked, and correctly treats the package's absence as fine (`N/A`, precaution is optional) rather than a problem. Run the checklist after applying this fix to confirm it landed correctly, rather than relying on the manual `ls -la` alone.
 
 **Deliverables produced** (not just discussed — actual files, delivered as artifacts):
 - `golden-image-prep-checklist.md` — the full one-time prep sequence to run on this reference node immediately before ROM-writer capture (by-path fstab/grub edit, machine-id truncation, SSH host key removal, config directory presence check, fabricmanager preinstall+mask, and why the EFI partition's own volume ID is deliberately left alone), plus what happens automatically on each clone's actual first boot.
