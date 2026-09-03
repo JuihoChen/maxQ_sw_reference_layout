@@ -370,9 +370,33 @@
 #                       sensitive table columns (which `dpkg`'s own
 #                       documentation notes isn't intended for scripting in
 #                       the first place).
+#   0.4.20 2026-09-02  Added "Disk Hygiene / Repo Cleanup" section (build log
+#                       §22a). Purpose: this checklist previously only ever
+#                       checked for PRESENCE of expected components, never
+#                       ABSENCE of things deliberately removed - so if
+#                       cuda-repo-ubuntu2404-13-0-local (3.6G) or
+#                       nvidia-driver-local-repo-ubuntu2404-580.173.02 (573M)
+#                       ever get reinstalled (e.g. someone re-runs the CUDA
+#                       install steps from §8 on a rebuild/re-clone without
+#                       re-reading §22a), the ~4.4G they reclaim would quietly
+#                       come back with nothing here to catch it. Reports OK if
+#                       purged, CHECK (not MISSING - the package existing
+#                       isn't a functional defect, just a footprint one) if
+#                       still/again installed, noting the size and pointing at
+#                       §22a. Uses the same `dpkg-query -W -f='${Status}'`
+#                       pattern as the v0.4.19 Fabric Manager fix, for the
+#                       same hold-state-safety reason.
+#                       Also added a swap check: BCM's own category disk-setup
+#                       XML (confirmed in §22a) defines no swap partition/file
+#                       at all for this reference layout, so any active swap
+#                       device is reported CHECK (informational, not
+#                       PASS/FAIL - a genuinely reprovisioned node with
+#                       different RAM might legitimately want swap; this just
+#                       flags it for a human to confirm intentional rather
+#                       than silently ignoring it).
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.19"
+SCRIPT_VERSION="0.4.20"
 
 set -uo pipefail
 
@@ -691,6 +715,49 @@ else
       note_na "Out-of-Band FW (CPLD/EROT/HMC/FPGA)" "BMC IP=$BMC_IP found, component list matched, but per-component GET failed"
     fi
   fi
+fi
+
+# ----------------------------------------------------------------------------
+# 6c. Disk Hygiene / Repo Cleanup
+# Confirms build log §22a's cleanup pass hasn't regressed. Both local-repo
+# .deb packages are legitimate, dpkg-tracked install-time scaffolding for
+# CUDA (§8) / nvidia-fabricmanager (§25) - fine to have installed transiently,
+# but they leave a combined ~4.4G under /var that serves no purpose once the
+# real packages they staged (cuda-toolkit-13-0, nvidia-fabricmanager) are in
+# place. §22a purged both; this section catches silent re-installation on a
+# future rebuild rather than assuming the cleanup stays done forever.
+# Status is CHECK, not MISSING, if still present - this is a footprint/
+# hygiene concern, not a functional defect, so it shouldn't count toward a
+# failed bring-up the way a genuinely missing driver/CUDA component would.
+# ----------------------------------------------------------------------------
+section "Disk Hygiene / Repo Cleanup"
+
+if dpkg-query -W -f='${Status}' cuda-repo-ubuntu2404-13-0-local 2>/dev/null | grep -q "ok installed"; then
+  ROWS+=("Stale CUDA Repo Pkg|installed - ~3.6G under /var, purge per §22a (apt purge cuda-repo-ubuntu2404-13-0-local)|CHECK")
+else
+  ROWS+=("Stale CUDA Repo Pkg|not installed - clean (§22a)|OK")
+fi
+
+if dpkg-query -W -f='${Status}' nvidia-driver-local-repo-ubuntu2404-580.173.02 2>/dev/null | grep -q "ok installed"; then
+  ROWS+=("Stale NVIDIA Driver Repo Pkg|installed - ~573M under /var, purge per §22a (apt purge nvidia-driver-local-repo-ubuntu2404-580.173.02)|CHECK")
+else
+  ROWS+=("Stale NVIDIA Driver Repo Pkg|not installed - clean (§22a)|OK")
+fi
+
+# BCM's own category disk-setup XML (confirmed in §22a) defines only
+# efi/boot/root for this reference layout - no swap partition or swap file.
+# /swap.img (8G, 0B ever used at 2.0Ti host RAM) was a manual, out-of-band
+# addition, not something BCM provisioning creates - so its removal in §22a
+# won't be undone by a category resync/reinstall. This check just confirms
+# the current state; it doesn't assume swap is always wrong (a node with a
+# real category-level swap definition, or genuinely tight RAM, might
+# legitimately want it), so it's informational (CHECK), not PASS/FAIL.
+swap_active=$(swapon --show --noheadings 2>/dev/null)
+if [[ -z "$swap_active" ]]; then
+  ROWS+=("Unused Swap File|none active - matches BCM disk-setup, no swap defined (§22a)|OK")
+else
+  swap_summary=$(echo "$swap_active" | awk '{print $1, $3}' | tr '\n' ';' | sed 's/;$//')
+  ROWS+=("Unused Swap File|active: ${swap_summary} - confirm intentional, not part of BCM category disk-setup (§22a)|CHECK")
 fi
 
 # ----------------------------------------------------------------------------

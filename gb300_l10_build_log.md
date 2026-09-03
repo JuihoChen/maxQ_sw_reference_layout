@@ -1,7 +1,7 @@
 # GB300 NVL L10 Reference Layout — Build Log
 
 **Reference:** NVIDIA 2.0 release, GB300 L10 reference layout — MNNVL Bring-Up Guide, Release 1.15
-**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.4.4
+**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.4.20
 
 ## 0. Host Software Components — Version Matrix (source of truth)
 
@@ -1192,6 +1192,71 @@ Triggered by an HMC firmware release-notes screenshot (bundle `nvfw_GB300-P4059-
 
 *Status: resolved. §17's "closed, not pursued further" is superseded — this is now implemented, tested against the real unit, and producing accurate data on every checklist run.*
 
+## 22a. Disk-Cleanup Pass — Stale Local-Repo Packages + Unused Swap (2026-09-02)
+
+Triggered by a routine `du -shc *` under `/var` showing 5.2G total, with two single directories accounting for the bulk of it:
+
+| Directory | Size | What it actually was |
+|---|---|---|
+| `cuda-repo-ubuntu2404-13-0-local` | 3.6G | Local APT repo tree created by the `.deb` used to install the CUDA Toolkit (§8) |
+| `nvidia-driver-local-repo-ubuntu2404-580.173.02` | 573M | Local APT repo tree created by the local-repo `.deb` used for the `nvidia-fabricmanager` install (§25) |
+
+**Confirmed both are dpkg-tracked packages, not orphaned folders** — `dpkg -l | grep -iE 'cuda|nvidia'` showed both as `ii`:
+```
+ii  cuda-repo-ubuntu2404-13-0-local                       13.0.2-580.95.05-1
+ii  nvidia-driver-local-repo-ubuntu2404-580.173.02        1.0-1
+```
+So the correct removal path is `apt purge` (removes the dpkg entry, the `/var/...` tree, and the matching `/etc/apt/sources.list.d/*.list` entry together), not a manual `rm -rf` against a directory dpkg still owns.
+
+**Pre-removal safety checks — both packages confirmed as install-time scaffolding only, not needed post-install:**
+- `dpkg -l | grep -i cuda` — full CUDA 13.0 toolkit/library set present and unaffected by the repo package itself (`cuda-toolkit-13-0`, `cuda-cudart-13-0`, `cuda-nvcc-13-0`, etc. all separate, real packages).
+- `nvidia-smi` — driver `580.173.02`, CUDA `13.0` reported correctly; all 4 GB300 Max-Q GPUs visible, 0 MiB used, no running processes. Confirms the driver install itself has nothing to do with whether its local-repo scaffolding stays on disk.
+
+**Commands run:**
+```bash
+sudo apt purge cuda-repo-ubuntu2404-13-0-local
+sudo apt purge nvidia-driver-local-repo-ubuntu2404-580.173.02
+sudo apt update
+sudo apt clean
+```
+Both purges cleanly removed the dpkg entry, config, and `/var/...` directory (`3,856 MB` and `600 MB` respectively per apt's own accounting). `apt update` afterward confirmed no dangling `sources.list.d` entries for either — the only remaining NVIDIA/DOCA-related repo file, `doca-kernel-26.04-1.0.9.0-6.17.0.1029.nvidia.64k.list`, is correctly left alone (belongs to the still-installed, in-use `doca-kernel-repo-...` package from §6, not leftover cruft).
+
+**Result:** ~4.4G reclaimed under `/var`. `cuda-toolkit-13-0` (`13.0.2-1 [installed,local]`) confirmed still installed and intact via `apt list --installed` post-purge — this is the source referenced by §23's CUDA version table.
+
+**Unrelated finding surfaced by `apt update`, logged but not acted on:** 130 packages showing as upgradable. **Deliberately not run** on this unit — with a custom `linux-nvidia-64k` kernel, DKMS-built NVIDIA driver, and DOCA host stack all version-pinned against the NVIDIA 2.0 release matrix (§0), a blanket `apt upgrade` risks pulling a mismatched kernel/driver and breaking `nvidia-smi` or DOCA. Flagged as a `Next Steps` item (§26) to review the list explicitly (`apt list --upgradable`) before ever upgrading this reference layout.
+
+### Swap File Removal (`/swap.img`, 8G)
+
+Found while auditing top-level `/` usage (`du -shc /*`) — `/swap.img` was present and mounted (`swapon --show` → `/swap.img file 8G 0B -2`) but showed **0B used** despite the host having been up and under normal bring-up load.
+
+**Checked against the BCM category's actual disk-setup definition** (`get disksetup` on `category[maxQ-1014-doca321]`) — confirms swap is **not part of the intended reference layout** at all: the category only defines `efi` (100M), `boot1` (4G), and `slash1`/`/` (max, ext4). No swap partition or swap-file directive anywhere in the XML.
+
+**Confirmed not provisioning-managed** — checked the category's `Initialize script` and `Finalize script` (both `<0B>`, i.e., empty) via `cmsh`, so nothing in this category's automated provisioning creates `/swap.img`; it was added manually/out-of-band by whoever originally set up this node, not by BCM.
+
+**Confirmed safe on resource grounds** — `free -h` showed `2.0Ti` total RAM, `56Gi` used, swap at `0B` used out of `8.0Gi`. At this RAM scale, 8G of swap provides negligible OOM protection and was never being touched.
+
+**Commands run:**
+```bash
+sudo swapoff -v /swap.img
+sudo rm /swap.img
+sudo sed -i '/swap.img/s/^/#/' /etc/fstab   # comment out rather than delete the line, for auditability
+```
+
+**Verification:**
+
+| Check | Command | Result |
+|---|---|---|
+| Swap disabled | `free -h` | `Swap: 0B / 0B / 0B` ✅ |
+| No active swap device | `swapon --show` | *(empty)* ✅ |
+| fstab entry preserved but disabled | `cat /etc/fstab` | `#/swap.img      none    swap    sw      0       0` ✅ |
+| `/` free space | `df` | `/dev/nvme0n1p2` — 856G available, 2% used ✅ |
+
+**Open item — not yet checked at the category/fleet level:** confirmed only that *this node's* provisioning scripts don't recreate `/swap.img` on reinstall/resync. Whether other nodes in `maxQ-1014-doca321` (38 total) were built the same manual way and are carrying the same unused 8G swap file has not been checked. Worth a quick audit (`filesystemmounts` submode, plus a live `swapon --show` sweep across the category) if this reference layout's disk footprint is being finalized for fleet-wide golden-image capture (§25).
+
+**`gb300_l10_sw_checklist.sh` v0.4.20 adds a "Disk Hygiene / Repo Cleanup" section** covering both findings — reports `OK` if the two local-repo packages stay purged and no swap is active, `CHECK` (not `MISSING` — footprint concern, not a functional defect) if either regresses on a future rebuild/re-clone. Run the checklist after any reinstall of §8/§25's steps to confirm this cleanup pass hasn't silently been undone.
+
+*Status: both cleanup items complete and verified on `carlonext`. ~4.4G (repo packages) + 8G (swap) = **~12.4G reclaimed total** under `/`, with no functional regression — CUDA, driver, and DOCA stack all confirmed intact post-cleanup.*
+
 ## 23. CUDA Version Fields — Why Three Different Numbers Are All Correct
 
 Recurring point of confusion worth a permanent reference entry, since it came up directly in review. The checklist shows three different CUDA-related version strings, and none of them are wrong or inconsistent with each other:
@@ -1301,6 +1366,47 @@ ls -la /etc/systemd/system/nvidia-fabricmanager.service   # confirmed -> /dev/nu
 
 *Status: designed, partially validated (root/boot confirmed on this node), not yet validated end-to-end against a real clone. Do not treat as production-proven until the first actual ROM-writer unit has been walked through the full first-boot sequence.*
 
+## 25a. BCM Image Export — `maxQ20rc4-1029-doca341-baseos.tgz` (2026-09-02)
+
+**Deliberate divergence from §25's design, logged explicitly so this isn't mistaken for an oversight later:** §25 designed a golden-image path that truncates `machine-id` and removes SSH host keys pre-capture, relying on `systemd`/`ssh.service` to regenerate unique values on each clone's first boot. This capture **does not do that** — `machine-id` and all six `ssh_host_*` key files were deliberately left live in the archive, and `/home` was left in its current state rather than stripped, because this reference layout also carries diag-team preset accounts and diagnostic test data under `/home` that need to persist across the capture. This is a conscious choice for this specific image, not a reversal of §25's general design — if a future image built from this same pipeline needs the unique-per-clone identity behavior, apply §25's `golden-image-prep-checklist.md` steps before capture; they weren't run here.
+
+**Capture command:**
+```bash
+sudo mkdir -p /root/bcm-image-export
+sudo tar --numeric-owner --xattrs --acls -czpf /root/bcm-image-export/maxQ20rc4-1029-doca341-baseos.tgz \
+  --exclude='./proc' --exclude='./sys' --exclude='./dev' --exclude='./run' \
+  --exclude='./tmp' --exclude='./mnt' --exclude='./media' --exclude='./lost+found' \
+  --exclude='./root/bcm-image-export' \
+  -C / .
+```
+Result: `10,585,047,328` bytes (~9.9 GiB) compressed, `172,523` archive members, from a `/` that `df` showed at ~17.4G used pre-capture — a reasonable compression ratio for a mixed binary/text root filesystem.
+
+**Pre-capture consistency check — by-path root config confirmed intact end-to-end, not just at the `fstab` level (§25):**
+```
+/etc/fstab                       → /dev/disk/by-path/pci-...-nvme-1-part2  /
+/etc/default/grub                → GRUB_DISABLE_LINUX_UUID=true
+/boot/grub/grub.cfg (generated)  → linux /boot/vmlinuz-... root=/dev/nvme0n1p2 ro console=tty0
+```
+All three agree — no `UUID=` anywhere in the boot chain. This confirms §25's by-path decision is fully baked into the *generated* GRUB config that ships inside this tarball, not just the source `fstab`/`grub` files — worth checking specifically since `grub.cfg` is generated at `update-grub` time and could in principle drift from the source config if regenerated under different conditions.
+
+**Post-capture validation:**
+| Check | Command | Result |
+|---|---|---|
+| Archive not corrupt / member count sane | `tar -tzf ... \| wc -l` | `172523` members, listed cleanly, no read errors |
+| `machine-id` present as intended (not excluded) | `tar -tzf ... \| grep '^\./etc/machine-id'` | Present ✅ |
+| SSH host keys present as intended (not excluded) | `tar -tzf ... \| grep '^\./etc/ssh/ssh_host'` | All 6 files (3 key types × priv/pub) present ✅ |
+
+**Checked and found to need no action — `/var/cache/apt/archives`:** confirmed already empty (`ls` shows only `lock` and an empty `partial/`) as a result of the `apt clean` run during §22a's disk-cleanup pass. No exclude needed for this path on this capture; would only matter if `apt clean` hadn't already been run beforehand.
+
+**Not excluded, not yet independently confirmed as intentional-and-reviewed beyond the diag-account rationale above:**
+- `/var/log` (234M at last check) — this node's own bring-up-session logs are baked into the image as-is. Not wrong, but every clone will carry `carlonext`'s own dmesg/auth/syslog history from the bring-up process. Acceptable for now; worth excluding on a future re-capture if that ever matters (e.g. log-size creep across many clones, or wanting a genuinely blank audit trail per unit).
+
+**Open items:**
+- This tarball has been captured and internally validated (tar integrity, expected-file presence, by-path consistency) but **not yet run through `cm-create-image`** or provisioned onto an actual node — that end-to-end pass is still outstanding.
+- Because `machine-id`/SSH host keys are static in this image (by design, see above), **every node cloned from this image will share the same `machine-id` and SSH host keys** unless something downstream (BCM's own provisioning, a different finalize step) regenerates them per node. This is the opposite tradeoff from §25's design and needs to be a conscious decision at the provisioning-pipeline level, not just this capture step — confirm whether `cm-create-image`/the node-install process has its own regeneration mechanism before cloning multiple units from this image, since relying on shared SSH host keys across many production nodes is a real MITM/fingerprint-collision exposure if uncaught.
+
+*Status: image captured and validated at the tar level. Not yet fed into `cm-create-image` or tested against a real provisioned node — treat as a candidate image, not a confirmed-working one, until that pass completes.*
+
 ## 26. Next Steps (not yet started)
 
 - [x] NVIDIA kernel build packages (gcc, dkms, make) — see §5
@@ -1331,6 +1437,12 @@ ls -la /etc/systemd/system/nvidia-fabricmanager.service   # confirmed -> /dev/nu
 - [ ] Validate field-site offline kernel upgrade procedure (§21) against a real field unit; confirm dkms/build-essential presence assumption
 - [x] IMEX Service inactive finding (§19) — resolved, expected L10 behavior (no fabric peers pre-rack), not a defect. No provisioning blocker.
 - [x] Run L10 partner mfg diag (partnerdiag) — MaxQ-specific spec/SKU config (§18, §18a) run against this unit, `Final Result: PASS`, see §18b
+- [x] Disk-cleanup pass — purged stale `cuda-repo-*`/`nvidia-driver-local-repo-*` local-repo packages and removed unused 8G `/swap.img`, ~12.4G reclaimed, CUDA/driver/DOCA confirmed intact — see §22a
+- [ ] Review `apt list --upgradable` (130 packages, surfaced by §22a) before ever running `apt upgrade` on this reference layout — check specifically for `linux-image-*`/`nvidia-*`/`doca-*` version bumps against the pinned NVIDIA 2.0 matrix (§0)
+- [ ] Audit other nodes in category `maxQ-1014-doca321` for the same manually-added, unused `/swap.img` (§22a open item) — not part of the BCM disk-setup definition, so likely a per-node manual addition rather than fleet-standard
+- [x] Capture reference-layout tarball (`maxQ20rc4-1029-doca341-baseos.tgz`) for BCM image export — validated at the tar level (integrity, expected-file presence, by-path consistency), see §25a
+- [ ] Feed `maxQ20rc4-1029-doca341-baseos.tgz` into `cm-create-image` and provision a real test node from it — end-to-end pass not yet run, see §25a
+- [ ] Confirm whether `cm-create-image`/BCM's node-install process has its own `machine-id`/SSH-host-key regeneration mechanism, since §25a's image deliberately ships both static (diverging from §25's per-clone-regen design) — needs to be a conscious pipeline-level decision before cloning multiple production nodes from this image
 
 ---
 
