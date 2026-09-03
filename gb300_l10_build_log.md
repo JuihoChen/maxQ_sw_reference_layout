@@ -612,12 +612,16 @@ Per internal "Installation - Linux kernel tool install list" slide. Two items ne
 
 ```bash
 sudo apt install -y fio sysstat smartmontools numactl net-tools unzip \
-  jq ipmitool nvme-cli expect stress-ng sshpass mstflint
+  jq ipmitool nvme-cli expect stress-ng sshpass mstflint ifupdown
 ```
 
 **Already present before this run** (no-op, previously installed): `sysstat` (12.6.1-2), `numactl` (2.0.18-1ubuntu0.24.04.1), `jq` (1.7.1-3ubuntu0.24.04.2). `gcc` and `make` (also on the slide's implied baseline) were already installed in §5 and not re-specified here.
 
 **Newly installed (35 packages total incl. dependencies):** `fio`, `smartmontools`, `net-tools`, `unzip`, `ipmitool`, `nvme-cli`, `expect`, `stress-ng`, `sshpass`, `mstflint` — plus transitive deps (`freeipmi-common`, `openipmi`, `libglusterfs0`/`librados2`/`librbd1` stack pulled in by `fio`'s optional storage-backend support, etc.). No errors, no service restart required.
+
+**`ifupdown` added, not on the original slide's list — Ubuntu 22.04 vs 24.04 difference:**
+- **22.04:** Netplan is already the default renderer, but `ifupdown`/legacy compatibility bindings are commonly still present in the base image, so `/etc/network/interfaces` and `/etc/network/interfaces.d/*` are often still parsed if those bindings exist.
+- **24.04 (this platform):** `ifupdown` has been fully removed from default installs — Netplan + `systemd-networkd` is the only supported path by default. Any file dropped into `/etc/network/interfaces.d/` is silently ignored by the kernel/systemd unless `ifupdown` is explicitly installed — hence adding it here rather than assuming it's present.
 
 **Post-install verification:**
 
@@ -1241,8 +1245,19 @@ Raised from a separate conversation and brought back here for tracking: this ref
 
 - **SSH host keys (#3):** No custom mechanism needed either. Ubuntu's `ssh.service` dependency chain regenerates any *missing* host key type automatically at boot. Golden-image prep: `sudo rm -f /etc/ssh/ssh_host_*` before capture.
 
+**Fourth pre-capture check added, different category from the three above — config directory presence, not per-node identity.** Raised from a separate BCM-provisioning pipeline (a chroot-built software image there hit a fatal node-installer error because `/etc/network/interfaces.d/` and `/etc/ntpsec/` didn't exist for it to write generated config into). That specific failure mode is tied to how that other pipeline builds its images (a curated chroot install with its own package-exclusion logic) and isn't expected to reproduce on `carlonext`'s normal bare-metal install — but confirming these directories exist here too, before ROM-writer capture, costs nothing and closes off the same failure class as a precaution:
+
+```bash
+ls -la /etc/network/interfaces.d/ /etc/ntpsec/
+# if either is missing:
+sudo mkdir -p /etc/network/interfaces.d
+sudo mkdir -p /etc/ntpsec
+```
+
+Unlike `machine-id`/SSH host keys, there's no per-clone regeneration needed here — these are static directories, not per-node identity state, so confirming/creating them once on this reference node before capture is sufficient; no `first-boot-regen` logic required.
+
 **Deliverables produced** (not just discussed — actual files, delivered as artifacts):
-- `golden-image-prep-checklist.md` — the full one-time prep sequence to run on this reference node immediately before ROM-writer capture (by-path fstab/grub edit, machine-id truncation, SSH host key removal, and why the EFI partition's own volume ID is deliberately left alone), plus what happens automatically on each clone's actual first boot.
+- `golden-image-prep-checklist.md` — the full one-time prep sequence to run on this reference node immediately before ROM-writer capture (by-path fstab/grub edit, machine-id truncation, SSH host key removal, config directory presence check, and why the EFI partition's own volume ID is deliberately left alone), plus what happens automatically on each clone's actual first boot.
 - `first-boot-regen.sh` / `first-boot-regen.service` — a self-triggering, self-disabling systemd oneshot unit (`ConditionPathExists=!/var/lib/first-boot-regen-done`) that fires once per cloned node. After the by-path decision, this no longer does anything boot-critical — it only gives each node a genuinely unique filesystem UUID for asset-tracking/tooling clarity (no `fstab`/`grub` edit, no reboot, since boot no longer depends on that value at all).
 
 **Zero production-line touch required** — every regeneration step happens automatically on each unit's own first boot; the only manual work is the one-time golden-image prep on this reference node before the ROM writer captures it.
@@ -1251,6 +1266,7 @@ Raised from a separate conversation and brought back here for tracking: this ref
 - Root/boot by-path change is confirmed working on *this* node's own reboot — but the full first-boot sequence (regen service, `machine-id`, SSH host keys) hasn't yet been exercised against an actual ROM-writer-cloned unit. First real clone should be watched through the whole sequence before trusting this at scale.
 - Whether the ROM writer performs an offline block-level copy (assumed) vs. some other mechanism that might behave differently — not independently confirmed.
 - "Unified hardware design across the rack" — the load-bearing assumption for the entire by-path approach — hasn't been explicitly confirmed by whoever owns the hardware BOM/board revisions, only assumed reasonable.
+- Config directory presence (`interfaces.d/`, `ntpsec/`) — added as a precaution, not because a failure was observed on `carlonext` itself; not yet independently confirmed whether these were ever actually missing here.
 
 *Status: designed, partially validated (root/boot confirmed on this node), not yet validated end-to-end against a real clone. Do not treat as production-proven until the first actual ROM-writer unit has been walked through the full first-boot sequence.*
 

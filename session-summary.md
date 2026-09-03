@@ -310,13 +310,16 @@ Image build is stable and reproducible (6f + 6g confirm it two different ways), 
 8. Provision the rack, watching for the per-node identity question below (machine-id/SSH host keys/hostname) since it hasn't been confirmed to auto-resolve yet.
 9. Run L11 (rack/fabric-level) partnerdiag once provisioned.
 10. If any NEW error appears at any step, apply the same pattern used throughout Section 6: get the exact line from `/var/log/cm-create-image-baseos-1014-doca321.log` (or the equivalent node-installer log once past image-build) — don't guess from a truncated on-screen `[FAILED]` message. Remember "Finalizing cluster services" failures may be non-fatal (6j) while "Finalizing image services" failures are not (6d).
-11. Resolve the still-open items below in parallel.
+11. **Not yet started:** investigate the proposed `hosts.suffix`/`#HOSTNAME#` fix for a `BF3PcieInterfaceTraffic` partnerdiag failure (6n) — verify the mechanism against real BCM documentation before applying anything, since it's currently unverified and unapplied.
+12. Resolve the still-open items below in parallel.
 
 ### Still-open, non-blocking items
 - Per-node identity regeneration (machine-id, SSH host keys, hostname) across the 18 nodes — not yet confirmed how/whether BCM's node-installer handles this automatically. Check "Assigning Images to Nodes and Post Installation Configurations" doc section.
 - Whether an off-box backup of `maxQ106`'s pre-BCM-capture state exists — still never explicitly confirmed this session.
+- **Bake missing `/etc/network/interfaces.d/` and `/etc/ntpsec/` directories into `maxQ106` before the next re-tar (8.7).** Currently only patched live on `baseos-1014-doca321`'s extracted image directory — won't survive a fresh `-a` rebuild and hasn't been applied to any of the other 7 racks' future images. Same category of fix as the fabricmanager mask override (6k) — should be done once on the reference host, not repeated per rack.
 - **`6.8.0-106-generic-64k` build-time cost (6i)** — reproduces reliably (hit in both the incremental and from-archive builds) and costs real wall-clock time (~8.5hr total build observed) via redundant DKMS/OFED cycles against a kernel that's discarded either way. Exact disposal mechanism unconfirmed (see 6i); worth an NV/BCM support report regardless, given it'll recur on all 7 remaining racks unless addressed.
 - **Root cause of the 6m `devtmpfs` incident** — head node recovered via reboot, but why it happened was never established. Worth a proper post-incident review with whoever else has admin/on-call ownership of this system, separate from the rack-build work.
+- **`BF3PcieInterfaceTraffic` partnerdiag `hosts.suffix` fix (6n) — proposed only, not applied, not verified.** Do not assume this is resolved; the `#HOSTNAME#` token's behavior in particular needs confirming before running the command.
 
 ### 6l. `--dgx-type dgx_gb200` vs `dgx_gb300` — ✅ both build successfully; question reframed from "which works" to "which is correct"
 
@@ -365,6 +368,24 @@ Manually recreating each node with `mknod` (using standard major/minor numbers) 
 **Practical implications for the remaining 7 racks:**
 - Don't assume `--dgx-type` (either value) is the cause of a "Validating repo configuration" failure again without first checking `ls -la /dev/null` (or the same wider sweep) on the head node directly — this failure signature is now known to have at least two unrelated possible causes (the 6e repo-conflict class, and this devtmpfs class), and the on-screen message doesn't distinguish them.
 - If any future rack build hits this same failure signature, check the host's `/dev` **before** re-running any chroot-cleanup or `cm-create-image` commands, given the (unconfirmed but not ruled out) possibility that mount-cleanup activity is implicated.
+
+### 6n. ⚠️ Candidate fix for `BF3PcieInterfaceTraffic` partnerdiag failure — proposed, NOT YET APPLIED, NOT YET VERIFIED
+
+Raised as a possible remedy for a `BF3PcieInterfaceTraffic` partnerdiag test failure on nodes provisioned from `baseos-1014-doca321`:
+
+```bash
+echo "127.0.1.1   #HOSTNAME#" > /cm/images/baseos-1014-doca321/etc/hosts.suffix
+```
+
+**Status: this has not been run. No action has been taken on this image or any node.** Recorded here only as a flagged candidate for the next session, not as a fix in progress or a confirmed resolution — do not treat this section as "done" the way 6f/6g/6k are.
+
+**Open questions to resolve before applying this, not yet answered:**
+- Whether `/etc/hosts.suffix` is a real, documented BCM convention (content appended to the node-installer's auto-generated `/etc/hosts` at provisioning time) or an assumption about a path that happens to look BCM-like — not confirmed either way this session.
+- Whether `#HOSTNAME#` is a literal token BCM's node-installer actually substitutes per-node at provisioning time, or would need real per-node substitution some other way. **This is the most important thing to verify before applying at scale** — if BCM does not expand this token, every node would end up with a broken `/etc/hosts` entry containing the literal string `#HOSTNAME#` instead of its own hostname, which could itself cause hostname-resolution failures (possibly a *different*, newly-introduced problem masquerading as a fix).
+- What the specific failing check actually validates and why a `#HOSTNAME#`/hosts-file fix would plausibly address it — the test itself is now named (`BF3PcieInterfaceTraffic`), but *why* PCIe interface traffic testing on the BF3 would depend on `/etc/hosts` content hasn't been explained or verified, only assumed from the fix's framing.
+- Same archive-vs-live-directory caveat as 6k/8.7: if this does turn out to be a real, verified fix, it should ultimately be baked into the `maxQ106` reference archive before the next re-tar, not left as a manual step applied only to this one image directory.
+
+**Next session: verify the BCM `hosts.suffix`/`#HOSTNAME#` mechanism against actual BCM documentation or support before running the command above, then apply, then re-run `BF3PcieInterfaceTraffic` partnerdiag and confirm pass before writing this up as resolved.**
 
 ---
 
@@ -450,7 +471,41 @@ Repeat step 8.4 (mount cleanup) again after this chroot session too.
 cm-create-image -d /cm/images/<image-name> -n <image-name> -s --no-cm-cuda-repo
 ```
 
-### 8.7 Verify before trusting the image
+### 8.7 Pre-provisioning check: missing config directories (`interfaces.d/`, `ntpsec/`)
+
+**New finding (rack00, first real PXE/node-installer run against `baseos-1014-doca321`):** the node-installer's `open()` calls for generating per-node config — the network interface file (`interfaces.d/ifcfg-<iface>`) and NTP config (`ntpsec/ntp.conf`) — fail with a fatal error if their **target directories** don't exist inside the image, even though the files themselves are meant to be generated fresh per node. This is a directory-existence problem, not a missing-package problem — confirmed by checking directly inside the image:
+
+```bash
+cm-chroot-sw-img /cm/images/<image-name>
+ls -la /etc/network/interfaces.d/ 2>&1
+ls -la /etc/ntpsec/ 2>&1
+exit
+```
+
+If either reports "No such file or directory," create them before the first PXE boot against this image:
+
+```bash
+mkdir -p /cm/images/<image-name>/etc/network/interfaces.d
+mkdir -p /cm/images/<image-name>/etc/ntpsec
+```
+
+**Known limitation of this fix as written:** applied directly to the live `/cm/images/<image-name>` directory, so it survives future `-d` resumes against this same directory but **will not survive a fresh `-a` rebuild from the source archive** — it isn't baked into the `.tgz`. Until/unless this is fixed at the archive level (same pattern as the fabricmanager masked-override fix in 6k), re-apply this `mkdir -p` step after any full from-archive rebuild, and check for it explicitly on each of the remaining 7 racks rather than assuming a prior rack's fix carried over.
+
+**Root cause, not yet fully confirmed:** most likely these directories are normally created as a side effect of installing whatever package owns them (e.g. `ntpsec`'s own package normally creates `/etc/ntpsec/` even before its config is populated) — and something in the "Installing CM packages" stage's package exclusion logic (per the `extradist: Added ... to exclude dist list` lines seen in 6i's log investigation) may be stripping that package, or installing it in a way that skips directory creation. Worth confirming with `dpkg -L ntpsec 2>/dev/null | grep /etc/ntpsec` inside the chroot if a permanent, archive-level fix is pursued later — not required to unblock provisioning now.
+
+After creating the directories, reboot the affected node via IPMI/PXE to re-trigger provisioning — the installer should now write both config files without the fatal error. **Confirm this actually completes cleanly before treating it as resolved** — check the node's post-boot status in `cmsh`/Base View and, if possible, confirm the two generated files exist on the node itself (`ifcfg-<iface>` under `interfaces.d/`, populated `ntp.conf` under `ntpsec/`), rather than assuming success from the reboot alone.
+
+**⚠️ Reminder — bake this into the reference archive (`maxQ106`), same precedent as the fabricmanager mask (6k):** the `mkdir -p` above only fixes the current, already-extracted `/cm/images/<image-name>` directory. It will not survive a fresh `-a` rebuild from `maxQ106-1014-doca321-baseos.tgz`, and it does nothing at all for the other 7 racks' images until each one is separately patched or rebuilt from a corrected archive. **Before the next re-tar of `maxQ106`, add these two directories directly on the reference host itself:**
+
+```bash
+# run on maxQ106, before capturing/re-taring the reference layout
+sudo mkdir -p /etc/network/interfaces.d
+sudo mkdir -p /etc/ntpsec
+```
+
+Once captured into the archive this way, every future `-a` build (this rack's next rebuild and all 7 remaining racks) gets these directories automatically, with no per-image manual step needed — exactly how the fabricmanager masked-unit override became permanent once it was captured into the archive rather than reapplied via chroot on every build. Track this alongside the fabricmanager fix as one of the standing "things the next `maxQ106` re-tar should include."
+
+### 8.8 Verify before trusting the image
 
 ```bash
 cm-chroot-sw-img /cm/images/<image-name>
@@ -463,8 +518,12 @@ ls -la /boot/vmlinuz* /boot/initrd*
 dkms status
 apt-cache policy doca-host mlnx-ofed-kernel nvidia-imex-580
 
-# fabricmanager — expect masked, not just disabled
-systemctl status nvidia-fabricmanager
+# fabricmanager — check the masked-override symlink directly; systemctl status
+# does NOT work inside cm-chroot-sw-img (no PID 1/D-Bus, see 6k)
+ls -la /etc/systemd/system/nvidia-fabricmanager.service   # expect -> /dev/null
+
+# config directories that must exist before first PXE boot (8.7)
+ls -la /etc/network/interfaces.d/ /etc/ntpsec/
 
 exit
 ```
@@ -475,7 +534,7 @@ cmsh -c "softwareimage; list"    # confirm image registered with correct kernel 
 
 Do **not** treat `/cm/images/<image-name>/boot/grub/grub.cfg` (checked from the head node) as a validation signal either way — BCM's node-installer regenerates real bootloader config on each node's own disk during provisioning; this file is not authoritative (see 6f).
 
-### 8.8 Known-acceptable states (don't re-debug these on future racks)
+### 8.9 Known-acceptable states (don't re-debug these on future racks)
 
 | Symptom | Verdict |
 |---|---|
@@ -486,3 +545,4 @@ Do **not** treat `/cm/images/<image-name>/boot/grub/grub.cfg` (checked from the 
 | `nvidia-fabricmanager-580` version doesn't match the DKMS-built driver version | Irrelevant — package is masked and never runs on the compute host; real FM runs off-host on the NVSwitch tray (6d/6k). |
 | `cm-chroot-sw-img` reports `dev`/`proc`/`sys`/`run`/`run/systemd/resolve/resolv.conf`/`dev/pts` "already mounted" on entry | Expected if step 8.4 wasn't run after the previous session — run it, don't ignore the warning (6h). |
 | `Validating repo configuration` fails with `Failure getting installed package list` / `Failed to install packages`, **regardless of `--dgx-type`** | Check the head node's own `ls -la /dev/null` first (6m) before assuming a repo conflict (6e) — this exact on-screen failure has two known, unrelated root causes and doesn't distinguish them. If `/dev` is missing core nodes, that's a host-level incident, not fixable by changing `cm-create-image` flags. |
+| PXE node-installer fails fatally trying to write `interfaces.d/ifcfg-<iface>` or `ntpsec/ntp.conf` during first boot against a new image | Not a package or `ifupdown`/Netplan problem — the target directories (`/etc/network/interfaces.d/`, `/etc/ntpsec/`) don't exist in the image. Fix at the image level per 8.7, not on the node. Doesn't survive a fresh `-a` rebuild — check for it on every rack, not just the first. |
