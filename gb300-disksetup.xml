@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<diskSetup>
+    <device>
+        <blockdev>/dev/nvme0n1</blockdev>
+        <partition id="efi" partitiontype="esp">
+            <size>100M</size>
+            <type>linux</type>
+            <filesystem>fat</filesystem>
+            <mountPoint>/boot/efi</mountPoint>
+            <mountOptions>defaults,noatime,nodiratime</mountOptions>
+        </partition>
+        <partition id="boot1">
+            <size>4G</size>
+            <type>linux</type>
+            <filesystem>ext2</filesystem>
+            <mountPoint>/boot</mountPoint>
+            <mountOptions>defaults,noatime,nodiratime</mountOptions>
+        </partition>
+        <partition id="slash1">
+            <size>max</size>
+            <type>linux</type>
+            <filesystem>ext4</filesystem>
+            <mountPoint>/</mountPoint>
+            <mountOptions>defaults,noatime,nodiratime</mountOptions>
+        </partition>
+    </device>
+</diskSetup>
+
