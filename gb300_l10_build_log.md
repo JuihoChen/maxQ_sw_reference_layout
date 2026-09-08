@@ -1407,6 +1407,155 @@ All three agree — no `UUID=` anywhere in the boot chain. This confirms §25's 
 
 *Status: image captured and validated at the tar level. Not yet fed into `cm-create-image` or tested against a real provisioned node — treat as a candidate image, not a confirmed-working one, until that pass completes.*
 
+## 25b. `cm-create-image` Finding — NVIDIA Driver Packages Install Unpinned, Silently Drift Off the §0 Target Version (2026-09-08)
+
+**Symptom:** running `cm-create-image` end-to-end against `maxQ20rc4-1029-doca341-baseos.tgz` produces a chroot where `nvidia-open-580`, `nvidia-driver-580-open`, `libnvidia-compute-580`, and the rest of the `580`-branch package set install correctly in terms of dependency resolution, but land at whatever NVIDIA's CUDA network repo currently considers the newest `580.x` build (observed: `580.178.04`) — **not** the `580.173.02` required by the NVOnline 2.0.0RC4 matrix in §0. This is a silent drift, not an install failure: `cm-create-image` reports `[OK]` at every stage, and nothing in the log distinguishes a correctly-pinned install from an accidentally-latest one.
+
+**Root cause, confirmed by reading `/var/log/cm-create-image-<image>.log` line-by-line:** the CM package install step invokes `apt-get install` with a **bare package-name list, no version pins**, e.g.:
+```
+apt-get install --yes --assume-yes --allow-unauthenticated -o DPkg::Options::="--force-confnew" \
+  nvidia-open-580 libnvidia-nscq nvidia-driver-580-open nvidia-imex nvidia-persistenced \
+  libnvidia-compute-580 libnvidia-gl-580 libnvidia-cfg1-580 ... [full list in log]
+```
+The CUDA repo (`cm-cuda-ubuntu2404-sbsa.list`) is added immediately before this step and its keyring (`cm-cuda-archive-keyring.gpg`) is deliberately deleted immediately after (`Removing CUDA repo` / `rm -rf .../cm-cuda-archive-keyring.gpg` in the log) — meaning **whichever version apt resolves as "candidate" at that exact moment becomes permanently baked into the image**, with no re-check, no pin, and no way to reproduce the same result on a later rebuild if NVIDIA has published a newer `580.x` patch in the interim. This is a moving target disguised as a deterministic build step.
+
+**Validated separately on bare-metal (`carlonext`, this same day) that version pinning must account for more than a simple `=580.173.02` suffix** — the naive approach fails with cross-repo dependency conflicts. Confirmed working method:
+
+1. Ubuntu-ports and NVIDIA's own CUDA repo package the *same* nominal driver version with **different suffixes** (`580.173.02-0ubuntu0.24.04.1` from ports vs. `580.173.02-1ubuntu1` from NVIDIA's repo). Mixing suffixes across dependent packages (e.g. `libnvidia-compute-580` from one source depending on `nvidia-persistenced >= X-1ubuntu1` but only the ports build being installed) produces unmet-dependency errors that look like version conflicts but are really source-mismatch conflicts. **Fix: pin every `580`-branch package to the NVIDIA-repo suffix (`-1ubuntu1` for this release) consistently, not just the bare version number.**
+2. `libnvidia-nscq` and `nvidia-imex` are available as **both** Ubuntu-ports `-580`/`-580-server`-suffixed virtual packages *and* as bare-named packages directly from NVIDIA's own repo. The `-580-server` variant `Conflicts:` with the `-580` (non-server/open) branch's `nvidia-kernel-common-580` — installing the wrong one blocks the whole open-branch install with a `Conflicts: nvidia-kernel-common` error that doesn't obviously point at `libnvidia-nscq`/`nvidia-imex` as the cause. **Fix: use the bare `libnvidia-nscq=580.173.02-1ubuntu1` / `nvidia-imex=580.173.02-1ubuntu1` package names from NVIDIA's repo, not the Ubuntu-ports `-580`-suffixed virtual-package providers.**
+3. `nvidia-persistenced` and `nvidia-compute-utils-580` are the same underlying package under two names (the former is a virtual package provided by the latter) — pin `nvidia-compute-utils-580` explicitly; pinning only `nvidia-persistenced` by itself does not reliably pin the version.
+4. `dkms` itself has a minimum-version dependency from `nvidia-dkms-580-open` (`>= 3.1.8` for this release) that Ubuntu's stock `noble` `dkms` package (`3.0.11-1ubuntu13`) does not satisfy. Pin `dkms` explicitly to the lowest available version that clears the minimum (`1:3.2.1-1` from NVIDIA's repo) rather than accepting whatever the dependency solver reaches for, to avoid an unnecessary jump to `dkms`'s newest release (`1:3.4.1-1ubuntu1` at time of writing) as a side effect.
+
+**Full validated pin list** (confirmed installing cleanly via `aptitude install` with no unmet dependencies, on `carlonext` bare-metal, 2026-09-08):
+```
+nvidia-open-580=580.173.02-1ubuntu1
+nvidia-firmware-580=580.173.02-1ubuntu1
+libnvidia-gpucomp-580=580.173.02-1ubuntu1
+libnvidia-egl-xcb1=1.0.5-1ubuntu1
+libnvidia-egl-xlib1=1.0.5-1ubuntu1
+libnvidia-egl-wayland1          # unversioned/no 580-branch coupling, latest is fine
+libnvidia-egl-gbm1              # unversioned/no 580-branch coupling, latest is fine
+nvidia-compute-utils-580=580.173.02-1ubuntu1   # also satisfies nvidia-persistenced
+libnvidia-nscq=580.173.02-1ubuntu1             # bare NVIDIA-repo package, not libnvidia-nscq-580
+nvidia-imex=580.173.02-1ubuntu1                # bare NVIDIA-repo package, not nvidia-imex-580
+libnvidia-compute-580=580.173.02-1ubuntu1
+libnvidia-gl-580=580.173.02-1ubuntu1
+libnvidia-cfg1-580=580.173.02-1ubuntu1
+libnvidia-common-580=580.173.02-1ubuntu1
+libnvidia-extra-580=580.173.02-1ubuntu1
+libnvidia-decode-580=580.173.02-1ubuntu1
+libnvidia-encode-580=580.173.02-1ubuntu1
+libnvidia-fbc1-580=580.173.02-1ubuntu1
+xserver-xorg-video-nvidia-580=580.173.02-1ubuntu1
+nvidia-dkms-580-open=580.173.02-1ubuntu1
+nvidia-driver-580-open=580.173.02-1ubuntu1
+nvidia-kernel-source-580-open=580.173.02-1ubuntu1
+nvidia-kernel-common-580=580.173.02-1ubuntu1
+nvidia-modprobe=580.173.02-1ubuntu1
+libxnvctrl0=580.173.02-1ubuntu1
+dkms=1:3.2.1-1
+```
+followed by locking every pinned package in place so a later `apt upgrade` (see §26 open item on this) can't silently move any of them:
+```bash
+sudo apt-mark hold \
+  nvidia-open-580 \
+  nvidia-firmware-580 \
+  libnvidia-gpucomp-580 \
+  libnvidia-egl-xcb1 \
+  libnvidia-egl-xlib1 \
+  nvidia-compute-utils-580 \
+  libnvidia-nscq \
+  nvidia-imex \
+  libnvidia-compute-580 \
+  libnvidia-gl-580 \
+  libnvidia-cfg1-580 \
+  libnvidia-common-580 \
+  libnvidia-extra-580 \
+  libnvidia-decode-580 \
+  libnvidia-encode-580 \
+  libnvidia-fbc1-580 \
+  xserver-xorg-video-nvidia-580 \
+  nvidia-dkms-580-open \
+  nvidia-driver-580-open \
+  nvidia-kernel-source-580-open \
+  nvidia-kernel-common-580 \
+  nvidia-modprobe \
+  libxnvctrl0 \
+  dkms
+```
+(`libnvidia-egl-wayland1` and `libnvidia-egl-gbm1` deliberately excluded — per the comments above, they have no `580`-branch version coupling, so holding them isn't necessary.)
+
+**Verify the holds actually took:**
+```bash
+apt-mark showhold | grep -E "nvidia|^dkms$|libxnvctrl0"
+```
+Should list all 23 package names above, nothing more, nothing missing.
+
+**No action needed on this reference layout, `carlonext`, or the `maxQ20rc4-1029-doca341-baseos.tgz` tarball itself** — `carlonext` is already correctly pinned at `580.173.02` (§7, §16a), and the tarball's own contents are not where the drift originates. Confirmed from the `cm-create-image` log timestamps: the NVIDIA driver packages are **not** part of the tarball's captured filesystem state — they get installed fresh, from scratch, every time `cm-create-image` runs, via the "Installing CM packages" step's own `apt-get install nvidia-open-580 ...` command. That command is generated from a config file that lives entirely on the BCM head node (`bcm11-headnode`), separate from anything this build log or the tarball controls — most likely `/cm/local/apps/cluster-tools/config/UBUNTU2404-config-cm.xml` or an equivalent CM package list, which is out of scope for this document and needs a different owner to action.
+
+**Recommendation — action needed in that head-node pipeline config, tracked here only as a cross-reference:** each `nvidia-*`/`libnvidia-*`/`xserver-xorg-video-nvidia-580`/`dkms` entry in that config needs updating to carry the exact pinned version string above, so that re-running `cm-create-image` at any future date reproducibly lands on `580.173.02`, matching §0, instead of whatever NVIDIA's repo happens to consider newest at build time. Until that config changes, **every future `cm-create-image` run against this or any similarly-built tarball will need the same manual post-build correction** — this finding doesn't self-resolve just because `carlonext`/the tarball are correct.
+
+**Not addressed here — kernel version:** this finding is scoped to driver/module *package version* pinning only. The kernel version target (`6.17.0-1029-nvidia-64k` per §0) is unchanged by this finding and is being tracked separately.
+
+**Revised recommendation (2026-09-08, supersedes the head-node-config-pin recommendation above as the primary fix):** after a full day spent chasing this exact class of problem inside the `cm-create-image` chroot — cross-repo suffix mismatches, virtual-package traps (`libnvidia-nscq`/`nvidia-imex` vs. their `-580`/`-580-server` variants), the `nvidia-persistenced`/`nvidia-compute-utils-580` alias confusion, `dkms` minimum-version pins, and the `nvidia-driver-580-open` metapackage unexpectedly pulling in a full desktop/X11 stack — pinning apt versions *inside the BCM chroot* has proven fragile and expensive in wall-clock time, repeatedly, not just once. The head-node-config pin fix above would still work if implemented, but it keeps this whole fragile mechanism in the critical path of every future image build.
+
+**The more robust fix: don't install the NVIDIA driver via apt at `cm-create-image` time at all.** Ensure `580.173.02` (or whatever the current target is) is already correctly installed on the reference host (`carlonext`) via the `.run`-installer method (§7) **before** the next `-a` capture/re-tar, so the driver — kernel module, DKMS registration, and userspace libraries — is already present and correct in the tarball's filesystem state itself. If the driver is already there when `cm-create-image` unpacks the tarball, whatever the `UBUNTU2404-dist-extrapackages.xml`/CM package list's unpinned `apt-get install nvidia-open-580 ...` step does or doesn't successfully install becomes irrelevant — at worst it's wasted build time on packages the image doesn't actually need to function, not a correctness risk.
+
+**This pattern is already independently validated elsewhere** — the parallel `maxQ106`/`baseos-1014-doca321` reference layout (a separate rack, tracked in `session-summary.md`) uses exactly this approach: its validated driver (`580.126.20`) is baked into the tarball from the original `.run`-installer bring-up, and its `cm-create-image` build has never needed to depend on the apt-based NVIDIA package list succeeding. Today's `baseos-1029-doca341` line is the outlier, not the norm, in trying to get the driver installed via apt inside the BCM pipeline.
+
+**Practical next step:** before the next capture of this reference layout, confirm `carlonext`'s `580.173.02` install (already done and validated, §7/§16a) is what gets tar'd, and treat the CM/dist package list's `nvidia-*-580` install attempt inside `cm-create-image` as a harmless no-op to ignore going forward — not something to fix or pin. The head-node config pin fix remains a valid *secondary* improvement if someone wants build logs to stop showing version-drift noise, but it's no longer the recommended primary path.
+
+**How to actually do this, step by step:**
+
+1. **On `carlonext`, re-verify the driver/kernel state matches the target before touching anything else** — don't assume it's still correct just because it was validated earlier in this document; today's own session showed how easily this drifts:
+   ```bash
+   uname -r                          # expect 6.17.0-1029-nvidia-64k (or current target, see §0)
+   modinfo nvidia | grep ^version    # expect 580.173.02
+   nvidia-smi                        # confirm all GPUs healthy, no NVML errors
+   dkms status                       # confirm single-kernel, no stray entries
+   dpkg -l | grep -E "nvidia-open-580|nvidia-driver-580-open"  # expect: not installed via apt at all —
+                                                                 # driver should only exist via the .run/DKMS path (§7), matching maxQ106's pattern
+   ```
+   If any of these are wrong, fix them on `carlonext` directly (re-run the `.run` installers per §7, or whatever correction is needed) and re-run the full `gb300_l10_sw_checklist.sh` checklist before proceeding — do not capture a tarball from a known-drifted state.
+
+2. **Run the disk-cleanup pass (§22a) again if it's been a while since the last one** — stale local-repo packages, apt cache, and swap-file bloat all get baked into the tarball verbatim if skipped:
+   ```bash
+   apt-get clean
+   # + whatever else §22a's specific cleanup steps cover
+   ```
+
+3. **Capture the tarball using the same method as §25a** (adjust the filename/version tag for whatever this capture represents — e.g. bump `rc4` or the date if this is meant to be a distinct, trackable artifact from the original):
+   ```bash
+   sudo mkdir -p /root/bcm-image-export
+   sudo tar --numeric-owner --xattrs --acls -czpf /root/bcm-image-export/<new-tarball-name>.tgz \
+     --exclude='./proc' --exclude='./sys' --exclude='./dev' --exclude='./run' \
+     --exclude='./tmp' --exclude='./mnt' --exclude='./media' --exclude='./lost+found' \
+     --exclude='./root/bcm-image-export' \
+     -C / .
+   ```
+
+4. **Run §25a's post-capture validation** (tar integrity, member count, `machine-id`/SSH-host-key presence per whatever identity policy is intended this time) before trusting the new archive.
+
+5. **Feed the new tarball into `cm-create-image`** exactly as before (this time dropping `--no-cm-cuda-repo`, per this morning's original finding, unless §8.2's caveat in `session-summary.md` changes that decision):
+   ```bash
+   cm-create-image -a /root/bcm-image-export/<new-tarball-name>.tgz \
+     -n <new-image-name> \
+     --dgx-type dgx_gb300 \
+     -s
+   ```
+
+6. **After the build completes, verify the driver survived intact** — this is the actual proof the strategy worked:
+   ```bash
+   cm-chroot-sw-img /cm/images/<new-image-name>
+   dkms status                       # expect nvidia/580.173.02 (or current target) against the target kernel, untouched
+   dpkg -l | grep -E "nvidia-open-580|nvidia-driver-580-open"  # if these got installed via the CM/dist package
+                                                                 # list's unpinned apt step, that's the expected
+                                                                 # harmless no-op from §25b — check the DKMS-registered
+                                                                 # version above is still correct regardless
+   exit
+   ```
+   If `dkms status` still shows the correct, `carlonext`-validated version after the build, the strategy is confirmed working — the tarball's baked-in driver survived `cm-create-image`'s own apt activity untouched, exactly as `maxQ106` already demonstrates.
+
 ## 26. Next Steps (not yet started)
 
 - [x] NVIDIA kernel build packages (gcc, dkms, make) — see §5
@@ -1441,7 +1590,10 @@ All three agree — no `UUID=` anywhere in the boot chain. This confirms §25's 
 - [ ] Review `apt list --upgradable` (130 packages, surfaced by §22a) before ever running `apt upgrade` on this reference layout — check specifically for `linux-image-*`/`nvidia-*`/`doca-*` version bumps against the pinned NVIDIA 2.0 matrix (§0)
 - [ ] Audit other nodes in category `maxQ-1014-doca321` for the same manually-added, unused `/swap.img` (§22a open item) — not part of the BCM disk-setup definition, so likely a per-node manual addition rather than fleet-standard
 - [x] Capture reference-layout tarball (`maxQ20rc4-1029-doca341-baseos.tgz`) for BCM image export — validated at the tar level (integrity, expected-file presence, by-path consistency), see §25a
-- [ ] Feed `maxQ20rc4-1029-doca341-baseos.tgz` into `cm-create-image` and provision a real test node from it — end-to-end pass not yet run, see §25a
+- [x] Feed `maxQ20rc4-1029-doca341-baseos.tgz` into `cm-create-image` — end-to-end run completed 2026-09-08; surfaced a real finding, see §25b
+- [ ] (secondary, deprioritized per §25b's revised recommendation) Update `cm-create-image`'s CM package list (head-node config, not this tarball) to pin every `nvidia-*`/`libnvidia-*`/`dkms` entry to the exact `580.173.02` version strings validated in §25b — only worth doing to quiet build-log noise, not required for correctness once the driver is baked into the tarball directly
+- [x] Decided: driver correctness will come from the reference layout (`carlonext`, §7) being correct **before** the next tarball capture, not from apt-pinning inside `cm-create-image` — see §25b's revised recommendation (2026-09-08). Chasing pins in the BCM chroot repeatedly cost more time than it saved.
+- [ ] Before the next `-a` capture/re-tar of this reference layout, re-confirm `carlonext`'s driver state is still `580.173.02`/kernel `6.17.0-1029-nvidia-64k` (or whatever the current target is) so it's what actually gets baked into the new tarball
 - [ ] Confirm whether `cm-create-image`/BCM's node-install process has its own `machine-id`/SSH-host-key regeneration mechanism, since §25a's image deliberately ships both static (diverging from §25's per-clone-regen design) — needs to be a conscious pipeline-level decision before cloning multiple production nodes from this image
 
 ---

@@ -306,8 +306,8 @@ Image build is stable and reproducible (6f + 6g confirm it two different ways), 
 2. **Escalate to NV** per 6l's updated question — which of `gb200`/`gb300` is correct for GB300 NVL, and whether `maxQ106`'s original validation ever went through this flag at all. Do not provision the 18-node rack until this is answered, given the risk is now a silent wrong-parameter choice (e.g. IOMMU/PCIe/NVLink topology), not a build failure.
 
 **Phase 2 — Pending image-level fixes (resolve/apply before assigning nodes, not after):**
-3. **Not yet started:** investigate the proposed `hosts.suffix`/`#HOSTNAME#` fix for a `BF3PcieInterfaceTraffic` partnerdiag failure (6n/8.9) — verify the mechanism against real BCM documentation before applying anything, since it's currently unverified and unapplied.
-4. Confirm the `nsswitch.conf` SSSD-hang fix (6o/8.8) — real-node reproduction and fix now confirmed working — is actually the *intended* trade-off (i.e. local-only account resolution is correct for this cluster's access model, not just effective at stopping the hang).
+3. **✅ Resolved 2026-09-04:** the `hosts.suffix`/`#HOSTNAME#` approach was confirmed non-functional; a working finalize-script fix (v3) is validated across a full 18-node rack01 redeploy — see 6n/8.9. **Still open:** confirm this actually fixes `BF3PcieInterfaceTraffic` partnerdiag (never independently verified), and decide whether to bake the finalize-script assignment into the `maxQ106` reference build.
+4. **The `nsswitch.conf` SSSD-hang fix (6o/8.8) is confirmed to regress `cmsupport` account resolution** (real-node evidence, `rack01node18`, 2026-09-08) — needs a revised remediation (tune SSSD timeout/negative-cache instead of `files`-only, or explicitly allow-list only the accounts that don't need LDAP) before being applied to any further racks or baked into `maxQ106`. Do not treat 8.8 as done.
 5. Decide and apply a fix for the `/swap.img` sparse-file inflation (6p) — either fix the tar sparseness (archive-creation side or `cm-create-image --tar-options`) or simply exclude `swap.img` from the image via `-o`/`--exclude-from`. Costs ~8GB per image otherwise, multiplied across 8 racks.
 
 **Phase 3 — Optional diagnostics (nice-to-have, not blocking provisioning):**
@@ -326,13 +326,17 @@ Image build is stable and reproducible (6f + 6g confirm it two different ways), 
 14. Resolve the still-open items below in parallel.
 
 ### Still-open, non-blocking items
+- **`ntp` health check FAIL — root cause confirmed, fix drafted, not yet applied or validated.** `chrony` missing from the image entirely; category `timeservers` field does not drive persistent sync. See 8.12.
+- **`ldap` health check FAIL (`cmsupport` user) — ✅ CONFIRMED as a direct regression from 8.8's `nsswitch.conf` local-only fix (2026-09-08).** Reproduced on `rack01node18`, running the correct image (`baseos-1014-doca321`/`maxQ106`, with 8.8 actually applied — confirmed via `latesthealthdata`), so this is real evidence, not the earlier confounded observation on `rack08node18` (which turned out to be a different node, on a different image entirely, checked mid-`cm-create-image`-write on an unrelated build — that result should be disregarded). `id: 'cmsupport': no such user` reproduces exactly as suspected: `cmsupport` apparently must resolve via LDAP, and 8.8's `files`-only override for `passwd`/`group`/`netgroup` blocks that lookup entirely. **This means 8.8's trade-off is not safe as currently written — needs a fix that stops the SSSD/LDAP hang (6o) without breaking accounts, like `cmsupport`, that genuinely require LDAP resolution.** Candidate directions to investigate next session: (a) keep `sssd` in `nsswitch.conf` but tune SSSD's own negative-cache/timeout settings so unknown-UID lookups fail fast instead of hanging, rather than removing LDAP from the chain entirely; (b) explicitly allow-list `cmsupport` (and any other required service accounts) to resolve locally via `/etc/passwd` while leaving `nsswitch.conf` otherwise pointed at SSSD for everything else. Do not consider 8.8 closed/final until one of these is validated — reverting to the pre-8.8 `nsswitch.conf` isn't safe either, since 6o's hang was independently reproduced and confirmed on real hardware.
+- **`gpu_health_nvlink` FAIL (all 4 GPUs) and `gpu_health_overall` FAIL on `rack01node18` (2026-09-08) — expected, not a bug.** Info: `Fabric State is In Progress (2). Ensure that the FabricManager is...`. Confirmed benign: this is the expected pre-GFM-configuration state for this GB300 NVL topology (real Fabric Manager runs off-host on the NVSwitch tray per 6k, not on the compute node) — will clear once GFM is configured on the NVSwitches. **Corroborating evidence:** `rack08` (different image/rack — `baseos-1029-doca341`, not `maxQ106`, so not a same-image comparison, but same underlying fabric-state mechanism) shows no `gpu_health_nvlink` FAIL, consistent with rack08's NVSwitches already having GFM configured while rack01's do not yet. Supports fabric state being a rack-infrastructure/GFM-configuration property, not something tied to the compute-node image. No fix needed on the compute-image side; re-check `rack01` after NVSwitch GFM configuration to confirm it clears as expected, but not a blocker for anything upstream of that step.
+- **`gpu_health_overall` FAIL despite all per-GPU sub-checks PASS** on `rack01node01` — cause unknown, not yet investigated.
 - Per-node identity regeneration (machine-id, SSH host keys, hostname) across the 18 nodes — not yet confirmed how/whether BCM's node-installer handles this automatically. Check "Assigning Images to Nodes and Post Installation Configurations" doc section.
 - Whether an off-box backup of `maxQ106`'s pre-BCM-capture state exists — still never explicitly confirmed this session.
 - **Bake missing `/etc/network/interfaces.d/`, `/etc/ntpsec/` directories, and the `nsswitch.conf` SSSD-hang fix (6o) into `maxQ106` before the next re-tar (8.7/6o).** Currently only patched live on `baseos-1014-doca321`'s extracted image directory — won't survive a fresh `-a` rebuild and hasn't been applied to any of the other 7 racks' future images. Same category of fix as the fabricmanager mask override (6k) — do all of these in one pass on the reference host, not repeated per rack.
 - **`/swap.img` inflated from 8.0K (sparse) to 8.0GB (fully allocated) during image capture (6p)** — confirmed via direct `du`/`ls -lsh`/`--apparent-size` measurement, root cause (tar sparseness lost somewhere in the archive-creation or extraction path) suspected but not pinned down. No fix applied yet; decide between fixing tar sparseness (`--tar-options --sparse`) vs. simply excluding `swap.img` from the image (`-o`/`--exclude-from`). Costs ~8GB per image, multiplied across all 8 racks if left unaddressed.
 - **`6.8.0-106-generic-64k` build-time cost (6i)** — reproduces reliably (hit in both the incremental and from-archive builds) and costs real wall-clock time (~8.5hr total build observed) via redundant DKMS/OFED cycles against a kernel that's discarded either way. Exact disposal mechanism unconfirmed (see 6i); worth an NV/BCM support report regardless, given it'll recur on all 7 remaining racks unless addressed.
 - **Root cause of the 6m `devtmpfs` incident** — head node recovered via reboot, but why it happened was never established. Worth a proper post-incident review with whoever else has admin/on-call ownership of this system, separate from the rack-build work.
-- **`BF3PcieInterfaceTraffic` partnerdiag `hosts.suffix` fix (6n) — proposed only, not applied, not verified.** Do not assume this is resolved; the `#HOSTNAME#` token's behavior in particular needs confirming before running the command.
+- **`BF3PcieInterfaceTraffic` partnerdiag fix (6n/8.9) — delivery mechanism resolved and validated (18-node rack01 redeploy), but the underlying fix theory itself still unconfirmed.** Re-run partnerdiag on a rack01 node to confirm this actually resolves the failure before treating the original problem as closed.
 
 ### 6l. `--dgx-type dgx_gb200` vs `dgx_gb300` — ✅ both build successfully; question reframed from "which works" to "which is correct"
 
@@ -382,23 +386,35 @@ Manually recreating each node with `mknod` (using standard major/minor numbers) 
 - Don't assume `--dgx-type` (either value) is the cause of a "Validating repo configuration" failure again without first checking `ls -la /dev/null` (or the same wider sweep) on the head node directly — this failure signature is now known to have at least two unrelated possible causes (the 6e repo-conflict class, and this devtmpfs class), and the on-screen message doesn't distinguish them.
 - If any future rack build hits this same failure signature, check the host's `/dev` **before** re-running any chroot-cleanup or `cm-create-image` commands, given the (unconfirmed but not ruled out) possibility that mount-cleanup activity is implicated.
 
-### 6n. ⚠️ Candidate fix for `BF3PcieInterfaceTraffic` partnerdiag failure — proposed, NOT YET APPLIED, NOT YET VERIFIED
+### 6n. ✅ RESOLVED: `/etc/hosts` `127.0.1.1 <hostname>` fix for `BF3PcieInterfaceTraffic` partnerdiag failure (2026-09-04)
 
-Raised as a possible remedy for a `BF3PcieInterfaceTraffic` partnerdiag test failure on nodes provisioned from `baseos-1014-doca321`:
-
+Originally raised as a candidate remedy for a `BF3PcieInterfaceTraffic` partnerdiag test failure on nodes provisioned from `baseos-1014-doca321`. The original candidate command:
 ```bash
 echo "127.0.1.1   #HOSTNAME#" > /cm/images/baseos-1014-doca321/etc/hosts.suffix
 ```
+was never applied and is now confirmed **not a real BCM mechanism** — see resolution below. Both open questions flagged at the time this was first raised turned out to be justified, not just theoretical caution:
 
-**Status: this has not been run. No action has been taken on this image or any node.** Recorded here only as a flagged candidate for the next session, not as a fix in progress or a confirmed resolution — do not treat this section as "done" the way 6f/6g/6k are.
+**Confirmed: `hosts.suffix` does nothing.** Node-installer's own log (`/var/log/node-installer`) shows it generates `/etc/hosts` internally from its own template + device database at two points during provisioning (`/tmp/hosts` early, then `/localdisk/etc/hosts` later) — with no log line anywhere indicating it reads or merges any `.suffix` companion file. The file would sync onto disk via the image rsync step, then simply sit there unused, never referenced by anything. Also confirmed `#HOSTNAME#` is not a real BCM macro — moot, since the merge mechanism it depended on doesn't exist either.
 
-**Open questions to resolve before applying this, not yet answered:**
-- Whether `/etc/hosts.suffix` is a real, documented BCM convention (content appended to the node-installer's auto-generated `/etc/hosts` at provisioning time) or an assumption about a path that happens to look BCM-like — not confirmed either way this session.
-- Whether `#HOSTNAME#` is a literal token BCM's node-installer actually substitutes per-node at provisioning time, or would need real per-node substitution some other way. **This is the most important thing to verify before applying at scale** — if BCM does not expand this token, every node would end up with a broken `/etc/hosts` entry containing the literal string `#HOSTNAME#` instead of its own hostname, which could itself cause hostname-resolution failures (possibly a *different*, newly-introduced problem masquerading as a fix).
-- What the specific failing check actually validates and why a `#HOSTNAME#`/hosts-file fix would plausibly address it — the test itself is now named (`BF3PcieInterfaceTraffic`), but *why* PCIe interface traffic testing on the BF3 would depend on `/etc/hosts` content hasn't been explained or verified, only assumed from the fix's framing.
-- Same archive-vs-live-directory caveat as 6k/8.7: if this does turn out to be a real, verified fix, it should ultimately be baked into the `maxQ106` reference archive before the next re-tar, not left as a manual step applied only to this one image directory.
+**Actual working fix — three iterations, real root cause found on the second:**
 
-**Next session: verify the BCM `hosts.suffix`/`#HOSTNAME#` mechanism against actual BCM documentation or support before running the command above, then apply, then re-run `BF3PcieInterfaceTraffic` partnerdiag and confirm pass before writing this up as resolved.**
+- **v1** (`echo "127.0.1.1 $(hostname)" >> /etc/hosts`, delivered as a BCM category finalize script): ran successfully every time (confirmed via node-installer log: `Finalize script:finalize-hosts-127: appended 127.0.1.1 rack08node18 to /etc/hosts`), but the appended line never survived to the booted node. **Root cause confirmed directly from BCM's own shipped example** (`/cm/local/apps/cmd/etc/htdocs/scripts/finalize/log_available_environment_variables.sh`), which states outright in its header comment: *"The root / of the running node is always mounted on /localdisk"* during the finalize stage. v1 wrote to the ramdisk's own throwaway `/etc/hosts`, not the target node's persisted file at `/localdisk/etc/hosts` — a chroot/path mismatch, not a race condition or a cmd-overwrite as first suspected.
+- **v2** (self-healing systemd `.path` unit watching `/etc/hosts` for changes, re-applying the entry on every trigger, installed via the finalize script): built as a workaround that sidesteps the path-mismatch question entirely by running post-boot, on the real filesystem, regardless of when/how cmd or node-installer touch the file. Sound in principle, tested logically, but ultimately not needed once the actual root cause was found — not deployed to the category.
+- **v3** (shipped fix): writes directly to `/localdisk/etc/hosts` instead of `/etc/hosts`, fixing the root cause directly rather than working around it. Saved as a real on-disk reference copy at `/cm/local/apps/cmd/etc/htdocs/scripts/finalize/finalize-hosts-127-v3.sh` (alongside BCM's own shipped finalize examples — confirmed this is a real, cmsh-tab-completion-recognized directory, not an assumption), and applied to `category[maxQ-1014-doca321]` via `set finalizescript finalize-hosts-127-v3.sh` (cmsh reads the file directly by name from that directory — cleaner than the interactive editor-paste method used for v1/v2, confirmed working).
+
+**Validated 2026-09-04 on a full rack01 redeploy (18× L10 nodes)**, not just a single retest:
+```
+rack01node01: 127.0.1.1   rack01node01
+rack01node02: 127.0.1.1   rack01node02
+rack01node09: 127.0.1.1   rack01node09
+rack01node18: 127.0.1.1   rack01node18
+```
+Each node correctly shows its own hostname — no cross-contamination, no leftover `#HOSTNAME#` literal, no missing entries across a spot-check of 4 of 18 nodes.
+
+**Still open, not yet closed out:** whether this actually makes `BF3PcieInterfaceTraffic` partnerdiag pass has **not yet been re-run and confirmed** on a node with this fix applied. The `/etc/hosts`-content theory for that failure was never independently verified — only assumed from how the original fix was framed when first proposed. Re-run partnerdiag on at least one of the rack01 nodes and confirm pass before treating the *original problem* (not just the delivery mechanism) as closed.
+
+**Also open:** per the original archive-vs-live-directory caveat, this fix currently lives only in `category[maxQ-1014-doca321]`'s finalize script — confirm whether it needs to be reflected in the `maxQ106`/reference-image build process (§8) so it's not lost on a future image rebuild that doesn't go through this specific category.
+
 
 ### 6o. `ls -l`/`id` hangs on non-existent UIDs — SSSD/LDAP lookup timeout, fixed via `nsswitch.conf` — ✅ real-node reproduction and fix confirmed
 
@@ -489,6 +505,20 @@ cm-create-image -a /root/bcm-image-export/<source-archive>.tgz \
   --no-cm-cuda-repo
 ```
 
+**⚠️ Caveat added 2026-09-08, not yet resolved — verify before relying on this step as written for the next rack build.** `--no-cm-cuda-repo` was correct when this SOP was written (successful `baseos-1014-doca321` build, 2026-08-24), but a separate, parallel image build (`baseos-1029-doca341`, same head node, same `UBUNTU2404-dist-extrapackages.xml` package list) run today needed the CUDA network repo *enabled* to successfully install the `nvidia-open-580`/`nvidia-imex`/`nvidia-kernel-common-580`/etc. entries from that same file — without it, those packages come back "Unable to locate package" and are silently skipped rather than failing the build.
+
+**Working hypothesis, not confirmed:** `maxQ106`'s validated driver (`580.126.20`, DOCA 3.2.1) is already present in the source tarball via the original `.run`-installer bring-up — this build step was very likely trying to additionally install `580.173.02` (the next-gen, 2.0.0-era driver from §3's staged artifacts) as an "extra" package, unrelated to the image's actual working driver. If that install silently failed in the original August build too, it wouldn't have caused a visible problem, since the image never depended on it succeeding — but this has **not** been confirmed against the original build log, which wasn't available to check this session.
+
+**Before the next rack build, verify directly rather than assuming either way:**
+```bash
+cm-chroot-sw-img /cm/images/<image-name>
+apt-cache policy nvidia-open-580 nvidia-imex nvidia-kernel-common-580
+dpkg -l | grep -E "nvidia-open-580|nvidia-imex|nvidia-kernel-common-580"
+exit
+```
+If none of these are installed and that's expected (because `580.126.20` is the intended driver and `580.173.02` genuinely isn't needed yet), `--no-cm-cuda-repo` is fine as-is — no change needed. If any of the 2.0.0-era `.run`-staged driver components are actually expected to come from this apt-based step (rather than purely from the staged `.run` files in §3), the flag needs to be dropped, matching what today's `baseos-1029-doca341` build required — see the parallel `gb300_l10_build_log.md` §25b for the version-pinning issues that come with turning the repo back on (unpinned installs there drifted to `580.178.04` instead of the intended `580.173.02`).
+
+
 ⚠️ **`--dgx-type dgx_gb300` shown here as the current default for copy-paste, matching what `baseos-1014-doca321` was most recently built with — but this is not yet NV-confirmed as correct for this hardware (see 6l).** Double-check 6l/Section 4 item 2 before running this on a new rack in case NV's answer has landed since this doc was last updated; if NV instead confirms `dgx_gb200`, update this value accordingly before building the remaining racks.
 
 Expect this to take up to ~8.5 hours end-to-end (6i) — dominated by two redundant DKMS/OFED build cycles against an irrelevant `6.8.0-106-generic-64k` kernel that "Installing CM packages" installs by name regardless of `-s`. This is currently accepted as a known, reproducible cost, not a failure — do not interrupt the build on this basis. If a real NV/BCM support report is wanted, check `/var/log/apt/history.log` inside the image afterward (6i) to pin the exact package-disposal mechanism first.
@@ -576,41 +606,105 @@ sudo mkdir -p /etc/ntpsec
 
 Once captured into the archive this way, every future `-a` build (this rack's next rebuild and all 7 remaining racks) gets these directories automatically, with no per-image manual step needed — exactly how the fabricmanager masked-unit override became permanent once it was captured into the archive rather than reapplied via chroot on every build. Track this alongside the fabricmanager fix as one of the standing "things the next `maxQ106` re-tar should include."
 
-### 8.8 Fix: `ls -l`/`id` hang on unresolvable UIDs (SSSD/LDAP timeout) — ✅ confirmed working, but confirm the trade-off is intended
+### 8.8 — REMOVED FROM SOP: `nsswitch.conf` SSSD-hang fix (was here, confirmed regression, do not apply)
 
-```bash
-cm-chroot-sw-img /cm/images/<image-name>
-sed -i 's/passwd:.*/passwd:     files/' /etc/nsswitch.conf
-sed -i 's/group:.*/group:      files/' /etc/nsswitch.conf
-sed -i 's/netgroup:.*/netgroup:   files/' /etc/nsswitch.conf
-exit
+**This step is intentionally no longer part of the SOP.** The `files`-only `nsswitch.conf` override previously documented here was confirmed (2026-09-08, `rack01node18`, real-node `latesthealthdata`) to break `cmsupport` account resolution — `ldap` health check fails with `id: 'cmsupport': no such user`. Do not apply the old `sed` fix to any further racks, and do not bake it into `maxQ106`.
+
+The underlying problem it was trying to solve (`ls -l`/`id` hanging on unresolvable UIDs due to SSSD/LDAP lookup timeout) is real and independently confirmed on real hardware — see 6o for the full symptom writeup. A revised fix (tuning SSSD's negative-cache/timeout instead of removing LDAP from the chain, or explicitly allow-listing only the accounts that genuinely don't need LDAP) still needs to be designed and validated before anything is added back here. Track status in the "Still-open, non-blocking items" list, not as an SOP step, until a non-regressing fix exists.
+
+### 8.9 ✅ RESOLVED: `127.0.1.1 <hostname>` fix for `BF3PcieInterfaceTraffic` partnerdiag failure — SOP step (2026-09-04)
+
+The original candidate (`echo "127.0.1.1   #HOSTNAME#" > /cm/images/<image-name>/etc/hosts.suffix`) is **confirmed not a real BCM mechanism** — node-installer never reads or merges a `.suffix` file when generating `/etc/hosts`, and `#HOSTNAME#` is not a real substitution token. Full investigation and root-cause trail in 6n.
+
+**Actual SOP step, verified working on a full 18-node rack01 redeploy:**
+
+1. Save the finalize script at `/cm/local/apps/cmd/etc/htdocs/scripts/finalize/finalize-hosts-127-v3.sh` (this is a real, cmsh-recognized directory for authored finalize/initialize scripts, confirmed alongside BCM's own shipped examples — `ls` it to confirm before assuming the path on a different cluster/BCM version).
+2. Apply it to the target category:
+   ```
+   cmsh
+   % category use <category-name>
+   % set finalizescript finalize-hosts-127-v3.sh
+   % commit
+   ```
+3. The script itself writes to `/localdisk/etc/hosts` (not `/etc/hosts`) — this is the critical detail. Per BCM's own shipped `log_available_environment_variables.sh` example: *"The root / of the running node is always mounted on /localdisk"* during the finalize stage, so anything writing to `/etc/hosts` at this point hits the ramdisk's throwaway copy, not the file that survives onto the booted node. This was the actual root cause of the original fix never taking effect on the first working attempt (v1) — confirmed directly via node-installer log showing the script reporting success while the target node's booted `/etc/hosts` never showed the entry.
+
+**Verified 2026-09-04**, all spot-checked nodes on a fresh rack01 (18× L10) redeploy show their own correct `127.0.1.1 <hostname>` entry, no cross-contamination between nodes.
+
+**Still not confirmed:** whether this actually resolves `BF3PcieInterfaceTraffic` partnerdiag — the `/etc/hosts`-content theory for that failure has never been independently verified, only assumed from how the fix was originally framed. **Re-run partnerdiag on a rack01 node with this fix applied before treating the original problem as closed, not just the delivery mechanism.**
+
+**Same archive-baking reminder as 8.7:** if partnerdiag confirms this actually fixes the failure, bake the finalize-script assignment into the `maxQ106` reference build process so it's automatic for all remaining racks, rather than a manual per-category `cmsh` step applied ad hoc.
+
+
+### 8.10 Fix: `Missing device. Node Installer will halt.` (`missing device assert`) — category `disksetup` was unset
+
+**Symptom, confirmed via node-installer console screenshot:**
+```
+Finished setting up the network.
+Installmode is: FULL
+Setting up environment for initialize scripts.
+Fetching RAID setup.
+Fetching disks setup.
+Creating new disk layout.
+Missing device.  Node Installer will halt.
+More details are in the log file.
+
+There was a fatal problem. This node can not be installed
+until the problem is corrected.
+You can switch to a shell using Alt << F2-F12.
+
+The error was: missing device assert
+```
+Halts during the "Fetching disks setup" / "Creating new disk layout" stage — **before** node-installer ever gets to checking partition sizes, so this is not a disk-capacity issue despite the superficially similar "disk" framing. It's node-installer failing to resolve a target block device to partition at all.
+
+**Fix: set (or re-confirm) the category's `disksetup` property** with a valid disk-setup XML:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<diskSetup>
+    <device>
+        <blockdev>/dev/nvme0n1</blockdev>
+        <partition id="efi" partitiontype="esp">
+            <size>100M</size>
+            <type>linux</type>
+            <filesystem>fat</filesystem>
+            <mountPoint>/boot/efi</mountPoint>
+            <mountOptions>defaults,noatime,nodiratime</mountOptions>
+        </partition>
+        <partition id="boot1">
+            <size>4G</size>
+            <type>linux</type>
+            <filesystem>ext2</filesystem>
+            <mountPoint>/boot</mountPoint>
+            <mountOptions>defaults,noatime,nodiratime</mountOptions>
+        </partition>
+        <partition id="slash1">
+            <size>max</size>
+            <type>linux</type>
+            <filesystem>ext4</filesystem>
+            <mountPoint>/</mountPoint>
+            <mountOptions>defaults,noatime,nodiratime</mountOptions>
+        </partition>
+    </device>
+</diskSetup>
+```
+Same three-partition layout already validated against `carlonext`'s live disk (efi/boot/root, no swap defined — consistent with the swap-removal decision in the earlier disk-cleanup pass). Apply via `cmsh` (exact set syntax not yet confirmed against a file-based method the way `finalizescript`'s directory-file lookup was — likely requires editing via the interactive `set disksetup` editor, or loading one of the shipped templates from `/cm/local/apps/cmd/etc/htdocs/disk-setup/` if one matches):
+```
+cmsh
+% category use maxQ-1014-doca321
+% set disksetup
+```
+(paste the XML above, save, exit)
+```
+% commit
 ```
 
-**Before applying to a new rack, confirm this trade-off is actually wanted for this cluster's access model:** this disables SSSD/LDAP-based identity resolution on the node entirely, falling back to local (`files`-only) account resolution — correct if compute nodes are only ever accessed via local accounts, a regression if any operator workflow depends on LDAP/AD-resolved accounts directly on the compute node. Full reasoning and real-node confirmation in 6o.
+**Root cause: not fully confirmed, but strongly suspected to be an unset/empty `disksetup` property, not a content problem.** The XML applied is byte-for-byte identical to what was already reviewed and validated for this same category earlier in this session — so this almost certainly wasn't a wrong-`blockdev`-name or wrong-partition-scheme fix. The more likely explanation: the category's `disksetup` was empty/unset at the time of the halt (node-installer had nothing to target a device with, hence "missing device assert"), and simply setting *any* valid layout — even one identical to what had been reviewed before — gave it something to work from for the first time. **Not independently confirmed** — would need the pre-fix `get disksetup` output (empty vs. populated) to know for certain, which wasn't captured before the change was made.
 
-**Verify with a UID that's genuinely guaranteed not to exist** — avoid low numbers like `604` that risk coincidentally matching a real system/service account:
-```bash
-time id 9999
-time getent passwd 9999
-```
-(Run this on a real, provisioned, SSSD-running node if possible — a chroot session can't reproduce the actual hang, see 6o.)
+**Validated:** confirmed working after this was applied and rack01 (18× L10 nodes) was redeployed — no further "missing device assert" halts observed on that run. Not confirmed whether this reproduces/was present on rack08 as well, or whether rack08 has its own independent history with this setting.
 
-**Same archive-baking reminder as 8.7:** apply once on `maxQ106` before the next re-tar so it's automatic for all remaining racks, rather than reapplying per-image.
+**Before repeating on rack08 or any further rack:** confirm this category's `disksetup` is populated (`cmsh -c "category use <category>; get disksetup"`) as a pre-provisioning check, the same way 8.7's missing-directories check and 8.3's fabricmanager-mask check are done before assigning nodes — add this to the pre-flight checklist for all remaining racks rather than only discovering it via a live halt during provisioning.
 
-### 8.9 ⚠️ Candidate fix: `BF3PcieInterfaceTraffic` partnerdiag failure — UNVERIFIED, do not apply blind
 
-```bash
-echo "127.0.1.1   #HOSTNAME#" > /cm/images/<image-name>/etc/hosts.suffix
-```
-
-**Do not run this as a routine SOP step yet.** Unlike every other fix in this section, this one has **not** been confirmed to work, and the mechanism itself hasn't been verified:
-- Whether `/etc/hosts.suffix` is a real, documented BCM convention (content appended to the node-installer's generated `/etc/hosts`) or an untested assumption about the path.
-- Whether `#HOSTNAME#` is a literal token BCM's node-installer actually substitutes per-node — if it isn't, every node would get a broken `/etc/hosts` entry containing the literal string `#HOSTNAME#`, potentially causing a *new* hostname-resolution problem rather than fixing anything.
-- Why a PCIe interface traffic test on the BF3 would depend on `/etc/hosts` content at all — not yet explained.
-
-**Before including this in a real rack build:** verify the mechanism against actual BCM documentation or NV/BCM support, apply on a single test node, and confirm `BF3PcieInterfaceTraffic` partnerdiag actually passes as a direct result — see 6n for full context. Listed here as a placeholder so it isn't forgotten, not as an endorsed step.
-
-### 8.10 Verify before trusting the image
+### 8.11 Verify before trusting the image
 
 ```bash
 cm-chroot-sw-img /cm/images/<image-name>
@@ -630,8 +724,15 @@ ls -la /etc/systemd/system/nvidia-fabricmanager.service   # expect -> /dev/null
 # config directories that must exist before first PXE boot (8.7)
 ls -la /etc/network/interfaces.d/ /etc/ntpsec/
 
-# nsswitch.conf SSSD-hang fix (8.8) — expect 'files' on all three lines
+# nsswitch.conf — confirm the SSSD-hang override from the old 8.8 is NOT present
+# (that fix was removed from the SOP — confirmed regression, see 8.8/6o).
+# Expect the default Ubuntu/SSSD-backed lines here, NOT 'files' on all three.
 grep -E "^(passwd|group|netgroup):" /etc/nsswitch.conf
+
+# chrony (8.13) — expect installed, enabled, not systemd-timesyncd
+dpkg -l | grep -i -E "^ii\s+(ntp|chrony)"
+systemctl is-enabled chrony
+systemctl is-enabled systemd-timesyncd   # expect 'not-found' or 'masked', not 'enabled'
 
 exit
 ```
@@ -642,7 +743,7 @@ cmsh -c "softwareimage; list"    # confirm image registered with correct kernel 
 
 Do **not** treat `/cm/images/<image-name>/boot/grub/grub.cfg` (checked from the head node) as a validation signal either way — BCM's node-installer regenerates real bootloader config on each node's own disk during provisioning; this file is not authoritative (see 6f).
 
-### 8.11 Known-acceptable states (don't re-debug these on future racks)
+### 8.12 Known-acceptable states (don't re-debug these on future racks)
 
 | Symptom | Verdict |
 |---|---|
@@ -654,3 +755,46 @@ Do **not** treat `/cm/images/<image-name>/boot/grub/grub.cfg` (checked from the 
 | `cm-chroot-sw-img` reports `dev`/`proc`/`sys`/`run`/`run/systemd/resolve/resolv.conf`/`dev/pts` "already mounted" on entry | Expected if step 8.4 wasn't run after the previous session — run it, don't ignore the warning (6h). |
 | `Validating repo configuration` fails with `Failure getting installed package list` / `Failed to install packages`, **regardless of `--dgx-type`** | Check the head node's own `ls -la /dev/null` first (6m) before assuming a repo conflict (6e) — this exact on-screen failure has two known, unrelated root causes and doesn't distinguish them. If `/dev` is missing core nodes, that's a host-level incident, not fixable by changing `cm-create-image` flags. |
 | PXE node-installer fails fatally trying to write `interfaces.d/ifcfg-<iface>` or `ntpsec/ntp.conf` during first boot against a new image | Not a package or `ifupdown`/Netplan problem — the target directories (`/etc/network/interfaces.d/`, `/etc/ntpsec/`) don't exist in the image. Fix at the image level per 8.7, not on the node. Doesn't survive a fresh `-a` rebuild — check for it on every rack, not just the first. |
+| PXE node-installer halts with `Missing device. Node Installer will halt.` / `The error was: missing device assert` during "Fetching disks setup" | Not a disk-capacity problem — happens before partition sizes are even checked. Category `disksetup` likely unset. Fix per 8.10; add a pre-flight `get disksetup` check for every remaining rack. |
+
+### 8.13 Fix: `ntp` health check FAIL — `chrony` not installed on the image
+
+**Root cause, confirmed on `rack01node01`:** `dpkg -l | grep -i -E "^ii\s+(ntp|chrony)"` returns nothing — neither package is present on the image at all. `systemd-timesyncd` IS installed but ships `disabled` (matches the pattern already seen with `shorewall`/`shorewall6`/`auditd` being explicitly disabled during finalize — looks like the same class of intentional image hardening, just missing a replacement time-sync mechanism).
+
+**Also confirmed: setting the category's `timeservers` field does NOT wire up persistent time sync.** `journalctl -u systemd-timesyncd` showed zero entries after setting `timeservers 10.141.255.254` and a full reinstall — the field appears to only feed node-installer's one-shot provisioning-time sync (`ntpd -c /tmp/ntp.conf -q -g`, visible in the node-installer log), not any persistent post-boot service. Do not rely on this field alone for ongoing clock sync.
+
+**Health check specifically greps for `ntpd`/`chronyd` by process name** (`"ntpd or chronyd process is not running"`) — `systemd-timesyncd`, even if manually enabled, is very unlikely to satisfy this check. `chrony` is the correct target, not `timesyncd`.
+
+**Fix — same `cm-chroot-sw-img` pattern as 8.3, apply once to the reference image, not per-node:**
+
+```bash
+cm-chroot-sw-img /cm/images/<image-name>
+apt-get update && apt-get install -y chrony
+systemctl disable systemd-timesyncd
+systemctl mask systemd-timesyncd
+systemctl enable chrony
+```
+
+Then point chrony at the head node as the internal time source — edit `/etc/chrony/chrony.conf` inside the chroot, replacing the default `pool ntp.ubuntu.com` / `pool 2.ubuntu.pool.ntp.org` lines with:
+```
+server 10.141.255.254 iburst
+```
+(confirmed reachable from `rack01node01` — `ping 10.141.255.254` succeeds with ~0.6-1.7ms latency; also confirmed this node DOES have outbound internet reachability via `ping 8.8.8.8`, which was unexpected — worth deciding deliberately whether internal-only or a public pool as fallback is the intended design, rather than defaulting to whatever chrony ships with)
+
+```bash
+exit
+```
+
+Then run 8.4 (mount cleanup — mandatory), optionally 8.5, then 8.6 to commit.
+
+**Not yet validated end-to-end** — this is a drafted fix based on confirmed root-cause findings (missing package, `timeservers` field's actual scope, health check's exact wording), not yet applied to the image or re-tested via a fresh reinstall + `latesthealthdata`. **Before treating this as resolved:**
+1. Apply to `<image-name>` via the steps above.
+2. Reinstall `rack01node01` (`set installmode FULL` at the device level, as done for the disk-setup/finalize-script tests, then `ssh rack01node01 reboot`).
+3. Confirm: `dpkg -l | grep chrony`, `systemctl status chrony`, `chronyc sources` (should show `10.141.255.254` reachable/synced).
+4. Confirm the health check itself flips to PASS: `cmsh -c "device use rack01node01; latesthealthdata"`.
+5. Same archive-baking reminder as every other 8.x fix: apply once on the reference image before the next re-tar, not per-rack.
+
+**Still open, unrelated to this fix, surfaced by the same health-check run:**
+- `ldap` FAIL (`id: 'cmsupport': no such user`) — **confirmed** direct regression from the old 8.8 `nsswitch.conf` fix (now removed from the SOP — see 8.8 and "Still-open, non-blocking items" for full detail and candidate revised fixes). Not an open question anymore; a non-regressing replacement fix is what's still needed.
+- `gpu_health_overall` FAIL despite all four per-GPU sub-checks (`gpu0`-`gpu3`) showing PASS — cause not yet identified, worth pulling the detailed reason via cmsh rather than assuming it's transient.
+
