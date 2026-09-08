@@ -1556,6 +1556,8 @@ Should list all 23 package names above, nothing more, nothing missing.
    ```
    If `dkms status` still shows the correct, `carlonext`-validated version after the build, the strategy is confirmed working — the tarball's baked-in driver survived `cm-create-image`'s own apt activity untouched, exactly as `maxQ106` already demonstrates.
 
+**Operational note (2026-09-08): `cm-chroot-sw-img` exit does not reliably unmount everything.** After exiting a chroot session (`exit`/Ctrl-D), always check `mount | grep <image-name>` before running further `cm-create-image`/`cm-chroot-sw-img` operations — `dev`, `run`, `proc`, `sys`, `efivarfs`, and a per-session `/var/tmp/<random>` tmpfs scratch dir (created by apt) have all been observed still mounted after exit, more than once today. Unmount manually if found. The `/var/tmp/<random>` one can report "target is busy" if a leftover process still has it open (`fuser -vm <path>` to check); low-risk to leave if nothing obviously wrong is holding it — it doesn't affect the image's actual filesystem content, just head-node housekeeping.
+
 ## 26. Next Steps (not yet started)
 
 - [x] NVIDIA kernel build packages (gcc, dkms, make) — see §5
