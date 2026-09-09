@@ -47,6 +47,12 @@
 #     ./pxe_rack_provision.sh -pxe --rack 1
 #     ./pxe_rack_provision.sh -pxe --rack 1-8
 #
+#   Single node only, within a single rack (not valid with a rack range) -
+#   use for a pilot/test run on one node before committing a whole rack:
+#     ./pxe_rack_provision.sh --rack 1 --node 18
+#     ./pxe_rack_provision.sh -pxe --rack 1 --node 18
+#     ./pxe_rack_provision.sh -power cycle --rack 1 --node 18
+#
 #   Override node count only if a rack genuinely has a different number of
 #   nodes than the confirmed default of 18 (check `cmsh -c "device; list" |
 #   grep bmc-rackNN` first if unsure) - applies to every rack in range:
@@ -80,12 +86,13 @@ DEFAULT_NODE_COUNT=18     # confirmed via full device list: every rack
                           # (01-08) currently has exactly 18 nodes
 
 usage() {
-  echo "Usage: $0 [--dry-run] [-power on|off|cycle | -pxe] [-U <bmc_user>] [-P <bmc_pass>] [--delay <seconds>] --rack <N|N-M> [--nodes <node_count>]"
+  echo "Usage: $0 [--dry-run] [-power on|off|cycle | -pxe] [-U <bmc_user>] [-P <bmc_pass>] [--delay <seconds>] --rack <N|N-M> [--nodes <node_count>] [--node <N>]"
   echo "  Default (neither -power nor -pxe): full PXE workflow - bootdev pxe THEN power cycle."
   echo "  -power on|off|cycle: ONLY that power action, no bootdev change."
   echo "  -pxe: ONLY the bootdev pxe (EFI) call, no power action."
   echo "  -power and -pxe are mutually exclusive."
   echo "  --rack accepts a single number (1) or a range (1-8)."
+  echo "  --node <N>: target only node N within the rack given by --rack. Requires --rack to be a single rack (not a range)."
   echo "  --delay: seconds between nodes, default $DEFAULT_DELAY_SECONDS (no delay). Set >0 to stagger a large run."
   echo
   echo "  e.g.: $0 --rack 1                       (rack01 only, PXE workflow, real run)"
@@ -94,6 +101,7 @@ usage() {
   echo "        $0 -power off --rack 1            (rack01 only, power off only)"
   echo "        $0 -pxe --rack 1                  (rack01 only, bootdev pxe flag only, no power action)"
   echo "        $0 --rack 1 --nodes 12            (rack01, override to 12 nodes)"
+  echo "        $0 --rack 1 --node 18             (rack01node18 only, PXE workflow)"
   echo "        $0 -U root -P 'Pass123' --rack 1  (rack01, override BMC credentials)"
   exit 1
 }
@@ -103,6 +111,7 @@ POWER_ACTION=""   # "" = unset; else on|off|cycle
 PXE_ONLY=0
 RACK_ARG=""
 NODE_COUNT=""
+SINGLE_NODE=""
 DELAY_SECONDS="$DEFAULT_DELAY_SECONDS"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -130,6 +139,12 @@ while [[ $# -gt 0 ]]; do
     --nodes)
       [[ -z "${2:-}" ]] && { echo "ERROR: --nodes requires a value (e.g. --nodes 18)."; usage; }
       NODE_COUNT="$2"
+      shift 2
+      ;;
+    --node)
+      [[ -z "${2:-}" ]] && { echo "ERROR: --node requires a value (e.g. --node 18)."; usage; }
+      [[ ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --node must be a positive integer (got '$2')."; usage; }
+      SINGLE_NODE="$2"
       shift 2
       ;;
     --delay)
@@ -178,14 +193,27 @@ if ! [[ "$RACK_START" =~ ^[0-9]+$ && "$RACK_END" =~ ^[0-9]+$ ]] || [[ "$RACK_STA
   usage
 fi
 
+if [[ -n "$SINGLE_NODE" && "$RACK_START" -ne "$RACK_END" ]]; then
+  echo "ERROR: --node requires a single rack for --rack (got range '$RACK_ARG'). Specify one rack, e.g. --rack $RACK_START --node $SINGLE_NODE."
+  usage
+fi
+if [[ -n "$SINGLE_NODE" ]] && [[ "$SINGLE_NODE" -lt 1 || "$SINGLE_NODE" -gt "${NODE_COUNT:-$DEFAULT_NODE_COUNT}" ]]; then
+  echo "ERROR: --node $SINGLE_NODE is out of range for a rack of ${NODE_COUNT:-$DEFAULT_NODE_COUNT} nodes. Use --nodes to override the rack size if needed."
+  usage
+fi
+
 RACK_LABEL_START=$(printf "rack%02d" "$RACK_START")
 RACK_LABEL_END=$(printf "rack%02d" "$RACK_END")
-if [[ "$RACK_START" -eq "$RACK_END" ]]; then
+if [[ -n "$SINGLE_NODE" ]]; then
+  NODE_PADDED_LABEL=$(printf "%02d" "$SINGLE_NODE")
+  RANGE_LABEL="${RACK_LABEL_START}node${NODE_PADDED_LABEL}"
+elif [[ "$RACK_START" -eq "$RACK_END" ]]; then
   RANGE_LABEL="$RACK_LABEL_START"
 else
   RANGE_LABEL="${RACK_LABEL_START}-${RACK_LABEL_END}"
 fi
 NUM_RACKS=$((RACK_END - RACK_START + 1))
+TOTAL_NODES=$([[ -n "$SINGLE_NODE" ]] && echo 1 || echo $((NODE_COUNT * NUM_RACKS)))
 
 TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
 LOGFILE="pxe_${RANGE_LABEL}_${TIMESTAMP}.log"
@@ -201,10 +229,12 @@ else
   ACTION_VERB="PXE-boot-flag and POWER CYCLE"
 fi
 
-echo "Rack(s)     : $RANGE_LABEL ($NUM_RACKS rack$([[ $NUM_RACKS -gt 1 ]] && echo s))"
+echo "Rack(s)     : $RANGE_LABEL ($([[ -n "$SINGLE_NODE" ]] && echo "1 node" || echo "$NUM_RACKS rack$([[ $NUM_RACKS -gt 1 ]] && echo s)"))"
 echo "Mode        : $MODE_LABEL"
-echo "Node count  : $NODE_COUNT per rack$([[ "$NODE_COUNT" != "$DEFAULT_NODE_COUNT" ]] && echo " (overridden from default $DEFAULT_NODE_COUNT)")"
-echo "Total nodes : $((NODE_COUNT * NUM_RACKS))"
+if [[ -z "$SINGLE_NODE" ]]; then
+  echo "Node count  : $NODE_COUNT per rack$([[ "$NODE_COUNT" != "$DEFAULT_NODE_COUNT" ]] && echo " (overridden from default $DEFAULT_NODE_COUNT)")"
+fi
+echo "Total nodes : $TOTAL_NODES"
 echo "BMC user    : $BMC_USER"
 echo "Delay/node  : ${DELAY_SECONDS}s$([[ "$DELAY_SECONDS" != "$DEFAULT_DELAY_SECONDS" ]] && echo " (overridden from default ${DEFAULT_DELAY_SECONDS}s)")"
 echo "Dry run     : $([[ $DRY_RUN -eq 1 ]] && echo yes || echo no)"
@@ -212,7 +242,7 @@ echo "Log file    : $LOGFILE"
 echo
 
 if [[ $DRY_RUN -eq 0 ]]; then
-  echo "!!! This will $ACTION_VERB $((NODE_COUNT * NUM_RACKS)) node(s) across $RANGE_LABEL. !!!"
+  echo "!!! This will $ACTION_VERB $TOTAL_NODES node(s) across $RANGE_LABEL. !!!"
   read -rp "Type '$RANGE_LABEL' exactly to confirm and proceed: " CONFIRM
   if [[ "$CONFIRM" != "$RANGE_LABEL" ]]; then
     echo "Confirmation did not match. Aborting, nothing was sent."
@@ -229,7 +259,7 @@ for ((r=RACK_START; r<=RACK_END; r++)); do
   echo "Rack: $RACK_LABEL" | tee -a "$LOGFILE"
   echo "-------------------------------------------------------------------" | tee -a "$LOGFILE"
 
-  for ((i=1; i<=NODE_COUNT; i++)); do
+  for ((i=$([[ -n "$SINGLE_NODE" ]] && echo "$SINGLE_NODE" || echo 1); i<=$([[ -n "$SINGLE_NODE" ]] && echo "$SINGLE_NODE" || echo "$NODE_COUNT"); i++)); do
     NODE_PADDED=$(printf "%02d" "$i")
     HOSTNAME="bmc-${RACK_LABEL}node${NODE_PADDED}"
     BMC_IP="10.141.${r}.$((IP_OFFSET + i))"
