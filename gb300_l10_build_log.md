@@ -1,7 +1,7 @@
 # GB300 NVL L10 Reference Layout — Build Log
 
 **Reference:** NVIDIA 2.0 release, GB300 L10 reference layout — MNNVL Bring-Up Guide, Release 1.15
-**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.4.28
+**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.4.29
 
 ## 0. Host Software Components — Version Matrix (source of truth)
 

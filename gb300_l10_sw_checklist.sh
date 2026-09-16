@@ -569,9 +569,27 @@
 #                       tray's own FPGA (§0b's Switch Tray BMC+FPGA+EROT
 #                       bundle), not applicable to this un-racked compute
 #                       host regardless of naming similarity.
+#   0.4.29 2026-09-16  Added "Golden-Image / Pre-Capture Readiness" section
+#                       (build log §25 / SOP §12) - two checks that were
+#                       previously manual-only SOP steps, easy to forget
+#                       right before an image capture:
+#                       (1) "Config Dirs (interfaces.d/ntpsec)" - straight
+#                       PASS/FAIL presence check, some BCM-provisioning
+#                       pipelines fail hard without these existing.
+#                       (2) "Boot Device Addressing" - deliberately
+#                       INFORMATIONAL, not PASS/FAIL, unlike everything
+#                       else added to this section. UUID-based addressing
+#                       is completely normal during ordinary bring-up and
+#                       only becomes a decision point right before image
+#                       capture (and only then if the by-path fix's
+#                       hardware-uniformity assumption actually holds) -
+#                       this script has no way to know "are we about to
+#                       capture right now" vs "mid bring-up", so it reports
+#                       current state only rather than asserting a target
+#                       that would false-flag every normal build.
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.28"
+SCRIPT_VERSION="0.4.29"
 
 set -uo pipefail
 
@@ -1109,6 +1127,50 @@ if [[ -z "$swap_active" ]]; then
 else
   swap_summary=$(echo "$swap_active" | awk '{print $1, $3}' | tr '\n' ';' | sed 's/;$//')
   ROWS+=("Unused Swap File|active: ${swap_summary} - confirm intentional, not part of BCM category disk-setup (§22a)|CHECK")
+fi
+
+# ----------------------------------------------------------------------------
+# Golden-Image / Pre-Capture Readiness - added 2026-09-16 (build log §25 /
+# SOP §12). Both checks below were previously manual-only SOP steps someone
+# had to remember to run right before an image capture - wiring them into
+# the checklist means a stale/incomplete pre-capture state shows up on a
+# routine run instead of only being caught (or missed) by hand.
+# ----------------------------------------------------------------------------
+section "Golden-Image / Pre-Capture Readiness"
+
+# Config directory presence - straightforward PASS/FAIL, no ambiguity: some
+# BCM-provisioning pipelines fail hard if these don't exist for their
+# node-installer to write generated config into (build log §25). Static
+# directories, not per-node identity state, so there's no "correct answer
+# depends on when you run this" complication the way the boot-addressing
+# check below has - missing is missing, at any bring-up stage.
+missing_dirs=()
+[[ -d /etc/network/interfaces.d ]] || missing_dirs+=("/etc/network/interfaces.d")
+[[ -d /etc/ntpsec ]] || missing_dirs+=("/etc/ntpsec")
+if [[ ${#missing_dirs[@]} -eq 0 ]]; then
+  ROWS+=("Config Dirs (interfaces.d/ntpsec)|both present|OK")
+else
+  ROWS+=("Config Dirs (interfaces.d/ntpsec)|missing: ${missing_dirs[*]} - mkdir -p before image capture (§25/SOP §12)|CHECK")
+fi
+
+# Boot device addressing (UUID vs by-path) - deliberately INFORMATIONAL, not
+# PASS/FAIL, unlike everything else in this section. Unlike the config-dir
+# check above, "correct" here depends entirely on WHEN this script runs, not
+# just on the current state: UUID-based addressing is completely normal and
+# correct during ordinary bring-up (SOP §1-§11) - only becomes a deliberate
+# decision point right before image capture (SOP §12/build log §25), and
+# only applies at all if this build's specific hardware-uniformity
+# assumption holds (fixed NVMe slot, identical fleet hardware - see SOP §12
+# step 0). This script has no way to know "are we about to capture an image
+# right now" vs "mid bring-up", so asserting a hard target here would
+# produce false CHECKs on every normal build before that decision point.
+# Reports current state only; a human applies the SOP §12 judgment call.
+if grep -q 'root=/dev/disk/by-path' /boot/grub/grub.cfg 2>/dev/null; then
+  ROWS+=("Boot Device Addressing|by-path (converted) - confirm this matches an intentional decision, not an accident|OK")
+elif grep -qE 'UUID=|/dev/disk/by-uuid' /etc/fstab 2>/dev/null; then
+  ROWS+=("Boot Device Addressing|UUID (not converted) - normal during bring-up; decide by-path vs UUID before image capture, see SOP §12 step 0|OK")
+else
+  ROWS+=("Boot Device Addressing|neither UUID nor by-path detected in fstab/grub.cfg - inspect manually|CHECK")
 fi
 
 # ----------------------------------------------------------------------------
