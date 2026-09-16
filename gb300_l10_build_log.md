@@ -1,7 +1,7 @@
 # GB300 NVL L10 Reference Layout — Build Log
 
 **Reference:** NVIDIA 2.0 release, GB300 L10 reference layout — MNNVL Bring-Up Guide, Release 1.15
-**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.4.20
+**Checklist script version:** `gb300_l10_sw_checklist.sh` v0.4.28
 
 ## 0. Host Software Components — Version Matrix (source of truth)
 
@@ -11,13 +11,14 @@ Pinned versions per NVIDIA 2.0 release matrix. Confirmed `DOCA_Host` here (3.4.1
 
 | Component | Version |
 |---|---|
-| Kernel Module Source (NVIDIA driver) | `NVIDIA-kernel-module-source-580.173.02.tar.xz` |
+| Kernel Module Source (NVIDIA driver) | `NVIDIA-kernel-module-source-580.173.10.tar.xz` (was `580.173.02` under RC4 — see §0a) |
+| IMEX | `580.173.10` (tracks driver — installed from the same `.run` bundle, see §7) |
 | CUDA Toolkit | `13.0.2` |
 | MFT Tools | `4.36.0-147` |
 | WinOF-2 | `26.4.27095` |
 | DOCA_Host | `3.4.1-010000` |
-| Fabric Manager (GFM) | `580.173.04` |
-| NMX-M | `20v85.1.1100_85.1.1100.pdf` |
+| Fabric Manager (`nvidia-fabricmanager`, host package) | tracks Datacenter Driver (`580.173.10`) — sourced from the `nvidia-driver-local-repo` package, not an independent release train (corrected §0a) |
+| NMX-M | `85.1.1100` (was recorded as `20v85.1.1100_85.1.1100.pdf` under RC4 — see §0a) |
 | BF3 (firmware) | `32.49.1118` |
 
 *Note: WinOF-2 is the Windows NIC driver and not applicable to this Ubuntu 24.04 L10 layout — listed here for completeness against the source matrix only.*
@@ -37,6 +38,106 @@ Master download manifest — every remaining stack component maps to one of thes
 | 1160245 | GB300 NVL72 MAXQ Software and Firmware Source of Truth Metadata File, 2.0.0RC4 |
 
 **Confirmed:** ConnectX-8 firmware `.bin` sourced via NVOnline ID **1159833**, not the DOCA-Host package (DOCA-Host installs the MFT *tooling*; the firmware image itself comes separately from this ID). Same likely applies to BlueField-3 firmware under the same ID.
+
+## 0a. 2.0.0GA Reconciliation — 2026-09-14
+
+**NVIDIA has published the official GA release notes** (`RN-11874-001_2.0.0GA`, "NVIDIA GB300_Max-Q_NVL72_P4059_CX8_Release_2.0.0GA Release Notes"). This is now the authoritative source and supersedes NVOnline **1160245**'s RC4 metadata file (`GB300 NVL72 MAXQ Software and Firmware Source of Truth Metadata File, 2.0.0RC4`), which everything through §16 above was pinned against. Diffing the two:
+
+| Component | RC4 (superseded) | 2.0.0GA (current) | Change |
+|---|---|---|---|
+| GPU Driver / Kernel Module Source | `580.173.02` | `580.173.10` | **Changed** |
+| IMEX | `580.173.02` | `580.173.10` | **Changed** (tracks driver) |
+| CUDA Toolkit | `13.0.2` | `13.0.2` | No change |
+| MFT Tools | `4.36.0-147` | `4.36.0-147` | No change |
+| WinOF-2 | `26.4.27095` | `26.4.27095` | No change |
+| DOCA_Host | `3.4.1-010000` | `3.4.1-010000` | No change |
+| BF3 firmware | `32.49.1118` | `32.49.1118` | No change |
+| CX8 firmware | `40.49.1118` | `40.49.1118` | No change (confirmed against the GA notes' "CX8 N/S" section) |
+| NMX-M | `20v85.1.1100_85.1.1100.pdf` | `85.1.1100` | Corrected — the RC4-era value was a bundle/filename artifact, not a clean version string |
+
+**Fabric Manager — correction, not just a version bump.** RC4 metadata's `GFM: 580.173.04` (§16, Finding 2) was carried into §0 as if it were this host's Fabric Manager target. It isn't, and the earlier correction was wrong on the merits, not just stale: `nvidia-fabricmanager` (the host-side package, §25) is sourced from `nvidia-driver-local-repo-ubuntu2404-<driver-version>` and versioned `<driver-version>-1ubuntu1` — i.e., it **tracks the Datacenter Driver branch**, not an independent number. §16's Finding 2 is superseded. Whatever `GFM: 580.173.04` in the RC4 file actually referred to (most likely the NVSwitch tray's own NVOS-side Fabric Manager, a functionally separate thing from this compute-host package — see §25/note_na rows) is not confirmed against GA and should not be assumed equal to either the old `580.173.04` value or the new driver version without checking NVOS directly.
+
+**New in GA — out-of-band firmware baseline not previously tracked at all** (BMC, MCU, HMC pages of the GA notes):
+
+| Section | Component | GA Version |
+|---|---|---|
+| BMC bundle | BMC core | `GB200Nvl-26.07-1` |
+| BMC bundle | EROT | `01.04.0055.0000_n04` |
+| MCU | SMA Firmware | `0003.00.0278.0000` |
+| HMC | CPLD | `0.22` |
+| HMC | GPU (= VBIOS — see correction below) | `97.10.7D.00.16` |
+| HMC | EROT | `01.04.0055.0000_n04` |
+
+**Correction (2026-09-14):** the HMC table's "GPU" row is not a separate out-of-band Redfish-queryable firmware component — it's **VBIOS**, in NVIDIA's raw-hex notation, the same field `nvidia-smi` already reports. This reopens an unresolved thread from **§16** (RC4 era): that section logged VBIOS as `97.10.7D.00.0D` from the RC4 metadata and noted it "doesn't obviously match the already-confirmed-installed `97.10.59.00.13`," but treated the difference as possibly just notation and left it as an awareness-only note with no comparison target ever wired up. GA's value (`97.10.7D.00.16`) shares the **exact same `7D` segment** as the RC4 value — only the last segment moved (`0D` → `16`, a plausible RC4→GA build increment). Two independent NVIDIA-sourced metadata snapshots, weeks apart, agreeing with each other on `7D` while this host's actual installed VBIOS (`97.10.59.00.13`, unchanged throughout the entire build, correctly so since VBIOS isn't touched by driver installs) disagrees with both, is meaningfully stronger evidence of a **real VBIOS mismatch** than §16's original framing allowed for. Checklist v0.4.25 now wires `EXPECTED_VBIOS="97.10.7D.00.16"` into the existing "VBIOS Version" check, which previously had no comparison target at all. **Not yet investigated further** — whether this needs an actual VBIOS flash (a separate procedure from anything done in §7g/§10a, typically via `nvflash` and requiring its own caution around board-specific images) or is explained by something not yet considered is open.
+
+The checklist script's §6b (Out-of-Band Firmware / Redfish) already reads BMC/EROT/CPLD/SMA live from the BMC's `FirmwareInventory` rather than needing per-component `EXPECTED_*` pins for those; VBIOS is checked separately via `nvidia-smi`, not through this Redfish path.
+
+**Action item — not yet applied to any built system.** `carlonext` (§7), the `maxQ20rc4-1029-doca341-baseos.tgz` tarball (§25a/§25b), and the provisioned `rack08` (§25c) are all still on the RC4-era `580.173.02` driver — that's accurate history, not something to rewrite retroactively. They are now behind the GA-pinned target and need a driver/IMEX bump to `580.173.10` plus a re-validation pass (health checks, `dcgmi diag`, partner diag) before being considered GA-compliant. Tracked in §26.
+
+## 0b. Full GA Release Notes PDF Reviewed — 2026-09-14
+
+Everything up to this point in §0a was reconstructed from individual release-notes page images. The full PDF (`RN-11874-001_2.0.0GA_P4059_MAXQ__15.pdf`) surfaced several things those page crops didn't show — some resolve open threads from earlier in this session, some are new findings.
+
+**⚠️ Critical, rack-wide, not yet actioned anywhere:** *"In release 2.0.0GA NVLink Recovery remains enabled by default. To ensure proper functionality and system stability, you must upgrade **all** components in the rack to release 1.0.5 or later, including compute nodes and NVSwitch. Failure to upgrade the entire rack may lead to incompatibility issues and unexpected behavior during NVLink Recovery operations."* This isn't scoped to `carlonext` alone — it applies to every compute node **and every NVSwitch tray** in a rack. `rack08` (§25c, provisioned 2026-09-08 from `baseos-1029-doca341`) has not been checked against this requirement. Needs verification before `rack08` is considered anything more than a health-check pass — NVLink Recovery incompatibility across a partially-upgraded rack is exactly the kind of failure mode that wouldn't necessarily show up in the `[UP]`/health-check spot-checks already done.
+
+**NVOnline IDs changed for GA — §0's ID reference table is now stale.** Table 1 in the full PDF shows GA reissued three IDs that RC4-era metadata used different numbers for:
+
+| Component | RC4 ID (used throughout §0-§16) | GA ID |
+|---|---|---|
+| Compute Tray Firmware | `1160211` | **`1162802`** |
+| GPU Drivers (GB200/GB300 NVL72) | `1160161` | **`1162850`** |
+| Source of Truth Metadata File | `1160245` | **`1162808`** |
+
+`1162808` is the direct GA-era replacement for the exact metadata file (`1160245`) this whole build's version matrix was originally reconciled against in §16. Not yet re-pulled or diffed against what's already documented in §0/§0a — worth doing if a fully authoritative single-source check is ever needed, though the page-by-page GA release notes review already covers the same ground for the values actually in use on this host. Switch Tray Firmware (`1159830`), NVOS (`1159832`), and CX8/BF3 Firmware (`1159833`) remain on their RC4-era IDs even in the GA document — not reissued for GA, presumably unchanged content.
+
+**GFM's actual target confirmed — resolves the open hedge from §0a/checklist v0.4.24.** The full PDF's "GB300 Switch Tray > NVOS" table gives:
+```
+NVOS Version: 25.02.4463
+  SM:          2025.10.18
+  NMX-C:       4.21.156
+  GFM:         580.173.04
+  NMX-T:       4.20.9
+  Switch ASIC: 35_2014_5118
+```
+This directly confirms what §0a could only hedge on: `580.173.04` **is** a real, correct target — for the NVSwitch-tray-side Global Fabric Manager specifically, on its own independent release train tied to NVOS (`25.02.4463`), **not** tied to the compute-host driver version at all. It is a genuinely different thing from `carlonext`'s own inert `nvidia-fabricmanager` package (which does track the driver, now `580.173.10`, per §7g). Both numbers are real and both are now documented; checklist v0.4.27 adds `EXPECTED_GFM_NVOS="580.173.04"` alongside the existing `EXPECTED_FM`, and corrects the "Fabric Manager Version" N/A row's message, which was incorrectly still saying "not confirmed against GA."
+
+**HMC baseline was incomplete — two components missing from §0a's table.** The full PDF's HMC section lists two rows the earlier page crop didn't include:
+| Component | Version |
+|---|---|
+| SBIOS | `02.06.06` |
+| FPGA | `1.66` |
+Added to the running baseline for completeness. Neither has a corresponding checklist check yet — not yet wired up, tracked in §26.
+
+**Entirely new baseline: GB300 Switch Tray firmware.** Not applicable to `carlonext` today (single un-racked L10 compute tray, no switch tray present), but now documented for whenever this unit or any other joins a rack:
+
+| Section | Component | Version |
+|---|---|---|
+| NVOS | (see GFM block above) | `25.02.4463` |
+| Switch BMC+FPGA+EROT bundle | EROT | `01.04.0055.0000_n04` (same EROT version as the compute-tray HMC/BMC — consistent across the whole rack) |
+| Switch BMC+FPGA+EROT bundle | BMC | `88.0002.1984` (switch tray's own BMC — different numbering scheme entirely from the compute-tray HMC's `GB200Nvl-26.07-1`, different board) |
+| Switch BMC+FPGA+EROT bundle | FPGA | `0.24` |
+| Switch SBIOS+EROT bundle | EROT | `01.04.0055.0000_n04` |
+| Switch SBIOS+EROT bundle | SBIOS | `0ACTV_01.01.030` |
+| Switch CPLD bundle | CPLD1/2/3 | `CPLD000420_REV0300` / `CPLD000419_REV0500` / `CPLD000418_REV0300` |
+| Switch CPLD bundle | FUI | `FUI000493` |
+
+**Resolves the `flint`/`mstflint` tooling mystery from §10a.** §10a flagged finding two apparently-different MFT tool generations installed side by side (`flint` worked with plain PCI addresses, `mstflint`/`mstfwreset` didn't) as a minor, un-investigated finding. The full PDF's Table 9 explains it: **`MFT Tools` (`4.36.0-147`, Host Software Components table) and `MSTflint` (`v4.36.0-1`, Table 9) are two separate, distinctly-versioned components in NVIDIA's own release** — not a drift or accidental double-install on this host. Not a bug; closed.
+
+**DCGM target now known.** Table 9: `DCGM 4.6.0` (NVOnline `1139880`). The checklist's `EXPECTED_DCGM` had been `"3.3"` since v0.1.0 — an unsourced placeholder, never actually verified against anything. Corrected to `4.6.0` in checklist v0.4.27. Relevant once the still-`MISSING` "DCGM Version"/`dcgmi diag` install step (§26) is finally reached.
+
+**Kernel branch context for the currently-held `apt list --upgradable` decision (§7g).** Improvement #32 in the GA notes fixes a real PCIe/SMMU issue and states it's *"fixed in the `7.0.0-1015-nvidia-64k` kernel and later"* — the same `7.0.0` branch that showed up in §7g's `apt list --upgradable` review as a held, not-yet-taken major kernel jump (`6.17.0-1032.32` → `7.0.0-1019.19~24.04.2`). This isn't proof the jump is required right now (the specific PCIe surprise-link-down scenario the fix addresses hasn't been observed on this unit), but it confirms `7.0.0` is a real, intentional target with actual fixes behind it — not an arbitrary Ubuntu HWE bump to be reflexively ignored. Worth factoring in whenever the kernel-hold decision is revisited.
+
+**Confirmed compatible, no action needed:** current kernel `6.17.0-1032-nvidia-64k` satisfies the documented minimum (`6.17.0-1014-nvidia-64k or later`, Table 11). Improvement #27's `6.17.0-1015-nvidia-64k` fix (NVLOOM/partition GPU-removal crash) is also covered, since `1032 > 1015`.
+
+**Noted for awareness, not yet relevant to this L10 host:** Known Issue #9 (FPGA may permanently assert power brake after a secondary-module OVERT fault, workaround: AC power cycle) and #10 (BMC ERoT serial number occasionally fails to populate in Redfish, <0.5%, workaround: graceful BMC restart) — both plausible future troubleshooting context given this unit's BMC/EROT work in §0a/§10a, not observed here yet.
+
+**Follow-up, same session — a real drift found, and a real bug fixed.** Running checklist v0.4.27 surfaced `HGX_FW_FPGA_0/1: 1.60` with no comparison target (this HMC field wasn't wired up yet) and `FW_E1S_CPLD_0/1: 0b.04.02 (expected 0.22)` showing `CHECK`. Neither was right as-is:
+- **FPGA drift is real.** `1.60` vs GA's HMC target `1.66` (this section's table above) — same shape as the already-known BMC/EROT staleness, not previously checked. Confirmed the correct target is the HMC's own FPGA field, *not* the physically separate NVSwitch-tray FPGA (`0.24`, this section's Switch Tray table) — this host has no switch tray, so that number was never applicable regardless of the naming coincidence.
+- **The E1S CPLD comparison was an actual bug, not a missed check.** v0.4.24's case-match used a bare `*CPLD*` substring pattern, which caught `FW_E1S_CPLD_0/1` (the E1S NVMe drive-carrier board's own, unrelated CPLD) and compared it against the HGX baseboard CPLD's `0.22` target — two different components being measured against each other's spec, producing a false mismatch rather than a real finding.
+
+Fixed in checklist v0.4.28: every Redfish component pattern (EROT/CPLD/FPGA/SMA/BMC) now anchors to the confirmed `HGX_FW_` prefix instead of loose substring matching, and `EXPECTED_HGX_FPGA_FW="1.66"` was added. `FW_E1S_CPLD_0/1` is now correctly excluded — no GA target exists for that component and none should be applied to it.
+
+*Status: informational review complete. Three checklist corrections applied across v0.4.27-v0.4.28 (DCGM, GFM, FPGA/E1S-CPLD). NVLink Recovery rack-wide upgrade requirement flagged as the most operationally urgent item — not yet verified against `rack08`. Tracked in §26.*
 
 ---
 **Status:** In progress — installation not yet complete
@@ -579,6 +680,146 @@ Device node present with correct major/minor — the modprobe config wasn't just
 
 *Status: complete. §3.3.3.6 (Configure NVIDIA Packages, 6.1–6.8) fully done.*
 
+## 7f. `nvidia-persistenced` Found Disabled — 2026-09-14
+
+**Regression against §7e.** §7e confirmed `nvidia-persistenced` as `active` + surviving a reboot back on 2026-08-07. Found today, unprompted (not during a specific reinstall step logged elsewhere in this document), in a completely different state:
+
+```
+root@carlonext:~# systemctl status nvidia-persistenced.service
+○ nvidia-persistenced.service - NVIDIA Persistence Daemon
+     Loaded: loaded (/etc/systemd/system/nvidia-persistenced.service; disabled; preset: enabled)
+     Active: inactive (dead)
+```
+
+Same unit file, same path as §7b's manually-authored one — not overwritten by a package-shipped unit. `preset: enabled` but actual state `disabled` means something explicitly removed the `multi-user.target.wants` symlink (or otherwise disabled it) sometime between 2026-08-07 and today; **not yet root-caused**. Candidates not yet checked: whether this correlates with any of the driver/DKMS work in §16a/§25, the BIOS/BMC update reboot in §20, or something outside this log entirely. Whether this happened as a side effect of driver-reinstall activity toward the pending `580.173.10` GA bump (§0a/§26) is also unconfirmed — asked, not answered as of this writing.
+
+**Fix applied:**
+
+```bash
+sudo systemctl enable --now nvidia-persistenced.service
+```
+
+Result: `enabled` + `active (running)`, all 4 GPUs re-registered and persistence-enabled cleanly per journal (`0009:06:00.0`, `0018:06:00.0`, `0019:06:00.0`, plus the 4th).
+
+**Open item:** root cause not established. Recurrence risk is real and unquantified — if whatever disabled it once (reboot, package action, manual command) happens again, especially during the still-pending `580.173.10` driver bump, it could regress silently, since the existing checklist only checks `nvidia-smi`'s runtime `persistence_mode` field (§0/checklist "Persistence Mode" row), not systemd enablement — see checklist v0.4.22 for the added `is-enabled` check this finding prompted. Re-verify this survives the *next* reboot (especially the one following the driver bump) before considering it closed.
+
+*Status: fixed, not closed — root cause open, recurrence unconfirmed either way.*
+
+## 7g. GA Driver Bump — `580.173.02` → `580.173.10` (2026-09-14)
+
+**Executes the action item from §0a.** Full sequence, in order, on `carlonext`.
+
+**Step 1 — uninstall old driver:**
+```bash
+sudo sh ./NVIDIA-Linux-aarch64-580.173.02.run --uninstall
+```
+Verified thorough before proceeding: `dkms status` showed `nvidia/580.173.02` fully deregistered (all other DKMS modules — `mlnx-ofed-kernel`, `iser`/`isert`/`srp`, `kernel-mft-dkms`, `xpmem` — untouched, all still against `6.17.0-1032-nvidia-64k`); `nvidia-smi` binary gone; no orphaned `/usr/src/nvidia-*` source tree. `nvidia_cspmu`/`arm_cspmu_module` remained loaded post-uninstall — checked and confirmed **unrelated**: `modinfo` shows `intree: Y`, `dpkg -S` traces it to `linux-modules-6.17.0-1032-nvidia-64k` (an in-tree ARM CoreSight PMU module, not shipped by the GPU driver package at all). Correctly left alone.
+
+One side effect caught, not assumed: `nvidia-persistenced` went into a restart-failure loop (`status=203/EXEC`, "Start request repeated too quickly") once its binary disappeared — the hand-authored unit from §7b stayed `enabled` and kept retrying. Silenced with `sudo systemctl stop nvidia-persistenced` until the new binary was back. Second time this session `nvidia-persistenced` has needed a manual save (see §7f) — different trigger, same daemon.
+
+**Step 2 — old `nvidia-fabricmanager`/`nvidia-imex` removed first (separately, before this step's install — see below for why that mattered).**
+
+**Real finding, not just cleanup: `nvidia-imex` was `dpkg`-tracked (`580.173.02-1ubuntu1`) on `carlonext`, contradicting §7's documented `.run`-based install.** `dkms status`/`dpkg -l` pre-removal both confirmed this live. §25 already documented that `nvidia-driver-580-open`/`nvidia-open-580` pull bare `nvidia-imex` in as a dependency when installed from the local-repo package, which stayed installed and pinned from §25 through §22a — a plausible mechanism. **Checked directly and ruled out for this specific file:** `grep -iE 'apt|nvidia-driver|nvidia-open|cuda-drivers|state:.*latest|upgrade' CX8_BF3_config.yml` (the Ansible config present in `~pega`) returned zero matches — this file has nothing to do with it. The dependency-pull mechanism §25 documented remains a real, general risk of leaving that repo installed, but the specific trigger for *this* occurrence is genuinely unknown, not "probably this file." Root cause remains open.
+
+Removal (both were plain `dpkg` packages by this point, no holds, dry-run confirmed no dependency casualties):
+```bash
+sudo apt purge --dry-run nvidia-fabricmanager nvidia-imex   # confirmed: only these 2 packages
+sudo systemctl unmask nvidia-fabricmanager
+sudo apt purge -y nvidia-fabricmanager
+sudo systemctl disable --now nvidia-imex
+sudo apt purge -y nvidia-imex
+```
+Two directories dpkg left behind (same conservative-non-empty-dir behavior as §22b): `/usr/share/nvidia` (from `nvidia-fabricmanager`) and `/etc/nvidia-imex` (from `nvidia-imex` — likely still holding the `config.cfg` staged in §7; contents not reviewed before this session ended, flagged for a `cat` check before deleting rather than assumed disposable).
+
+**Step 3 — install new driver:**
+```bash
+sudo sh ./NVIDIA-Linux-aarch64-580.173.10.run --dkms -q -s -m=kernel-open
+```
+Clean install. `nvidia-smi` confirms `580.173.10` exactly, CUDA `13.0`, all 4 GPUs visible (`00000008/9/18/19:06:00.0`), 0 MiB used, no running processes. `dkms status` shows `nvidia/580.173.10` correctly registered against `6.17.0-1032-nvidia-64k`, every other module undisturbed. The install-time `libglvnd EGL vendor library` warning is benign — headless server, no display stack, same category of noise as the X11-stack side effect already documented in §25.
+
+**Step 4 — IMEX reinstalled via its dedicated `.run`, deliberately NOT via the local-repo `.deb` this time** — restores §7's original method rather than repeating whatever produced the `dpkg`-tracked state found above:
+```bash
+sudo sh ./nvidia-imex-aarch64-580.173.10-internal.run
+sudo systemctl enable --now nvidia-imex
+```
+Clean install ("IMEX installation completed"), enabled. **Note the `-internal` suffix on this filename** — absent from the `580.173.02` `.run` used in §7. Not yet confirmed whether this is simply how this GA build happens to be named on NVOnline or signals a distribution-channel distinction worth being aware of; flagged, not resolved.
+
+**Step 5 — persistence daemon restored:**
+```bash
+sudo systemctl enable --now nvidia-persistenced
+```
+`active (running)`, all 4 GPUs re-registered, `persistence_mode: Enabled` across the board confirmed via `nvidia-smi`.
+
+**Step 6 — Fabric Manager reinstalled from the `580.173.10` local-repo `.deb`, masked, held (same pattern as §25):**
+```bash
+sudo dpkg -i nvidia-driver-local-repo-ubuntu2404-580.173.10_1.0-1_arm64.deb
+sudo cp /var/nvidia-driver-local-repo-ubuntu2404-580.173.10/nvidia-driver-local-180A0A68-keyring.gpg /usr/share/keyrings/
+sudo apt update
+sudo dpkg -i /var/nvidia-driver-local-repo-ubuntu2404-580.173.10/nvidia-fabricmanager_580.173.10-1ubuntu1_arm64.deb
+sudo systemctl mask nvidia-fabricmanager
+sudo apt-mark hold nvidia-fabricmanager
+```
+Same benign `Could not execute systemctl ... deb-systemd-invoke` postinst warning §25 already root-caused (real hardware, not chroot — cosmetic). Correctly masked (`→ /dev/null`) and held.
+
+**Step 7 — repo removed deliberately, promptly, this time — not left installed for weeks like the `580.173.02` copy was:**
+```bash
+sudo apt purge -y nvidia-driver-local-repo-ubuntu2404-580.173.10
+```
+600 MB freed. Live for only the few minutes needed to extract the FM `.deb`, directly motivated by Step 2's finding — an unpinned local-repo source sitting around indefinitely is exactly the mechanism suspected of having converted `nvidia-imex` to `dpkg`-tracked the first time. The downloaded `.deb` itself (`~596M`, separate from the `/var` repo tree the `dpkg -i` unpacked it into) was also deleted from `~pega` afterward — already consumed, no longer needed.
+
+**Step 8 — `apt list --upgradable` reviewed before considering this closed, per §26's standing item.** Found `libnvidia-nscq` unheld, showing an available "upgrade" to `615.71.09-2ubuntu1` — not a point release, a different major driver branch entirely. `nvidia-fabricmanager` and `nvidia-modprobe` show the identical `615.x` target, but both were already protected (FM just held in Step 6; `nvidia-modprobe` was already on the hold list from earlier in the build) — `libnvidia-nscq` was the one gap in an otherwise-working defense. Fixed:
+```bash
+sudo apt-mark hold libnvidia-nscq
+```
+Also surfaced, not yet acted on:
+- `nvidia-modprobe` remains held at `580.173.02` — didn't drift to `615.x` (good), but is now one point-version behind the rest of the freshly-bumped stack. Needs a deliberate unhold → upgrade to `580.173.10-1ubuntu1` → re-hold cycle.
+- `cuda-toolkit-13-0` and its family show `13.0.2-1` → `13.0.3-1` available — a genuine in-branch point release, unlike the others. §0's GA-pinned target is `13.0.2` specifically. **Decision not yet made:** stay pinned at `13.0.2`, or take `13.0.3`.
+- The kernel HWE trio (`linux-headers/image/nvidia-64k-hwe-24.04`) shows a major-version jump (`6.17.0-1032.32` → `7.0.0-1019.19~24.04.2`) — already correctly held, cited here as a concrete real-world instance of exactly the risk §26's "review before ever running `apt upgrade`" item was written to prevent.
+
+**Final verified state:** driver `580.173.10`, IMEX `580.173.10` (via `.run`, method restored), persistenced `enabled`+`active`, Fabric Manager `580.173.10` (masked, held), `libnvidia-nscq` now held, local-repo removed. CUDA toolkit untouched at `13.0.2` throughout (independent of the driver swap, as expected).
+
+**Open items carried forward, not resolved this session:**
+- ~~`CX8_BF3_config.yml` grep~~ — done, ruled out (see correction above). `nvidia-imex`'s conversion to `dpkg`-tracked remains genuinely unexplained.
+- `/usr/share/nvidia` and `/etc/nvidia-imex` leftover directories — reviewed (2026-09-14): both are current, from this session's `580.173.10` reinstall (timestamps confirm), not stale cruft from the old install. `config.cfg` is the untouched factory default. No action needed, closed.
+- ~~`nvidia-modprobe` version-alignment~~ — done: unheld, upgraded to `580.173.10-1ubuntu1` (confirmed via `nvidia-modprobe --version`), re-held.
+- ~~`cuda-toolkit-13-0` → `13.0.3` decision~~ — **decided: stay pinned at `13.0.2`.** `13.0.3` is not part of the GA-qualified pairing at all — it comes from NVIDIA's general public CUDA apt repo (`developer.download.nvidia.com/.../ubuntu2404/sbsa`), which rolls forward independently of this specific GB300 MaxQ release train. GA's release notes specify `13.0.2` as the validated pairing with this driver/firmware stack; newer isn't the same as qualified-for-this-stack. `apt-mark hold cuda-toolkit-13-0` applied.
+- IMEX `.run` filename's `-internal` suffix — still unexplained; not diagnosable from this session, would need an NVOnline/NVIDIA support-channel answer.
+- §7f's `nvidia-persistenced` disablement root cause — still open; this session's uninstall/reinstall cycle is a plausible-but-unconfirmed trigger for *a* disablement, but doesn't explain the original 2026-08-07→2026-09-14 gap that predated any of this session's work.
+- Also newly surfaced this session, see §10a: CX8/BF3 firmware found reverted to pre-§10 baseline, re-flashed and verified, root cause of the revert itself still unconfirmed (leading theory: process-level, possibly tarball/BCM-related, not a hardware rollback — SEL/dmesg came back clean).
+
+*Status: driver bump complete and verified. Most threads closed this session; two genuinely unexplained items remain (see above) rather than papered over.*
+
+## 7h. `nvidia-persistenced` Found Stopped Again — Partner Diag, Not a Regression — 2026-09-15/16
+
+**Found, ahead of re-tarring the reference layout:** `nvidia-smi` showed `Persistence-M: Off` on all 4 GPUs. Unlike §7f's original mystery, this one has a clear, plausible cause and a clean shutdown signature — not treated as a repeat of the same unexplained regression.
+
+```
+Active: inactive (dead) since Mon 2026-09-14 11:29:06 UTC; 1 day 14h ago
+Loaded: loaded (...; enabled; preset: enabled)
+```
+`enabled` confirms the systemd enablement itself was never touched — this is a *stop*, not a disable, and the journal shows a graceful one: `Received signal 15` → clean stop sequence → `Deactivated successfully`, both the daemon and its `ExecStopPost` cleanup exiting `status=0/SUCCESS`. That's the signature of something intentionally running `systemctl stop nvidia-persistenced`, not a crash. Timing lines up with partner diagnostics run the same day — GPU diag suites commonly stop this daemon first to get unmediated device access. Not confirmed against actual partner-diag logs/scripts, but plausible and distinct from §7f's original disablement (different mechanism — stopped vs. disabled — so not assumed to be the same root cause, or to retroactively explain it).
+
+Fixed immediately (`systemctl start nvidia-persistenced`) — confirmed `active (running)`, all 4 GPUs re-registered, persistence re-enabled.
+
+**Then: does this survive an actual reboot, not just a manual start?** Given how much of this session turned "should work per the config" into "didn't, actually" (§7f, §10a's firmware revert), this was tested directly rather than assumed from the unit file (`WantedBy=multi-user.target`, `Restart=always`, §7b):
+
+```bash
+sudo reboot
+# post-reboot:
+systemctl status nvidia-persistenced --no-pager
+nvidia-smi --query-gpu=index,persistence_mode --format=csv,noheader
+```
+
+**Result — clean, first-attempt success, no restart-loop:**
+```
+Active: active (running) since Wed 2026-09-16 02:01:09 UTC; 2min 51s ago
+```
+Single clean start sequence in the journal (all 3 remaining GPUs registered/persistence-enabled in order, `Local RPC services initialized`, `Started nvidia-persistenced.service`) — no failed early attempts, no evidence of racing the NVIDIA kernel module despite the unit having no explicit `After=`/`Requires=` tying it to driver readiness. `nvidia-smi --query-gpu=index,persistence_mode`: all 4 GPUs `Enabled`, zero manual steps required.
+
+**This genuinely closes out the "will a provisioned node boot with persistence on" question** — not just config-reviewed, actually boot-tested on this hardware/kernel/driver combination. Since the reboot didn't modify the unit file or its `enabled` state (both already correct and already captured in `maxQ20GA-1032-doca341-baseos.tgz`, tar'd before this test), the tarball doesn't need to be recaptured on account of this finding — this test validates what's already in it.
+
+*Status: fixed and, more importantly, boot-verified. §7f's original disablement root cause remains separately open — this event's clean-stop signature doesn't retroactively explain it.*
+
 ## 8. CUDA Toolkit Install
 
 Per corrected §0 matrix (`13.0.2`, confirmed via NVOnline 1160245 — see §0 note) and the public CUDA download selector (Linux / arm64-sbsa / Ubuntu 24.04 / deb (local)).
@@ -721,6 +962,53 @@ CA 'mlx5_8'
 - Both ports show `State: Down` — expected at this stage, not a fault: `mlx5_5` has no cable connected yet; `mlx5_8` is `Physical state: LinkUp` with `SM lid: 0`, i.e. physically up but no InfiniBand subnet manager present since this is a single un-racked L10 unit, not yet joined to a fabric.
 
 *Status: complete. Firmware confirmed updated and correct on both CX8 and BF3. Validated as a practice pass ahead of reference hand-off — procedure in §6a/§6c confirmed correct, with the host-power-cycle requirement (vs. plain reboot) now captured for anyone following this as the reference path.*
+
+## 10a. CX8/BF3 Firmware Found Reverted to Pre-§10 Baseline — 2026-09-14
+
+**Discovered via the checklist script, not suspected first.** Running `gb300_l10_sw_checklist.sh` v0.4.23 during the §7g driver-bump work showed:
+```
+BF3 Firmware Version : FW Version:  32.47.2526   [CHECK]
+CX8 Firmware Version : FW Version:  40.47.2526   [CHECK]
+```
+This is not a nearby-but-different version — it is **the exact pre-burn baseline §10 itself documented** ("`40.47.2526` → `40.49.1118`" for CX8; BF3's pre-flash value was `32.47.2526` per the same section). Confirmed independently via `flint -d <pci-addr> query` on all 5 devices (4× CX8, 1× BF3) using direct PCI-address syntax rather than `/dev/mst/*` paths (the latter failed to parse against this unit's installed `mstflint`/`mstfwreset` — a separate, minor tooling-version mismatch between `flint` and `mstflint`/`mstfwreset` on this host, not investigated further, noted here for anyone hitting the same parse error): all 4 CX8 ports at `40.47.2526`, BF3 at `32.47.2526`, both matching `FW Release Date: 12.1.2026` (pre-dating this entire bring-up).
+
+**Ruled out before re-flashing, not assumed:**
+- **Pending-activation theory (burn written but not yet loaded):** ruled out. `flint`/`mstflint` show a single `FW Version` with no distinct "Running" value on any device — if an unapplied newer image were sitting behind the running one, that would show as two separate version fields. `mstfwreset -d 0016:01:00.0 query` (BF3) confirmed no pending reset state either; `mstfwreset` against the CX8 ports failed with `ICMD_NOT_READY` (523) — a known ConnectX/BlueField capability difference in this interface, not evidence of anything.
+- **PSID mismatch risk:** checked and genuinely relevant, but for the *GA release-notes-referenced* bundle only (`fw-ConnectX8-...-SPA_Ax-...MT_0000001228.fwpkg` — PSID `MT_0000001228`, while this hardware's actual CX8 PSID is `MT_0000001513`, confirmed via `flint query` on all 4 ports). **Not applicable to the file actually used for re-flashing** (see below) — §10's original burn used a different, `ST0_Ax`-suffixed file from `/fwupd/CX8_BF3_DOCA_MFT/`, already validated against this exact hardware's real PSID once before.
+- **Hardware-level rollback/recovery mechanism:** checked via `ipmitool sel list`/`sel elist` (full history back to 2026-08-14) and `dmesg -T`. **Clean** — nothing but routine ACPI power-state transitions in the SEL, no CPLD/EROT/watchdog event, no reset flags; `dmesg` from the post-reflash boot shows only routine platform boot noise (`tegra-qspi ... device reset failed`, a known GICv3 firmware-bug log line typical of this platform) plus the expected `vfio-pci` reset that's a normal part of `bfb-install`'s DPU-mode transition. No evidence of a triggered hardware rollback.
+- **Physical event on the unit:** asked directly — none recalled.
+
+**Leading explanation (unconfirmed, not a hardware defect theory):** given the SEL/dmesg came back clean and no physical event is recalled, the most consistent explanation is a **process-level revert**, not a hardware-triggered one — most plausibly connected to the tarball-capture/`cm-create-image` work in §25, if `carlonext` or an equivalent captured/restored state was ever re-applied to this unit from a point predating §10's August flash. Not confirmed against actual BCM/tarball timestamps or logs — flagged as the leading theory, not treated as established fact.
+
+**Also newly relevant:** the BMC/EROT staleness first found two sessions ago (`HGX_FW_BMC_0: GB200Nvl-25.09-2` vs GA's `26.07-1`; `HGX_FW_ERoT_*: 01.04.0031.0000_n04` vs GA's `01.04.0055.0000_n04`) was considered as a possible *shared* root cause (a platform-level recovery event affecting BMC/EROT and CX8/BF3 together) but the clean SEL doesn't support that either — these may simply be two independent instances of stale firmware on this unit rather than one unifying event. Not resolved either way.
+
+**Re-flash — exact repeat of §10's procedure, same staged files:**
+```bash
+FW=/fwupd/CX8_BF3_DOCA_MFT/ConnectX-8/fw-ConnectX8-rel-40_49_1118-900-9X86E-00CX-ST0_Ax-UEFI-14.42.15-FlexBoot-3.9.101.signed.bin
+sudo flint -d 0000:03:00.0 -i "$FW" burn
+sudo flint -d 0002:03:00.0 -i "$FW" burn
+sudo flint -d 0010:03:00.0 -i "$FW" burn
+sudo flint -d 0012:03:00.0 -i "$FW" burn
+
+sudo bfb-install --rshim rshim0 --bfb /fwupd/CX8_BF3_DOCA_MFT/BlueField-3/bf-fwbundle-3.4.1-11_26.04-prod.bfb
+```
+All 4 CX8 cards: `40.47.2526 → 40.49.1118`, identical `OK` sequence to §10. BF3: NIC firmware updated to `32.49.1118`, BMC to `26.04-8`. Same `NIC Firmware reset is not supported. Host power cycle is required` message as §10 — same correct response:
+```bash
+ipmitool chassis power cycle
+```
+
+**Post-cycle verification — confirmed at two independent layers, not just one tool's report:**
+```
+root@carlonext:~# ibstat mlx5_5
+Firmware version: 40.49.1118
+root@carlonext:~# ibstat mlx5_8
+Firmware version: 32.49.1118
+```
+Cross-confirmed via kernel `dmesg`: `mlx5_core 0000:03:00.0: firmware version: 40.49.1118` (and identically for every other CX8/BF3 PCI function) — the driver itself sees the new firmware, not just userspace tooling reporting a cached value. Re-ran `gb300_l10_sw_checklist.sh` afterward: `BF3 Firmware Version`/`CX8 Firmware Version` both `OK` at `32.49.1118`/`40.49.1118`.
+
+**Open item — recurrence risk not closed.** The leading explanation (a process-level revert, possibly tarball/BCM-related) is unconfirmed, and the checklist's firmware checks are what caught this, not proactive monitoring — if whatever caused this happens again (a future tarball recapture, a BCM resync, or genuinely something else undiagnosed), it could revert silently between checklist runs. Worth treating "verify BF3/CX8 firmware" as a standing pre-handoff/post-any-reimage step, not a one-time confirmation, until the actual mechanism is understood.
+
+*Status: firmware corrected and verified at two independent layers (userspace `ibstat` + kernel `dmesg`). Root cause of the original revert not confirmed — leading theory documented, not established. Recurrence risk explicitly open.*
 
 ## 11. Ansible Install
 
@@ -904,6 +1192,8 @@ SBIOS: 02.06.06             VBIOS: 97.10.7D.00.0D       WinOF-2: 26.4.27095
 **Finding 2 — `EXPECTED_FM="570"` was also stale**, found opportunistically while reviewing the full list. `GFM: 580.173.04` is the confirmed Fabric Manager target. Corrected in the same pass and added to the §0 matrix (previously had no Fabric Manager row at all).
 
 **Not corrected — noted, not acted on:** `VBIOS: 97.10.7D.00.0D` in this source file doesn't obviously match the already-confirmed-installed `97.10.59.00.13` from earlier checklist runs, but the two use different notation (this file's value appears to be raw hex bytes) and there's no `EXPECTED_VBIOS` variable in the script to correct either way. Flagged for awareness only — not treated as a discrepancy without understanding the notation difference first.
+
+**Update, 2026-09-14 — see §0a.** GA's release notes independently confirm the same `7D` segment (`97.10.7D.00.16`), reopening this as a likely-real mismatch rather than a notation artifact. `EXPECTED_VBIOS` added to the checklist in v0.4.25.
 
 ```bash
 # gb300_l10_sw_checklist.sh changes (v0.4.3 -> v0.4.4)
@@ -1257,6 +1547,108 @@ sudo sed -i '/swap.img/s/^/#/' /etc/fstab   # comment out rather than delete the
 
 *Status: both cleanup items complete and verified on `carlonext`. ~4.4G (repo packages) + 8G (swap) = **~12.4G reclaimed total** under `/`, with no functional regression — CUDA, driver, and DOCA stack all confirmed intact post-cleanup.*
 
+## 22b. Stale Kernel Removal — `6.17.0-1029-nvidia-64k` (2026-09-14)
+
+**Goal:** slim the reference layout further by removing the old kernel now that `6.17.0-1032-nvidia-64k` is current and both `vmlinuz`/`initrd.img` symlinks already point there with no `.old` fallback pointing at `1029`.
+
+**Pre-removal checks (in order, before touching anything):**
+
+```
+root@carlonext:~# dpkg -l | grep '6.17.0-1029'
+ii  doca-kernel-repo-26.04-1.0.9.0-6.17.0.1029.nvidia.64k 26.04.1.0.9.0
+ii  linux-headers-6.17.0-1029-nvidia-64k                  6.17.0-1029.29
+ii  linux-image-6.17.0-1029-nvidia-64k                    6.17.0-1029.29
+ii  linux-modules-6.17.0-1029-nvidia-64k                  6.17.0-1029.29
+ii  linux-nvidia-6.17-headers-6.17.0-1029                 6.17.0-1029.29
+ii  linux-nvidia-6.17-tools-6.17.0-1029                   6.17.0-1029.29
+ii  linux-tools-6.17.0-1029-nvidia-64k                    6.17.0-1029.29
+ii  xpmem                                                 2604.0.2-1.kver.6.17.0-1029-nvidia-64k
+```
+
+```
+root@carlonext:~# dkms status
+iser/26.04.OFED.26.04.1.0.9.1-1, 6.17.0-1032-nvidia-64k, aarch64: installed
+isert/26.04.OFED.26.04.1.0.9.1-1, 6.17.0-1032-nvidia-64k, aarch64: installed
+kernel-mft-dkms/4.36.0.147, 6.17.0-1032-nvidia-64k, aarch64: installed
+mlnx-ofed-kernel/26.04.OFED.26.04.1.0.9.1-1, 6.17.0-1032-nvidia-64k, aarch64: installed
+nvidia/580.173.02, 6.17.0-1032-nvidia-64k, aarch64: installed
+srp/26.04.OFED.26.04.1.0.9.1-1, 6.17.0-1032-nvidia-64k, aarch64: installed
+xpmem/2604.0.2, 6.17.0-1032-nvidia-64k, aarch64: installed
+```
+
+```
+root@carlonext:~# apt-mark showhold
+linux-headers-6.17.0-1032-nvidia-64k
+linux-headers-nvidia-64k-hwe-24.04
+linux-image-6.17.0-1032-nvidia-64k
+linux-image-nvidia-64k-hwe-24.04
+linux-nvidia-64k-hwe-24.04
+mlnx-ofed-kernel-utils
+nvidia-modprobe
+```
+
+Every DKMS module (`nvidia`, `mlnx-ofed-kernel`, `iser`/`isert`/`srp`, `kernel-mft-dkms`, `xpmem`) is already exclusively built against `1032` — nothing registered for `1029`, so no `dkms remove` needed first. Holds only cover `1032`-versioned and meta-packages, none of the `1029`-versioned packages — purge won't fight the hold logic.
+
+**`xpmem` deliberately excluded from the purge.** Its version string (`...kver.6.17.0-1029-nvidia-64k`) makes it look like a per-kernel package the same way the others are, but `xpmem` is a package name with no kernel version baked in — dpkg can only track one installed version at a time, and `dkms status` already shows it built against `1032`, meaning the `1029` in the version string is a stale build-time artifact from whenever that `.deb` was produced, not a marker of what it actually ships. Confirmed via file manifest before excluding it, not just inferred:
+
+```
+root@carlonext:~# dpkg -L xpmem | grep -i 1029
+(no output)
+```
+
+No `1029`-specific files in the package at all — correctly left untouched, remains installed as-is (still `2604.0.2-1.kver.6.17.0-1029-nvidia-64k` in `dpkg -l`, harmlessly).
+
+**Purge:**
+
+```bash
+sudo apt purge -y \
+  linux-headers-6.17.0-1029-nvidia-64k \
+  linux-image-6.17.0-1029-nvidia-64k \
+  linux-modules-6.17.0-1029-nvidia-64k \
+  linux-nvidia-6.17-headers-6.17.0-1029 \
+  linux-nvidia-6.17-tools-6.17.0-1029 \
+  linux-tools-6.17.0-1029-nvidia-64k \
+  doca-kernel-repo-26.04-1.0.9.0-6.17.0.1029.nvidia.64k
+```
+
+Result: 7 packages removed, **475 MB freed**. Postrm hooks ran cleanly — `update-initramfs` deleted `/boot/initrd.img-6.17.0-1029-nvidia-64k`, and `update-grub` regenerated correctly, finding only `/boot/vmlinuz-6.17.0-1032-nvidia-64k` / `initrd.img-6.17.0-1032-nvidia-64k` (no stray `1029` menu entry).
+
+**Two directories dpkg couldn't remove itself** (conservative behavior — dpkg won't `rmdir` a non-empty directory even when the leftover contents are untracked build residue):
+
+```
+dpkg: warning: while removing linux-headers-6.17.0-1029-nvidia-64k, directory '.../scripts/kconfig' not empty so not removed
+  (+ scripts/ipe/polgen, scripts/dtc/libfdt, scripts/basic, include/config)
+dpkg: warning: while removing linux-modules-6.17.0-1029-nvidia-64k, directory '/lib/modules/6.17.0-1029-nvidia-64k' not empty so not removed
+```
+
+Most likely stale DKMS build output from when the modules above were still building against `1029`, before everything moved to `1032`. Since `dkms status` already confirmed nothing registered against `1029`, removed manually:
+
+```bash
+sudo find /usr/src/linux-headers-6.17.0-1029-nvidia-64k -maxdepth 0   # confirmed present before removing
+sudo find /lib/modules/6.17.0-1029-nvidia-64k -maxdepth 0             # confirmed present before removing
+sudo rm -rf /usr/src/linux-headers-6.17.0-1029-nvidia-64k
+sudo rm -rf /lib/modules/6.17.0-1029-nvidia-64k
+```
+
+**Final verification — all three clean:**
+
+```
+root@carlonext:~# ls /lib/modules/
+6.17.0-1032-nvidia-64k
+root@carlonext:~# ls /usr/src/ | grep 1029
+(no output)
+root@carlonext:~# dpkg -l | grep 1029
+ii  xpmem   2604.0.2-1.kver.6.17.0-1029-nvidia-64k   all   kernel module for user-space process remapping - scripts
+```
+
+The `xpmem` line is expected and correct — same package, same version string discussed above, not leftover from an incomplete purge.
+
+**`apt autoremove` for the orphaned X11/desktop stack (libgl1, mesa-vulkan-drivers, xserver-xorg-core, xfonts-base, etc., surfaced as "no longer required" during the purge) — deferred, not run.** This list plausibly matches the unwanted desktop stack §25's revised recommendation already flagged as a side effect of the `nvidia-driver-580-open` metapackage, but that connection wasn't confirmed before this session ended — treat as a separate, still-open cleanup opportunity rather than assuming it's the same thing without checking the package list directly against §25's finding first.
+
+**No action needed on `xpmem`'s version-string cosmetic mismatch** — it will keep reading `...6.17.0-1029-nvidia-64k` in `dpkg -l` until that specific `.deb` is rebuilt/reinstalled upstream; purely cosmetic, doesn't affect DKMS registration (already confirmed against `1032`) or function.
+
+*Status: complete and verified. 475 MB (packages) + residual `/usr/src`/`/lib/modules` directories reclaimed. `apt autoremove` for the X11/desktop leftovers tracked as a separate open item, not part of this pass.*
+
 ## 23. CUDA Version Fields — Why Three Different Numbers Are All Correct
 
 Recurring point of confusion worth a permanent reference entry, since it came up directly in review. The checklist shows three different CUDA-related version strings, and none of them are wrong or inconsistent with each other:
@@ -1587,6 +1979,62 @@ Root cause (confirmed, `rack08node15`, 2026-09-11): `nv-hostengine` (DCGM's daem
 
 **Not yet decided, either item:** whether these trade-offs are acceptable as standing behavior for every future rack handoff, or whether one/both need a different resolution (e.g., getting `onediagfieldmn` to gracefully request DCGM release its device handles instead of a hard `rmmod`, rather than stopping DCGM as a blunt workaround). Track alongside the `finalize` lifecycle stage in `rack_lifecycle.sh`, which is also still undecided pending clarification on what "ready for production/customer" actually requires.
 
+## 25d. GA Reference Layout Recapture — `maxQ20GA-1032-doca341-baseos.tgz` (2026-09-16)
+
+**Why:** the original `maxQ20rc4-1029-doca341-baseos.tgz` (§25a) reflects the RC4-era `580.173.02` driver on kernel `1029`. Since §0a/§7g's full GA reconciliation, `carlonext` itself has moved to `580.173.10` on kernel `1032` plus the CX8/BF3 firmware fix (§10a) and three disk-hygiene passes (§22a/§22b/§22c). This capture brings the reference tarball in line with what's actually validated on the reference host, rather than continuing to hand out an RC4-era image.
+
+**Capture command — identical to §25a's method, same output path, effectively replacing the original file in place:**
+```bash
+sudo tar --numeric-owner --xattrs --acls -czpf /root/bcm-image-export/maxQ20rc4-1029-doca341-baseos.tgz \
+  --exclude='./proc' --exclude='./sys' --exclude='./dev' --exclude='./run' \
+  --exclude='./tmp' --exclude='./mnt' --exclude='./media' --exclude='./lost+found' \
+  --exclude='./root/bcm-image-export' \
+  -C / .
+```
+Renamed immediately after to reflect what it actually is:
+```bash
+mv /root/bcm-image-export/maxQ20rc4-1029-doca341-baseos.tgz /root/bcm-image-export/maxQ20GA-1032-doca341-baseos.tgz
+```
+**Post-capture validation — confirmed, same checks as §25a:**
+```
+tar -tzf .../maxQ20GA-1032-doca341-baseos.tgz | wc -l                          → 186,001 members, listed cleanly, no read errors
+tar -tzf .../maxQ20GA-1032-doca341-baseos.tgz | grep '^\./etc/machine-id'      → present ✅
+tar -tzf .../maxQ20GA-1032-doca341-baseos.tgz | grep '^\./etc/ssh/ssh_host'    → all 6 files present ✅
+```
+Member count is up from the original's `172,523` — expected, given everything accumulated since (GA driver/IMEX/FM reinstall, disk-hygiene passes that also *added* artifacts like this session's `hosts.ini` template, not just removed things).
+
+**Correction: this ended up as two captures, not one — worth being precise about which is authoritative.** The first capture (further above) was taken, then renamed via `mv` from the original `1029`-named path. A second, genuinely fresh `tar` run was then executed directly against the final `maxQ20GA-1032-doca341-baseos.tgz` path — **after** §7h's boot-verification of `nvidia-persistenced` — which overwrote the renamed file. This second capture is authoritative: it has the confirmed-good, actually-boot-tested persistence behavior baked in directly, rather than being true of this file only by inference from a test run against the live host after the file already existed. The validation above is against this second, final capture.
+
+**Note on the original file:** this reused §25a's exact original path before renaming, which means the original RC4-era tarball at that path was overwritten during capture, not preserved as a separate artifact. `rack08` (§25c) is unaffected — it was already provisioned from the original weeks earlier — but if the original `1029`-era tarball itself is ever needed again (e.g. to diff against, or re-verify exactly what `rack08` was built from), it no longer exists at this path. Not confirmed whether a separate copy survives inside BCM's own imported-image store independent of this raw file.
+
+**Follows §25b's validated strategy, not the drift risk it originally found.** §25b's hard-won conclusion was: bake the driver in via the `.run` installer before capture, so `cm-create-image`'s own unpinned `apt-get install nvidia-open-580 ...` step becomes a harmless no-op instead of a silent version drift. Confirmed this capture does exactly that, checked directly rather than assumed:
+```
+uname -r                                                      → 6.17.0-1032-nvidia-64k ✅
+modinfo nvidia | grep ^version                                → 580.173.10 ✅
+nvidia-smi                                                     → all 4 GPUs healthy, no NVML errors ✅
+dkms status                                                    → nvidia/580.173.10 against 1032 only, no stray entries ✅
+dpkg -l | grep -E "nvidia-open-580|nvidia-driver-580-open"    → no output - NOT apt-installed ✅
+```
+Also an improvement over the original capture in one respect: `nvidia-imex` is confirmed `.run`-installed this time (§7g Step 4), not mysteriously `dpkg`-tracked the way it was found to be on the original build (root cause of that never resolved, see §7g).
+
+**Pre-capture, a real finding almost missed: `nvidia-persistenced` was found stopped** (not disabled — see §7h) due to partner diagnostics run the prior day. Confirmed this doesn't affect the tarball (systemd enablement state, the only part that gets captured, was untouched), then boot-verified end-to-end via an actual `reboot` that persistence comes back on automatically with zero manual steps — see §7h for full detail. This capture is therefore boot-tested for this specific property, not just config-reviewed.
+
+**Post-capture validation — not yet run, needed before trusting this as the new reference:**
+```bash
+tar -tzf /root/bcm-image-export/maxQ20GA-1032-doca341-baseos.tgz | wc -l
+tar -tzf /root/bcm-image-export/maxQ20GA-1032-doca341-baseos.tgz | grep '^\./etc/machine-id'
+tar -tzf /root/bcm-image-export/maxQ20GA-1032-doca341-baseos.tgz | grep '^\./etc/ssh/ssh_host'
+```
+§25a's `machine-id`/SSH-host-key design choice (left live, not stripped, for the diag-account rationale) has not been explicitly re-confirmed as still the right call for this recapture — carried forward by default since nothing in this session changed that reasoning, not because it was re-evaluated.
+
+**Open items:**
+- ~~Post-capture tar-integrity validation~~ — done, see above.
+- Not yet fed through `cm-create-image` — same as §25a's original status, this is a candidate image until that end-to-end pass completes, including re-confirming §25b's driver-survival check (`dkms status` inside the resulting chroot) after the build.
+- Original `1029`-era tarball's fate (overwritten vs. preserved elsewhere) not confirmed.
+- §0b's NVLink Recovery rack-wide upgrade requirement (all components ≥1.0.5, including NVSwitch) still needs verifying against whatever rack this new image eventually provisions — not specific to this capture, but relevant before treating any node built from it as production-ready.
+
+*Status: captured (twice — see correction above, second capture is authoritative), renamed, and tar-level validation passed. Driver/IMEX baking strategy confirmed correct per §25b's validated approach. Persistence-at-boot property specifically boot-tested (§7h) *before* this final capture, not just assumed. `cm-create-image` pass still outstanding.*
+
 ## 26. Next Steps (not yet started)
 
 - [x] NVIDIA kernel build packages (gcc, dkms, make) — see §5
@@ -1620,14 +2068,41 @@ Root cause (confirmed, `rack08node15`, 2026-09-11): `nv-hostengine` (DCGM's daem
 - [x] Disk-cleanup pass — purged stale `cuda-repo-*`/`nvidia-driver-local-repo-*` local-repo packages and removed unused 8G `/swap.img`, ~12.4G reclaimed, CUDA/driver/DOCA confirmed intact — see §22a
 - [ ] Review `apt list --upgradable` (130 packages, surfaced by §22a) before ever running `apt upgrade` on this reference layout — check specifically for `linux-image-*`/`nvidia-*`/`doca-*` version bumps against the pinned NVIDIA 2.0 matrix (§0)
 - [ ] Audit other nodes in category `maxQ-1014-doca321` for the same manually-added, unused `/swap.img` (§22a open item) — not part of the BCM disk-setup definition, so likely a per-node manual addition rather than fleet-standard
+- [x] Remove stale `6.17.0-1029-nvidia-64k` kernel packages + residual `/usr/src`/`/lib/modules` directories, 475 MB reclaimed, `xpmem` correctly left in place — see §22b
+- [ ] Run `apt autoremove` for the orphaned X11/desktop packages surfaced during §22b's purge (libgl1, mesa-vulkan-drivers, xserver-xorg-core, xfonts-base, etc.) — check first whether this is the same unwanted-desktop-stack side effect §25 flagged from `nvidia-driver-580-open`, don't assume it without confirming
 - [x] Capture reference-layout tarball (`maxQ20rc4-1029-doca341-baseos.tgz`) for BCM image export — validated at the tar level (integrity, expected-file presence, by-path consistency), see §25a
+- [x] Recapture the reference layout tarball reflecting GA (`580.173.10`, kernel `1032`, CX8/BF3 firmware fix, three disk-hygiene passes) — done, `maxQ20GA-1032-doca341-baseos.tgz`, see §25d
+- [x] Run post-capture tar-integrity validation on `maxQ20GA-1032-doca341-baseos.tgz` (member count, `machine-id`/SSH-host-key presence) — done: `186,001` members, both present, see §25d
+- [ ] Feed `maxQ20GA-1032-doca341-baseos.tgz` through `cm-create-image` end-to-end and re-confirm §25b's driver-survival check inside the resulting chroot — not yet done, this capture is a candidate image until then
+- [ ] Confirm whether the original `1029`-era tarball survives anywhere (BCM's own image store) now that its raw file at `/root/bcm-image-export/` was overwritten during the §25d recapture
 - [x] Feed `maxQ20rc4-1029-doca341-baseos.tgz` into `cm-create-image` — end-to-end run completed 2026-09-08; surfaced a real finding, see §25b
 - [x] Provision a real 18-node rack (`rack08`) from `baseos-1029-doca341` and confirm health — done 2026-09-08, all 18 nodes `[UP]` with no failure flag, `rack08node01` full `latesthealthdata` spot-check all-PASS, see §25c
 - [ ] Spot-check `latesthealthdata` on the remaining 17 `rack08` nodes (only node01 confirmed in detail so far) before considering the rack fully signed off
 - [ ] (secondary, deprioritized per §25b's revised recommendation) Update `cm-create-image`'s CM package list (head-node config, not this tarball) to pin every `nvidia-*`/`libnvidia-*`/`dkms` entry to the exact `580.173.02` version strings validated in §25b — only worth doing to quiet build-log noise, not required for correctness once the driver is baked into the tarball directly
 - [x] Decided: driver correctness will come from the reference layout (`carlonext`, §7) being correct **before** the next tarball capture, not from apt-pinning inside `cm-create-image` — see §25b's revised recommendation (2026-09-08). Chasing pins in the BCM chroot repeatedly cost more time than it saved.
-- [ ] Before the next `-a` capture/re-tar of this reference layout, re-confirm `carlonext`'s driver state is still `580.173.02`/kernel `6.17.0-1029-nvidia-64k` (or whatever the current target is) so it's what actually gets baked into the new tarball
+- [x] Before the next `-a` capture/re-tar of this reference layout, re-confirm `carlonext`'s driver state is still `580.173.02`/kernel `6.17.0-1029-nvidia-64k` (or whatever the current target is) so it's what actually gets baked into the new tarball — done for the §25d recapture: confirmed `580.173.10`/kernel `1032`/`.run`-installed (not apt) before capturing
+- [ ] Same timing concern as the item above, applied to §22b: a future kernel HWE point-update will leave a new stale `linux-*-<old-version>-nvidia-64k` set behind the same way `1029` was — this cleanup isn't a one-time fix, it's a step to repeat on every kernel bump before the next tarball capture, not yet automated or added to any checklist
 - [ ] Confirm whether `cm-create-image`/BCM's node-install process has its own `machine-id`/SSH-host-key regeneration mechanism, since §25a's image deliberately ships both static (diverging from §25's per-clone-regen design) — needs to be a conscious pipeline-level decision before cloning multiple production nodes from this image
+- [ ] **New per §0a (2026-09-14):** bump `carlonext` driver + IMEX from RC4-era `580.173.02` to GA-pinned `580.173.10`, then re-run `nvidia-smi`/`modinfo nvidia`/`dkms status` verification (same checks as §7/§16a) before the next tarball capture
+- [ ] Re-validate `nvidia-fabricmanager` (host package, §25) tracks the new `580.173.10` driver branch once bumped — confirm via the local-repo `.deb` naming, not by assuming the old `580.173.02`-tied install carries forward
+- [ ] Confirm the actual NVSwitch-tray/NVOS-side Fabric Manager version against GA release notes directly (not assumed equal to the driver version or to the old RC4 `580.173.04` value — see §0a)
+- [ ] Add the GA BMC/MCU/HMC out-of-band firmware baseline (§0a) to whatever process validates a rack post-handoff; confirm the checklist script's Redfish component-id filter actually surfaces an SMA/MCU entry
+- [ ] Re-verify `nvidia-persistenced` (§7f) survives the *next* reboot — especially the one following the pending driver bump to `580.173.10` — and root-cause why it was found `disabled` on 2026-09-14 despite §7e's original confirmation, before treating the fix as durable
+- [x] Bump driver + IMEX to GA-pinned `580.173.10` on `carlonext` — see §7g
+- [x] Confirm/deny the `CX8_BF3_config.yml` Ansible-driven dependency-pull theory for how `nvidia-imex` became `dpkg`-tracked (§7g) — grepped, ruled out; actual trigger still unexplained
+- [x] Review the `/usr/share/nvidia` and `/etc/nvidia-imex` leftover directories from the §7g package purges — confirmed current/from-this-session, not stale; no removal needed
+- [x] Bring `nvidia-modprobe` in line with the `580.173.10` bump — done, confirmed via `nvidia-modprobe --version`, re-held
+- [x] Decide: stay pinned at `cuda-toolkit-13-0` `13.0.2`, or take the available `13.0.3` point release (§7g) — decided: stay pinned, `13.0.3` isn't part of the GA-qualified pairing at all (general CUDA repo, not this release train); hold applied
+- [x] Re-flash CX8/BF3 firmware after discovering both had reverted to the pre-§10 baseline — see §10a; re-verified at both `ibstat` and kernel `dmesg` level
+- [ ] Root-cause the CX8/BF3 firmware revert itself (§10a) — SEL/dmesg came back clean, leading theory is a process-level revert possibly tied to §25's tarball/BCM work, not confirmed
+- [ ] Treat BF3/CX8 firmware verification as a standing pre-handoff/post-reimage check (§10a), not a one-time confirmation, until the revert mechanism is actually understood
+- [ ] Copy the updated `gb300_l10_sw_checklist.sh` (currently v0.4.26, adds real GA-sourced BMC/EROT/VBIOS comparison) onto `carlonext` — the v0.4.23 copy still there doesn't yet flag the known-stale `HGX_FW_BMC_0`/`HGX_FW_ERoT_*`/VBIOS readings
+- [ ] **New, highest priority per §0b:** verify `rack08` (and every compute node + NVSwitch tray in it) meets GA's "upgrade all rack components to 1.0.5+" requirement for NVLink Recovery compatibility — not yet checked, and failure mode may not surface in the existing `[UP]`/health-check spot-checks already done in §25c
+- [ ] Investigate the VBIOS mismatch reopened in §0a/§16: installed `97.10.59.00.13` vs GA-documented `97.10.7D.00.16` (same `7D` segment as the earlier RC4 value) — determine whether this needs an actual VBIOS flash and what that procedure/risk looks like on this hardware, separate from anything already done in §7g/§10a
+- [x] Add FPGA checklist check for the HMC baseline (§0b: `1.66`) — done in v0.4.28, also fixed a real false-positive bug (E1S CPLD wrongly compared against the wrong component's target) found in the same pass
+- [ ] SBIOS still has no checklist check (§0b: `02.06.06`) — not yet wired in, no corresponding `nvidia-smi`/dpkg-queryable field identified yet
+- [ ] HMC FPGA now also confirmed drifted (`1.60` live vs `1.66` GA target, §0b) — add to the same firmware-update pass as CX8/BF3 (§10a), BMC/EROT, and VBIOS rather than treating as a fourth separate one-off
+- [ ] Re-pull NVOnline `1162808` (GA's Source of Truth Metadata File, replaces RC4's `1160245`) and diff against what's already in §0/§0a if a fully authoritative cross-check is ever needed
 
 ---
 

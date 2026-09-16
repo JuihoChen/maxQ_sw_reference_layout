@@ -394,9 +394,184 @@
 #                       different RAM might legitimately want swap; this just
 #                       flags it for a human to confirm intentional rather
 #                       than silently ignoring it).
+#   0.4.21 2026-09-14  2.0.0GA reconciliation (build log §0a). NVIDIA's
+#                       official GA release notes (RN-11874-001) supersede
+#                       the RC4 metadata file (NVOnline 1160245) everything
+#                       through v0.4.20 was pinned against.
+#                       (1) EXPECTED_DRIVER 580.173.02 -> 580.173.10.
+#                       (2) EXPECTED_IMEX now derived as "$EXPECTED_DRIVER"
+#                       instead of a separate literal, so it can't be left
+#                       stale by omission on a future driver bump the way
+#                       it nearly was here.
+#                       (3) EXPECTED_FM corrected from a stale, and on
+#                       reflection never-correct, "580.173.04" (NVOnline
+#                       1160245's RC4 "GFM:" field) to "$EXPECTED_DRIVER".
+#                       Root cause: the host-side `nvidia-fabricmanager`
+#                       package (build log §25) is sourced from
+#                       nvidia-driver-local-repo-ubuntu2404-<driver-version>
+#                       and versioned <driver-version>-1ubuntu1 - it tracks
+#                       the driver branch, not an independent release train.
+#                       The v0.4.4 "Finding 2" correction (570 -> 580.173.04)
+#                       fixed a stale value but attributed it to the wrong
+#                       component; 580.173.04 most likely describes the
+#                       NVSwitch tray's own NVOS-side Fabric Manager, which
+#                       this script cannot see and which is NOT confirmed to
+#                       equal either the old or new value - the
+#                       "Fabric Manager Version" note_na message was
+#                       rewritten to stop implying otherwise.
+#                       (4) Added an actual version check ("Fabric Manager
+#                       Package Version") for the installed
+#                       nvidia-fabricmanager package against EXPECTED_FM -
+#                       previously only masked-state was checked, so a
+#                       package installed against a stale driver branch
+#                       would have silently read OK.
+#                       (5) Parameterized the "Stale NVIDIA Driver Repo Pkg"
+#                       check's package name on EXPECTED_DRIVER instead of a
+#                       hardcoded 580.173.02 suffix, for the same
+#                       stale-by-omission reason as (2).
+#                       (6) No NMX-M check exists in this script (build-log-
+#                       only tracking) - no code change needed there, but
+#                       the GA notes give a clean 85.1.1100 vs. the RC4-era
+#                       build log's malformed filename-as-version string;
+#                       see build log §0a.
+#                       (7) EXPECTED_CUDA/_CUDA_TOOLKIT/_DOCA/_MFT/_BF3_FW/
+#                       _CX8_FW confirmed unchanged by GA - comments updated
+#                       to say so explicitly rather than leaving silence
+#                       that could read as "not yet checked."
+#   0.4.22 2026-09-14  Added "Persistence Daemon (enabled)" check (build log
+#                       §7f) after nvidia-persistenced was found silently
+#                       `disabled` (systemd enablement) on carlonext despite
+#                       §7e's original enabled+reboot-survived confirmation -
+#                       root cause not established. The existing "Persistence
+#                       Mode" row only reads nvidia-smi's current runtime
+#                       state, which can show Enabled right up until the next
+#                       reboot even with the daemon disabled underneath it -
+#                       this new row checks `systemctl is-enabled` directly,
+#                       so a repeat of this regression won't hide behind a
+#                       still-passing runtime check.
+#   0.4.23 2026-09-14  Added "Held: libnvidia-nscq" / "Held: nvidia-modprobe" /
+#                       "Held: nvidia-fabricmanager" checks (build log §7g).
+#                       Found live, during the GA driver bump: libnvidia-nscq
+#                       was completely unheld and showed an available "apt
+#                       upgrade" target on a different major driver branch
+#                       (615.x) entirely, not a point release - a real
+#                       mismatch risk against the pinned 580.x stack, and
+#                       nothing in this script would have caught it. The
+#                       other two happened to already be protected by
+#                       existing process, not by anything this script
+#                       checked - closing that gap now rather than relying
+#                       on it being noticed by hand again next time.
+#   0.4.24 2026-09-14  Out-of-Band Firmware (Redfish) section now compares
+#                       BMC/EROT/CPLD/SMA/HMC-GPU component versions against
+#                       real GA-sourced targets (build log §0a) instead of
+#                       reporting everything found as an unconditional OK.
+#                       This wasn't theoretical: this same run's own earlier
+#                       output showed HGX_FW_BMC_0 at GB200Nvl-25.09-2 and
+#                       all 5 HGX_FW_ERoT_* entries at 01.04.0031.0000_n04,
+#                       both stale against GA's GB200Nvl-26.07-1 /
+#                       01.04.0055.0000_n04 - and the old code would have
+#                       kept reporting all of it OK forever, since there was
+#                       no comparison value available when this section was
+#                       first written. Also expanded the discovery filter
+#                       (CPLD|EROT|HMC|BMC|FPGA -> added SMA|GPU) since §0a's
+#                       MCU/HMC baseline includes SMA and GPU-under-HMC
+#                       fields that never appeared in any run's output under
+#                       the old filter - not yet confirmed whether that's
+#                       because this unit's BMC has no separately-exposed
+#                       member for them or because they exist under some
+#                       other unmatched name.
+#   0.4.25 2026-09-14  Corrected a mapping error from v0.4.24, caught before
+#                       it could cause a false negative: EXPECTED_HGX_GPU_FW
+#                       was added assuming the GA release notes' HMC "GPU"
+#                       field was a separate out-of-band Redfish-queryable
+#                       firmware component. It isn't - it's VBIOS, in
+#                       NVIDIA's raw-hex notation, same field "VBIOS Version"
+#                       already reads via nvidia-smi. Removed the *GPU* match
+#                       arm from the Redfish component-comparison case
+#                       (dead code anyway - no run this session ever
+#                       surfaced a GPU-matching Redfish component, consistent
+#                       with this correction) and from the discovery filter.
+#                       Added EXPECTED_VBIOS="97.10.7D.00.16" and wired it
+#                       into the existing "VBIOS Version" check, which has
+#                       had no comparison target at all since it was first
+#                       added - a real gap, not just a missed wiring. This
+#                       also reopens an unresolved thread from build log §16
+#                       (RC4 era): that section logged VBIOS as
+#                       "97.10.7D.00.0D" as a "may just be notation, not
+#                       confirmed" awareness note with no EXPECTED_VBIOS to
+#                       act on. GA's value shares the exact same "7D" segment
+#                       (only the last segment moved, 0D->16, a plausible
+#                       RC4->GA build increment) - the same segment agreeing
+#                       across two independent NVIDIA metadata sources weeks
+#                       apart, while this host's actual installed VBIOS
+#                       (97.10.59.00.13) has stayed unchanged throughout,
+#                       is stronger evidence of a real mismatch than §16's
+#                       original framing gave it credit for.
+#   0.4.26 2026-09-14  Fixed a real bug in v0.4.24/v0.4.25's own change,
+#                       caught on first live run on carlonext: script exited
+#                       with "EXPECTED_VBIOS: unbound variable" before
+#                       reaching the Out-of-Band Firmware section at all.
+#                       Root cause: EXPECTED_HGX_BMC_FW / _EROT_FW / _CPLD_FW
+#                       / _MCU_SMA_FW / _VBIOS were declared down near §6b's
+#                       Redfish section instead of in the main "§0. Config:
+#                       expected versions" block at the top where every other
+#                       EXPECTED_* variable lives - under `set -u`, the
+#                       "VBIOS Version" check (which runs much earlier, in
+#                       the NVIDIA Driver/CUDA/GPU section) referenced
+#                       EXPECTED_VBIOS before that later assignment had ever
+#                       executed, which is a hard error regardless of where
+#                       else in the file the variable eventually gets set.
+#                       Fixed by moving all 5 declarations up to the correct
+#                       location - values unchanged, only the location moved.
+#                       Verified with a static use-before-definition scan
+#                       across every EXPECTED_* variable in the script (not
+#                       just the ones just touched) to confirm no other
+#                       instance of this same class of bug exists elsewhere.
+#   0.4.27 2026-09-14  Two real corrections from reading the full GA release
+#                       notes PDF (RN-11874-001_2.0.0GA) for the first time,
+#                       rather than the individual page images used earlier
+#                       in this build:
+#                       (1) EXPECTED_DCGM corrected "3.3" -> "4.6.0". "3.3"
+#                       had been an unsourced placeholder since v0.1.0 - never
+#                       verified against anything. GA's Table 9 gives the
+#                       real target (DCGM 4.6.0, NVOnline 1139880).
+#                       (2) Added EXPECTED_GFM_NVOS="580.173.04", CONFIRMED
+#                       via the GA notes' "GB300 Switch Tray > NVOS" table -
+#                       this is a real, independent version for the
+#                       NVSwitch-tray-side Global Fabric Manager, separate
+#                       from EXPECTED_FM (this host's own inert
+#                       nvidia-fabricmanager package, which tracks the
+#                       driver). The v0.4.24 hedge ("580.173.04 most likely
+#                       refers to the NVOS-side FM, not confirmed") was
+#                       correct and is now directly confirmed, not just
+#                       inferred. "Fabric Manager Version" N/A message
+#                       updated accordingly - was incorrectly saying
+#                       "not confirmed against GA" when it now is.
+#   0.4.28 2026-09-14  Fixed a real false-positive bug, caught on a live run:
+#                       "FW_E1S_CPLD_0/1: 0b.04.02 (expected 0.22)" showed
+#                       CHECK, but 0.22 is the HGX baseboard CPLD's target
+#                       (§0a) - FW_E1S_CPLD_0/1 is the E1S NVMe drive-carrier
+#                       board's own, unrelated CPLD. The v0.4.24 case match
+#                       used a bare "*CPLD*" substring pattern, which caught
+#                       both components and compared one against the other's
+#                       spec - not a missed check, an actively wrong one.
+#                       Fixed by anchoring every pattern (EROT/CPLD/FPGA/SMA/
+#                       BMC) to the confirmed "HGX_FW_" prefix instead of
+#                       loose substrings, so only the components this build
+#                       log has actually confirmed the naming convention for
+#                       get compared at all. Also added HGX_FW_FPGA_* ->
+#                       EXPECTED_HGX_FPGA_FW="1.66" (GA release notes HMC
+#                       FPGA field, §0b) - this host's live "1.60" reading
+#                       had been silently reported OK with no target at all
+#                       until now; it's real drift, same shape as the
+#                       already-known BMC/EROT staleness. Explicitly NOT
+#                       "0.24" - that's the physically separate NVSwitch-
+#                       tray's own FPGA (§0b's Switch Tray BMC+FPGA+EROT
+#                       bundle), not applicable to this un-racked compute
+#                       host regardless of naming similarity.
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.20"
+SCRIPT_VERSION="0.4.28"
 
 set -uo pipefail
 
@@ -431,33 +606,92 @@ EXPECTED_OS="24.04"
 EXPECTED_KERNEL="nvidia-64k"   # Grace requires the 64k-page HWE kernel flavor;
                                 # substring match only (exact build # will drift
                                 # with HWE point updates, e.g. 6.17.0-1029)
-EXPECTED_DRIVER="580.173.02"   # per Host Software Components matrix
-                                # (NVIDIA-kernel-module-source-580.173.02)
-EXPECTED_CUDA="13.0"          # corrected from stale 12.8 - confirmed via NVOnline 1160245
+EXPECTED_DRIVER="580.173.10"   # per 2.0.0GA release notes (RN-11874-001), corrected
+                                # 2026-09-14 from the RC4-era 580.173.02 - see build
+                                # log §0a. (NVIDIA-kernel-module-source-580.173.10)
+EXPECTED_CUDA="13.0"          # corrected from stale 12.8 - confirmed via NVOnline 1160245;
+                                # unchanged by the GA reconciliation (§0a) - still 13.0.2
 EXPECTED_CUDA_TOOLKIT="13.0.2" # cuda-toolkit-13-0 meta-package version, per the
                                 # local-repo .deb this was installed from
                                 # (cuda-repo-...-13-0-local_13.0.2-580.95.05-1)
-                                # Table 2, paired with Datacenter Driver 580.173.02 (exact
-                                # match to installed driver) -> CUDA Toolkit 13.0.2
-EXPECTED_FM="580.173.04"       # corrected from stale "570" - confirmed via NVOnline
-                                # 1160245 source file (GFM: 580.173.04). Kept as a
-                                # documentation reference only as of v0.4.6 - GFM lives
-                                # on the NVSwitch tray's NVOS, not this compute host, so
-                                # the checks below no longer compare against it.
+                                # paired with Datacenter Driver 13.0.2 in both RC4 and
+                                # GA sources - unchanged by the driver version bump
 # EXPECTED_MOFED removed - confirmed via NVOnline 1160245 (full component list
 # checked) that MOFED/OFED is NOT independently versioned in this release; it
 # is absorbed into DOCA_Host (3.4.1-010000, already correct above). The
 # "MOFED Version" check below is now informational-only (no PASS/FAIL target).
-EXPECTED_DOCA="3.4.1"          # per Host Software Components matrix (3.4.1-010000)
-EXPECTED_DCGM="3.3"
-EXPECTED_MFT="4.36.0"          # per Host Software Components matrix (4.36.0-147)
-EXPECTED_BF3_FW="32.49.1118"   # per Host Software Components matrix
+EXPECTED_DOCA="3.4.1"          # per Host Software Components matrix (3.4.1-010000);
+                                # unchanged by GA (§0a)
+EXPECTED_DCGM="4.6.0"          # corrected 2026-09-14: was "3.3" since v0.1.0, an
+                                # unsourced placeholder guess that was never
+                                # actually verified against anything. GA release
+                                # notes Table 9 gives the real target: DCGM 4.6.0,
+                                # NVOnline 1139880.
+EXPECTED_MFT="4.36.0"          # per Host Software Components matrix (4.36.0-147);
+                                # unchanged by GA (§0a)
+EXPECTED_BF3_FW="32.49.1118"   # per Host Software Components matrix; unchanged by GA (§0a)
 EXPECTED_CX8_FW="40.49.1118"   # per Host Software Components matrix (CX8 entry,
-                                # NVOnline 1160245); confirmed via ibstat mlx5_5
-EXPECTED_IMEX="580.173.02"     # matches EXPECTED_DRIVER - installed via
-                                # nvidia-imex-aarch64-580.173.02.run (build log §7),
-                                # same version as the driver .run, not a separate
-                                # release train
+                                # NVOnline 1160245); confirmed via ibstat mlx5_5;
+                                # unchanged by GA - also matches GA notes' "CX8 N/S" section
+EXPECTED_IMEX="$EXPECTED_DRIVER" # matches EXPECTED_DRIVER - installed via
+                                # nvidia-imex-aarch64-<ver>.run (build log §7), same
+                                # version as the driver .run, not a separate release
+                                # train. Now derived from the variable instead of a
+                                # separate literal so a future driver bump can't leave
+                                # this one stale by omission.
+EXPECTED_FM="$EXPECTED_DRIVER" # corrected 2026-09-14 (build log §0a): the host-side
+                                # `nvidia-fabricmanager` package (§25) is sourced from
+                                # nvidia-driver-local-repo-ubuntu2404-<driver-version>
+                                # and versioned <driver-version>-1ubuntu1 - it tracks
+                                # the Datacenter Driver branch, not an independent
+                                # release train. The prior "580.173.04" value (from
+                                # NVOnline 1160245's RC4 "GFM:" field) was never this
+                                # host's actual target - see EXPECTED_GFM_NVOS below,
+                                # now confirmed as a separate, real component.
+EXPECTED_GFM_NVOS="580.173.04" # CONFIRMED 2026-09-14 via the full GA release notes PDF
+                                # (RN-11874-001_2.0.0GA), "GB300 Switch Tray > NVOS"
+                                # table - this is the actual NVSwitch-tray-side Global
+                                # Fabric Manager version, a functionally separate
+                                # component from EXPECTED_FM above (which is this
+                                # compute host's own inert nvidia-fabricmanager
+                                # package). The earlier §0a hedge ("most likely refers
+                                # to the NVOS-side FM, not confirmed") was correct and
+                                # is now directly confirmed by NVIDIA's own document,
+                                # not just inferred. Independent of EXPECTED_DRIVER -
+                                # does NOT track the compute-host driver version, has
+                                # its own release train tied to NVOS (25.02.4463 here).
+                                # Not checkable from this compute-tray host (no NVOS
+                                # access) - retained as a documented target for
+                                # whoever verifies the NVSwitch tray directly.
+# Moved here in v0.4.26 (were incorrectly declared down near the §6b Redfish
+# section in v0.4.24/v0.4.25, which broke under `set -u` since checks earlier
+# in the script - "VBIOS Version" in particular - referenced them before
+# that later assignment ever ran). Values unchanged, only the location moved.
+EXPECTED_HGX_BMC_FW="GB200Nvl-26.07-1"     # GA release notes BMC bundle, §0a
+EXPECTED_HGX_EROT_FW="01.04.0055.0000_n04" # GA release notes BMC bundle + HMC EROT, §0a
+EXPECTED_HGX_CPLD_FW="0.22"                # GA release notes HMC CPLD, §0a - HGX baseboard
+                                             # CPLD specifically, NOT the E1S drive-carrier
+                                             # board's CPLD (FW_E1S_CPLD_0/1), which has no
+                                             # documented GA target and is a different part
+                                             # entirely - see the case-match fix below (v0.4.28)
+EXPECTED_HGX_FPGA_FW="1.66"                 # GA release notes HMC FPGA field (§0b) - the
+                                             # compute-tray/HMC's own FPGA, NOT the physically
+                                             # separate NVSwitch-tray FPGA (0.24, §0b's Switch
+                                             # Tray BMC+FPGA+EROT bundle) - this host has no
+                                             # switch tray, so 0.24 would never be the right
+                                             # comparison here regardless of naming similarity
+EXPECTED_MCU_SMA_FW="0003.00.0278.0000"    # GA release notes MCU SMA Firmware, §0a
+EXPECTED_VBIOS="97.10.7D.00.16"            # GA release notes HMC "GPU" field (§0a) -
+                                             # confirmed via two independent metadata
+                                             # snapshots weeks apart: RC4 (§16) logged
+                                             # 97.10.7D.00.0D, GA logs 97.10.7D.00.16 -
+                                             # same 7D segment both times, only the last
+                                             # segment moved (plausible RC4->GA build
+                                             # increment). This host has reported
+                                             # 97.10.59.00.13 via nvidia-smi unchanged
+                                             # for the entire build - a real, unresolved
+                                             # mismatch, never compared automatically
+                                             # until now (§16 left it as awareness-only).
 
 LOGFILE=""
 while getopts "o:v" opt; do
@@ -531,6 +765,19 @@ check "IOMMU Enabled"         "[ $(ls /sys/kernel/iommu_groups/ 2>/dev/null | wc
 check "Kernel Pkgs Held (meta)"    "apt-mark showhold | grep -m1 '^linux-nvidia-64k-hwe'"
 check "Kernel Pkgs Held (image)"   "apt-mark showhold | grep -m1 '^linux-image-nvidia-64k-hwe'"
 check "Kernel Pkgs Held (headers)" "apt-mark showhold | grep -m1 '^linux-headers-nvidia-64k-hwe'"
+# Added 2026-09-14 (build log §7g). None of these three were checked anywhere
+# in this script before today, and it took a live incident to notice:
+# libnvidia-nscq sat completely unheld through this session's driver bump and
+# showed an available "upgrade" to a different major driver branch entirely
+# (615.x vs the pinned 580.x line) - not a point release, a real mismatch
+# risk. nvidia-fabricmanager and nvidia-modprobe happened to already be
+# covered (the former by the §25/§7g install procedure itself, the latter by
+# a pre-existing hold from earlier in the build) - libnvidia-nscq was the one
+# gap in an otherwise-working defense. Adding all three here so the next
+# driver bump doesn't have to rediscover this by hand.
+check "Held: libnvidia-nscq"       "apt-mark showhold | grep -m1 '^libnvidia-nscq$'"
+check "Held: nvidia-modprobe"      "apt-mark showhold | grep -m1 '^nvidia-modprobe$'"
+check "Held: nvidia-fabricmanager" "apt-mark showhold | grep -m1 '^nvidia-fabricmanager$'"
 check "unattended-upgrades"   "systemctl is-active unattended-upgrades" "inactive"
 
 # ----------------------------------------------------------------------------
@@ -553,8 +800,17 @@ check "nvcc (CUDA toolkit)"   "nvcc --version | grep release"
 check "CUDA Toolkit (meta-pkg)" "dpkg-query -W -f='\${Version}' cuda-toolkit-13-0 2>/dev/null" "$EXPECTED_CUDA_TOOLKIT"
 check "GPU Count"             "nvidia-smi --query-gpu=count --format=csv,noheader -i 0"
 check "GPU Name"              "nvidia-smi --query-gpu=name --format=csv,noheader -i 0"
-check "VBIOS Version"         "nvidia-smi --query-gpu=vbios_version --format=csv,noheader -i 0"
+check "VBIOS Version"         "nvidia-smi --query-gpu=vbios_version --format=csv,noheader -i 0" "$EXPECTED_VBIOS"
 check "Persistence Mode"      "nvidia-smi --query-gpu=persistence_mode --format=csv,noheader -i 0"
+# Added 2026-09-14 (build log §7f): "Persistence Mode" above reads current
+# GPU-level state via nvidia-smi, which can read Enabled right now even if
+# the daemon that maintains it won't survive the next reboot. Found this gap
+# the hard way - nvidia-persistenced was silently flipped to `disabled`
+# (systemd enablement, not the running state) sometime after §7e's original
+# enabled+verified confirmation, root cause not established. This checks the
+# thing "Persistence Mode" can't: whether it'll still be there after a
+# reboot, not just whether it's on right now.
+check "Persistence Daemon (enabled)" "systemctl is-enabled nvidia-persistenced" "enabled"
 check "GPU Kernel Module"     "modinfo nvidia | grep -m1 ^version"
 
 # ----------------------------------------------------------------------------
@@ -565,10 +821,14 @@ section "NVLink / NVSwitch / Fabric Manager"
 # GB300 NVL72 rack-scale design, fabric management runs on the NVSwitch
 # tray's own NVOS, not this compute host - `nvidia-fabricmanager`/
 # `nv-fabricmanager` are not expected to exist here at any bring-up stage,
-# racked or not. Verify GFM version (target: $EXPECTED_FM) on the
-# NVSwitch/NVOS side of bring-up instead.
+# racked or not.
+# Corrected 2026-09-14 (build log §0a): EXPECTED_FM now tracks EXPECTED_DRIVER
+# and describes this host's own (non-functional, future-proofing-only)
+# nvidia-fabricmanager package - it is NOT a confirmed target for the
+# NVSwitch tray's actual NVOS-side Fabric Manager, which is a separate
+# component this script can't see and whose GA version isn't confirmed here.
 note_na "Fabric Manager Service" "runs on NVSwitch tray (NVOS), not this host"
-note_na "Fabric Manager Version" "verify via NVOS, target $EXPECTED_FM"
+note_na "Fabric Manager Version" "NVOS-side target confirmed via GA release notes: ${EXPECTED_GFM_NVOS} - not checkable from this compute host, verify directly on the NVSwitch tray once racked"
 # v0.4.18: defense-in-depth for the build log §25 precaution (pre-install +
 # mask nvidia-fabricmanager here, purely as future-proofing against a
 # cm-create-image BCM finalize-stage failure if this layout is ever used as
@@ -582,10 +842,22 @@ note_na "Fabric Manager Version" "verify via NVOS, target $EXPECTED_FM"
 # fabricmanager` if this is ever adapted for a differently-sourced package.
 if dpkg-query -W -f='${Status}' nvidia-fabricmanager 2>/dev/null | grep -q "ok installed"; then
   fm_unit_state=$(systemctl is-enabled nvidia-fabricmanager 2>&1)
+  fm_installed_ver=$(dpkg-query -W -f='${Version}' nvidia-fabricmanager 2>/dev/null | grep -oP '^[0-9.]+')
   if [[ "$fm_unit_state" == "masked" ]]; then
     ROWS+=("Fabric Manager Package (if present)|installed, correctly masked|OK")
   else
     ROWS+=("Fabric Manager Package (if present)|installed but NOT masked (state: ${fm_unit_state}) - see build log §25|CHECK")
+  fi
+  # New 2026-09-14 (build log §0a): this package tracks the driver branch, so
+  # a mismatch here means it was installed against a different driver than
+  # what's currently on the box - a real drift worth catching, separate from
+  # the masking check above.
+  if [[ -n "$fm_installed_ver" ]]; then
+    if [[ "$fm_installed_ver" == "$EXPECTED_FM" ]]; then
+      ROWS+=("Fabric Manager Package Version|${fm_installed_ver}|OK")
+    else
+      ROWS+=("Fabric Manager Package Version|${fm_installed_ver} (expected ${EXPECTED_FM} - does not match current driver, see §0a)|CHECK")
+    fi
   fi
 else
   note_na "Fabric Manager Package (if present)" "not installed - fine, this precaution is optional/future-proofing only (§25)"
@@ -678,6 +950,39 @@ check "Default Runtime = nvidia" "docker info 2>/dev/null | grep -m1 'Default Ru
 # -k (skip TLS verify) is standard for BMC Redfish since they commonly run
 # self-signed certs - flagged here explicitly rather than silently bypassed.
 # ----------------------------------------------------------------------------
+# v0.4.24 2026-09-14 (build log §0a/§7g): previously every matched component
+# just reported OK unconditionally - there was no GA-sourced target to
+# compare against when this section was written. §0a now documents real GA
+# targets for BMC core and EROT, and this run's own output confirmed both
+# are actually stale (BMC: GB200Nvl-25.09-2 vs GA's GB200Nvl-26.07-1; EROT:
+# 01.04.0031.0000_n04 vs GA's 01.04.0055.0000_n04, all 5 instances) - a real
+# drift this section was silently reporting as OK. Added expected-version
+# comparison for BMC/EROT/CPLD by component-id pattern. Also expanded the
+# keyword filter to add SMA|GPU: this run's actual output (FW_BMC_0,
+# FW_E1S_CPLD_0/1, HGX_FW_BMC_0, HGX_FW_CPLD_0, HGX_FW_ERoT_*, HGX_FW_FPGA_0/1)
+# never surfaced an SMA or HMC-GPU entry at all under the old
+# CPLD|EROT|HMC|BMC|FPGA filter - confirming the gap flagged when §0a's MCU/
+# HMC baseline was first documented. Whether that's because this unit's BMC
+# genuinely has no separately-named SMA/GPU FirmwareInventory member, or
+# because it exists under a name still not covered, is NOT yet known -
+# expanding the filter is necessary but not sufficient to confirm either way.
+# EXPECTED_HGX_BMC_FW / EXPECTED_HGX_EROT_FW / EXPECTED_HGX_CPLD_FW /
+# EXPECTED_MCU_SMA_FW / EXPECTED_VBIOS are declared up in the main "§0.
+# Config: expected versions" block near the top of this script, alongside
+# every other EXPECTED_* variable - NOT here. (v0.4.24/v0.4.25 originally
+# declared them at this point instead, which broke under `set -u`: the
+# "VBIOS Version" check that references EXPECTED_VBIOS runs much earlier,
+# in the NVIDIA Driver/CUDA/GPU section - referencing a variable before it's
+# ever assigned is a hard "unbound variable" error regardless of where in
+# the file it's assigned later. Fixed in v0.4.26 by moving the declarations,
+# not by relaxing `set -u`.)
+# EXPECTED_HGX_GPU_FW removed 2026-09-14 - was NOT a separate out-of-band
+# Redfish component as originally assumed. Confirmed: the GA release notes'
+# HMC table "GPU" field is VBIOS, in NVIDIA's raw-hex notation - same field
+# nvidia-smi already reports via "VBIOS Version". Also consistent with why
+# no "GPU"-matching component ever appeared in any live Redfish run this
+# session - it was never going to, this isn't how VBIOS is exposed there.
+# ----------------------------------------------------------------------------
 section "Out-of-Band Firmware (Redfish)"
 BMC_USER="${BMC_USER:-root}"
 BMC_PASS="${BMC_PASS:-0penBmc}"   # MaxQ factory default - override via env var
@@ -694,7 +999,7 @@ else
   BMC_FW_URIS=$(curl -sk -u "${BMC_USER}:${BMC_PASS}" -X GET \
     "https://${BMC_IP}/redfish/v1/UpdateService/FirmwareInventory" 2>/dev/null \
     | jq -r '.Members[]?."@odata.id"' 2>/dev/null \
-    | grep -iE 'CPLD|EROT|HMC|BMC|FPGA')
+    | grep -iE 'CPLD|EROT|HMC|BMC|FPGA|SMA')
 
   if [[ -z "$BMC_FW_URIS" ]]; then
     note_na "Out-of-Band FW (CPLD/EROT/HMC/FPGA)" "BMC IP=$BMC_IP found but Redfish query failed - check creds/reachability"
@@ -706,7 +1011,47 @@ else
       comp_id=$(echo "$comp_json" | jq -r '.Id // empty' 2>/dev/null)
       comp_ver=$(echo "$comp_json" | jq -r '.Version // empty' 2>/dev/null)
       if [[ -n "$comp_id" && -n "$comp_ver" ]]; then
-        ROWS+=("Out-of-Band FW: ${comp_id}|${comp_ver}|OK")
+        # Match against a known GA target by component-id pattern, where one
+        # exists. Fixed in v0.4.28: every pattern anchored to the confirmed
+        # "HGX_FW_" prefix instead of loose substrings. The old bare "*CPLD*"
+        # pattern was a real bug, not just imprecise - it matched
+        # FW_E1S_CPLD_0/1 (the E1S NVMe drive-carrier board's own CPLD, a
+        # completely different, unrelated part) and compared it against the
+        # HGX baseboard's CPLD target, producing a false "CHECK" mismatch
+        # for two unrelated components rather than a real finding. Caught by
+        # a live run showing "FW_E1S_CPLD_0: 0b.04.02 (expected 0.22)" - that
+        # 0.22 target was never meant for this component at all. Order still
+        # matters: EROT before BMC, since "HGX_FW_ERoT_BMC_0" would otherwise
+        # match a plain BMC pattern first.
+        comp_expected=""
+        case "$comp_id" in
+          HGX_FW_ERoT_*) comp_expected="$EXPECTED_HGX_EROT_FW" ;;
+          HGX_FW_CPLD_*) comp_expected="$EXPECTED_HGX_CPLD_FW" ;;
+          HGX_FW_FPGA_*) comp_expected="$EXPECTED_HGX_FPGA_FW" ;;
+          HGX_FW_SMA_*)  comp_expected="$EXPECTED_MCU_SMA_FW" ;;
+          HGX_FW_BMC_*)  comp_expected="$EXPECTED_HGX_BMC_FW" ;;
+          # GPU pattern deliberately not matched here - see EXPECTED_VBIOS
+          # comment in §0: the GA "GPU" field is VBIOS, checked against
+          # nvidia-smi directly below, not something exposed via this
+          # Redfish FirmwareInventory endpoint on this unit.
+          # Deliberately NOT matched: bare FW_BMC_0 (this unit's baseboard
+          # BMC itself, e.g. "carlonext-bmc_0.80.07") - different versioning
+          # scheme entirely from the GB200Nvl-x.x GA target, no GA-sourced
+          # comparison value exists for it. FW_E1S_CPLD_0/1 (the E1S drive-
+          # carrier board's own CPLD - a different, unrelated part from the
+          # HGX baseboard CPLD) is correctly excluded by the HGX_FW_ prefix
+          # requirement above, not just "unconfirmed" - no GA target exists
+          # for this component and none should be applied to it.
+        esac
+        if [[ -n "$comp_expected" ]]; then
+          if [[ "$comp_ver" == "$comp_expected" ]]; then
+            ROWS+=("Out-of-Band FW: ${comp_id}|${comp_ver}|OK")
+          else
+            ROWS+=("Out-of-Band FW: ${comp_id}|${comp_ver} (expected ${comp_expected} per GA §0a)|CHECK")
+          fi
+        else
+          ROWS+=("Out-of-Band FW: ${comp_id}|${comp_ver}|OK")
+        fi
         BMC_FW_FOUND=1
       fi
     done <<< "$BMC_FW_URIS"
@@ -738,8 +1083,14 @@ else
   ROWS+=("Stale CUDA Repo Pkg|not installed - clean (§22a)|OK")
 fi
 
-if dpkg-query -W -f='${Status}' nvidia-driver-local-repo-ubuntu2404-580.173.02 2>/dev/null | grep -q "ok installed"; then
-  ROWS+=("Stale NVIDIA Driver Repo Pkg|installed - ~573M under /var, purge per §22a (apt purge nvidia-driver-local-repo-ubuntu2404-580.173.02)|CHECK")
+# Package name parameterized on EXPECTED_DRIVER as of 2026-09-14 (build log
+# §0a) - was hardcoded to the RC4-era 580.173.02 suffix, which would have
+# silently stopped matching anything real the moment the driver bumped to
+# GA's 580.173.10 (false "clean" reading, not because the repo pkg was
+# actually gone, but because the check was looking for the wrong name).
+driver_repo_pkg="nvidia-driver-local-repo-ubuntu2404-${EXPECTED_DRIVER}"
+if dpkg-query -W -f='${Status}' "$driver_repo_pkg" 2>/dev/null | grep -q "ok installed"; then
+  ROWS+=("Stale NVIDIA Driver Repo Pkg|installed - ~573M under /var, purge per §22a (apt purge ${driver_repo_pkg})|CHECK")
 else
   ROWS+=("Stale NVIDIA Driver Repo Pkg|not installed - clean (§22a)|OK")
 fi
