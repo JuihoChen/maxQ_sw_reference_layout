@@ -802,3 +802,534 @@ Then run 8.4 (mount cleanup — mandatory), optionally 8.5, then 8.6 to commit.
 - `ldap` FAIL (`id: 'cmsupport': no such user`) — **confirmed** direct regression from the old 8.8 `nsswitch.conf` fix (now removed from the SOP — see 8.8 and "Still-open, non-blocking items" for full detail and candidate revised fixes). Not an open question anymore; a non-regressing replacement fix is what's still needed.
 - `gpu_health_overall` FAIL despite all four per-GPU sub-checks (`gpu0`-`gpu3`) showing PASS — cause not yet identified, worth pulling the detailed reason via cmsh rather than assuming it's transient.
 
+
+---
+
+## 9. Addendum — `baseos-1032-doca341` build session (2026-09-16)
+
+**Context:** first production run of the SOP in Section 8 against a new reference archive, `maxQ20GA-1032-doca341-baseos.tgz` (kernel `6.17.0-1032-nvidia-64k`, DOCA `3.4.1-010000`) — the first DOCA 3.4.1-line archive to go through this SOP for real, as opposed to the 3.2.1-line `maxQ106` archive Section 8 was originally written against. Findings below are new information this archive surfaced; where they contradict or add nuance to Section 6/8, this section is authoritative until merged back.
+
+**Path correction:** reference archives on this head node live at `/root/pre-built-images/`, not `/root/bcm-image-export/` as Section 6 assumed. Confirm actual path per-site before following Section 6/8 literally.
+
+### 9a. Duplicate CUDA repo conflict — confirmed reproducible on this archive, and confirmed NOT fixable by chroot edit alone
+
+Building `baseos-1032-doca341` **without** `--no-cm-cuda-repo` fails at "Validating repo configuration" → `Failure getting installed package list`, identically to the `6e` finding on `maxQ106`/`1014`-doca321: `cm-cuda-ubuntu2404-sbsa.list` and `cuda-ubuntu2404-sbsa.list` both present, `Signed-By` conflict on the same CUDA sbsa URL.
+
+**Confirmed reproducible** across two independent from-archive builds (including a full teardown + `rm -rf` + fresh `-a`), not a one-off.
+
+**New finding, not previously documented:** removing the duplicate `.list` file via `cm-chroot-sw-img` and then resuming with `cm-create-image -d ...` did **not** survive — the build failed at the identical "Validating repo configuration" step again on resume. `apt list --installed` was confirmed clean (no `Signed-By` error) immediately before the resume, so the file was correctly removed; something in the resume path (most likely "Copying cm repo files," which is confirmed to run again on `-d` resume — see 6h/8.6 for the general pattern of this stage re-running) appears to re-inject the BCM `cm-cuda-...` file before validation runs. **Not root-caused — worth confirming directly next session** (diff `/etc/apt/sources.list.d/` immediately before and after a `-d` resume's "Copying cm repo files" stage to catch it in the act).
+
+**Working fix for this archive:** build with `--no-cm-cuda-repo` from the start rather than removing-and-resuming. Confirmed to avoid the conflict entirely (see 9b) — the CUDA sbsa repo itself remains enabled and functional (`apt-cache policy` still shows real candidates from `developer.download.nvidia.com`), only the conflicting BCM-injected duplicate is avoided.
+
+**Open question:** whether `--no-cm-cuda-repo` is *why* the duplicate is never injected (i.e. it's the correct standing fix), or whether it's coincidental and the real fix is elsewhere (e.g. a "Copying cm repo files" bug that only manifests when the CUDA network repo is otherwise enabled). Treat `--no-cm-cuda-repo` as the working answer for this archive until proven otherwise, but don't assume it explains the mechanism.
+
+### 9b. `--no-cm-cuda-repo` validated as safe for this archive — driver ships pre-baked, not via apt
+
+Per the `6l`/8.2 caveat (this flag previously caused `nvidia-open-580`/`nvidia-imex`/`nvidia-kernel-common-580` to be silently skipped on a *different* build), this was checked directly rather than assumed:
+
+```bash
+cm-chroot-sw-img /cm/images/baseos-1032-doca341
+apt-cache policy nvidia-open-580 nvidia-imex nvidia-kernel-common-580   # all "Installed: (none)" — expected here
+dkms status                                                              # nvidia/580.173.10 installed, full OFED stack installed, against 6.17.0-1032
+dpkg -l | grep -iE "nvidia|doca-host|mlnx-ofed"                          # doca-host 3.4.1-010000 present
+exit
+```
+
+**Result: benign.** The working driver (`580.173.10`) and full DOCA 3.4.1 stack are already present and correctly built via DKMS against the image's actual kernel — the archive ships its own driver, matching the pattern already established for `maxQ106`. The apt packages showing "not installed" is expected here, not the silent-skip failure. **Lesson for future archives: `apt-cache policy` alone cannot distinguish "flag skipped something needed" from "driver was never meant to come from here" — always cross-check with `dkms status` + `dpkg -l` for the actual driver/DOCA packages before trusting either flag setting on a new archive.**
+
+**Cosmetic-only finding:** the `xpmem` package version string read `2604.0.2-1.kver.6.17.0-1029-nvidia-64k` — referencing kernel `1029`, not this image's actual `1032`. `dkms status` confirmed the real module is correctly built against `1032`; this is stale package-naming metadata only, same category as the known `nvidia-fabricmanager` version-string mismatch in `6k`. Not a defect, not investigated further.
+
+### 9c. Fabric Manager mask — already baked into this archive
+
+```bash
+ls -la /etc/systemd/system/nvidia-fabricmanager.service
+# -> /dev/null, dated Sep 14 15:41
+```
+Confirmed already present without any manual chroot intervention — this archive's source tarball already carries the masked-unit override, same as the updated `maxQ106` archive per `6k`'s "UPDATE 2026-08-25" note. No action needed for this or future builds from this same archive.
+
+`nvidia-fabricmanager` itself shows as **installed** (`hi`, version `580.173.10-1ubuntu1`) despite being masked — consistent with `6k`'s finding that the package can be present and masked simultaneously with no functional issue; don't treat the installed-and-masked combination as contradictory.
+
+### 9d. New evidence for the open `dgx_gb200` vs `dgx_gb300` question
+
+Near the end of a successful `dgx_gb300` build, this non-fatal warning appeared:
+```
+running command: '.../bcm-dgx-software-image-kernel-param-syncer --dgx-platform dgx_gb300 --show-only ...'
+E | Unable to determine the correct method for collecting kernel parameters. Exiting!
+```
+This did not fail the build (logged as an error, build proceeded to `[OK]`). Notable because this tool's job — "obtain proper kernel parameters" — is exactly what `--dgx-type`'s own `--help` text says the flag controls. This is new, direct evidence relevant to the still-open `6l` question (which `--dgx-type` value is actually correct for GB300 NVL hardware) and should be included in the NV escalation report (Section 5) alongside the existing open questions. Does not resolve the question on its own — worth asking NV specifically why this tool can't determine a method under `dgx_gb300`.
+
+### 9e. Session outcome
+
+`baseos-1032-doca341` built successfully end-to-end with `--dgx-type dgx_gb300 -s --no-cm-cuda-repo`. Bind9/slapd non-fatal finalize messages reproduced as expected (`6j` pattern), no new variant. Image not yet assigned to a category or provisioned to nodes as of this writing — Section 2 (SOP) pre-provisioning checks are the next step.
+
+**Still open / carried forward, not resolved by this session:**
+- Section 9a's resume-doesn't-stick mechanism (why "Copying cm repo files" appears to re-add the duplicate on `-d` resume).
+- Whether `--no-cm-cuda-repo` is required by mechanism or coincidence for this archive.
+- The `dgx_gb200`/`dgx_gb300` correctness question — now has one more data point (9d), still not NV-confirmed.
+- Section 4's Phase 1/2 blocking items (ntp/chrony, ldap/nsswitch regression, swap.img) — not touched this session, still open exactly as documented there.
+
+### 9f. SOP correction: `-d` commit step is not part of the standard path
+
+Re-reviewing the successful `baseos-1032-doca341` build log (9e): `cm-create-image -a ... -s --no-cm-cuda-repo` completed **all** stages through "Adding/Updating software image" in a single invocation — no chroot session, no `-d` resume was used or needed. The SOP's Section 1.4 (`cm-create-image -d ... -n ... -s ...`) had been written as an unconditional standard step, inherited from the `maxQ106` narrative in Section 6 where a `-d` resume genuinely was needed (after the 6d/6e manual chroot fixes). That precondition no longer applies now that the standard `--no-cm-cuda-repo` path avoids those fixes entirely (9a/9b).
+
+**Correction:** treat `-d` commit as conditional, not routine — only needed if a chroot session actually modified the image (a fix was applied). Running it unconditionally on an already-complete image re-triggers "Installing CM packages" and the rest of the pipeline for no reason, costing time and risking hitting a new problem on an image that was already good. The verification chroot session (dkms status / dpkg checks, no writes) does **not** require a commit afterward — only the mandatory mount cleanup (`umount -l` loop), since it did open `/dev`/`/proc`/`/sys` bind mounts even though it made no changes.
+
+### 9g. Pre-provisioning check 2.1 — already satisfied on this archive
+
+`/etc/network/interfaces.d/` and `/etc/ntpsec/` are both already present (empty, dated Aug 26 18:06) on `baseos-1032-doca341` — no `mkdir -p` fix needed for this archive, unlike the original `maxQ106`/`1014`-doca321 archive where 6/8.7 found them missing. Consistent with 9c/9f: `maxQ20GA`-line archives appear to have several of the manual `maxQ106`-era fixes already baked in upstream. Don't assume this holds for a future archive without checking — verify per-archive as the SOP's Section 2.1 already directs.
+
+### 9h. SOP gap: category creation was never a documented step
+
+Reached Section 2 (pre-provisioning checks) for `baseos-1032-doca341` and found no BCM category exists yet for this rack/archive line — Section 2's `cmsh -c "category use <category-name>; get ..."` checks all assume the category is already there, true for the original `maxQ106`/`maxQ-1014-doca321` work but never explicit as a prerequisite. Added as new Section 2.0 to the SOP (`cmsh` → `category` → `add <category-name>` → `commit`).
+
+**Follow-on for this rack:** since the category is new, Section 2.1–2.3 won't be "verify existing config" checks — `disksetup` and `finalizescript` will need to be set for the first time, not confirmed. Expect this on any brand-new category, not just this one. Category name used for this rack: **[fill in once chosen]**.
+
+### 9i. Category setup — cloned from `maxQ-1029-doca341`, not built from scratch
+
+For `baseos-1032-doca341`, cloned the existing `maxQ-1029-doca341` category rather than building a new one from blank (see 9h) — faster and avoids retyping the validated `disksetup` XML:
+
+```bash
+cmsh
+% category
+% clone maxQ-1029-doca341 maxQ-1032-doca341
+% commit
+% category use maxQ-1032-doca341
+% set softwareimage baseos-1032-doca341
+% commit
+```
+
+**Confirmed via `get disksetup` / `get finalizescript` / `get softwareimage` after cloning:**
+- `disksetup` carried over correctly — same validated 3-partition layout (`efi`/`boot1`/`slash1` on `/dev/nvme0n1`) already in use on `maxQ-1029-doca341` and `maxQ-1014-doca321`.
+- `finalizescript` carried over correctly — the v3 hostname fix (writes to `/localdisk/etc/hosts`, matches `CMD_HOSTNAME`/`hostname` fallback, idempotent). Confirms the v3 script is now standard practice across at least two categories, not a one-off applied only to `maxQ-1014-doca321`.
+- `softwareimage` correctly repointed to `baseos-1032-doca341` after the explicit `set` — cloning does **not** auto-update this, has to be set manually per new image.
+
+**Note for the SOP:** cloning an existing, known-good category (rather than Section 2.0's blank `add`) is the preferred path whenever a suitable source category already exists — only `softwareimage` needs changing afterward. Blank `add` + manual `disksetup`/`finalizescript` should be reserved for the first-ever category on a cluster with no prior validated example to clone from.
+
+Category name for this rack, for reference: **`maxQ-1032-doca341`**.
+
+### 9j. Image verification (Section 4 checklist) — confirmed clean on `baseos-1032-doca341`, one known issue reconfirmed
+
+Ran the full post-build verification checklist against the image directly (before node provisioning):
+- Kernel: only `6.17.0-1032-nvidia-64k` present (`hi`), no stray kernel — clean.
+- `/boot/vmlinuz`/`initrd` present and correctly linked.
+- `dkms status`: `nvidia/580.173.10` + full OFED/mlnx stack, all `installed` against `6.17.0-1032-nvidia-64k` — matches 9b.
+- Fabric Manager: `-> /dev/null`, confirmed masked — matches 9c.
+- `/etc/network/interfaces.d/` and `/etc/ntpsec/` present — matches 9g.
+- `dpkg -l | grep -i -E "^ii\s+(ntp|chrony)"` → **empty**. Confirms the known `ntp` health-check issue (Section 4/5 of the SOP, originally found on `maxQ106`/`1014`-doca321) also applies to this archive — chrony is missing here too, not just on the older image. **Do not apply the drafted-but-unvalidated chrony fix to this image ad hoc** — same escalate-don't-patch guidance as the original finding applies here.
+
+**Conclusion:** image validated and ready for node assignment, with the pre-existing `ntp` health-check failure expected to reproduce on this rack's nodes post-provisioning — not a new issue, no action needed beyond what's already tracked.
+
+### 9k. `systemd-timesyncd` pre-disabled by default — confirmed on this archive too
+
+Applying the chrony fix (Section 5 known issue) to `baseos-1032-doca341`, `systemd-timesyncd` was found already `disabled` via `systemctl is-enabled systemd-timesyncd`, **before** any explicit `disable`/`mask` command was run and independent of the `chrony` install. Confirms this is not a `chrony`-install side effect but the same pre-disabled default already documented in §8.13 for the `1014`/DOCA-3.2.1 image — part of the same intentional-hardening pattern (`shorewall`/`auditd` also pre-disabled), just without a working time-sync replacement baked in. Consistent across at least two archive lines now.
+
+Explicit `disable`/`mask` commands were still run regardless, to make the end state certain rather than relying on this default holding on a future archive.
+
+### 9l. `/tmp` permissions issue is general to this chroot, not fabricmanager-specific
+
+The known `chmod 1777 /tmp && rm -rf /tmp/*` prerequisite (originally documented only in the fabricmanager fix, 6d/6g) was also required before `apt-get install -y chrony` would run cleanly on `baseos-1032-doca341` — same `Couldn't create temporary file /tmp/apt.conf.XXXXXX for passing config to apt-key` error. **Correction to the standing knowledge:** this is not a fabricmanager-specific workaround — it's a precondition for *any* `apt-get` operation inside `cm-chroot-sw-img` on this image (and likely any image with the same `/tmp` permission state). Treat `chmod 1777 /tmp && rm -rf /tmp/*` as a standard first step before *any* apt-get inside a chroot session on this archive line, not just when installing `nvidia-fabricmanager-580`.
+
+### 9m. Chrony install findings on `baseos-1032-doca341`
+
+**`apt-get install chrony` fully removed `systemd-timesyncd` as a package**, not just left it disabled — apt resolved it as a conflicting package and removed it outright during the chrony install. Different from the pre-disabled-but-present state seen in 8.13's original finding on the `1014`/DOCA-3.2.1 image. Functionally equivalent end state (timesyncd gone/masked either way) — `systemctl mask systemd-timesyncd` run afterward still succeeded and created the `-> /dev/null` symlink even with the package already removed. Worth noting for future archives: don't assume the package will still be present after installing chrony.
+
+**"Pending kernel upgrade!" false-alarm reproduced during this install** — apt's post-install scan reported running kernel `6.8.0-106-generic` vs. expected `6.17.0-1032-nvidia-64k`. Same known non-issue as 6d/6g: this is the **head node's** kernel identity leaking through `uname -r` inside any chroot, unrelated to the image's actual kernel (already independently confirmed correct via `dpkg -l`/`dkms status`). Confirms this false alarm isn't specific to the fabricmanager install — it fires on any package operation that triggers a kernel-scan hook inside `cm-chroot-sw-img`.
+
+**New mount-cleanup gotcha: `exit` did not auto-unmount this session** — every prior `cm-chroot-sw-img` session in this build printed `unmounted ...` lines automatically on `exit`; this one did not. A `mount | grep <image-name>` check from the head node afterward found two mounts the standard 1.3/8.4 cleanup loop doesn't cover:
+- `var/tmp/<random>` tmpfs — already a known-acceptable leftover (8.12), low risk.
+- **`sys/firmware/efi/efivars` (`efivarfs`), nested under `/sys`** — not previously documented anywhere in this SOP/log. Needs to be unmounted **before** `/sys` itself in the cleanup sequence, or the `/sys` unmount may not fully release.
+
+**Updated standing mount-cleanup sequence, going forward:**
+```bash
+umount -l /cm/images/<image-name>/sys/firmware/efi/efivars
+umount -l /cm/images/<image-name>/var/tmp/* 2>/dev/null
+for m in dev/pts dev proc sys run/systemd/resolve/resolv.conf run; do
+  umount -l "/cm/images/<image-name>/$m" 2>/dev/null
+done
+mount | grep <image-name>   # var/tmp entry may still linger (known-acceptable); nothing else should
+```
+Root cause of why `exit`'s auto-unmount didn't fire this time is not established — possibly related to the nested `efivarfs` mount blocking the normal teardown order. Worth watching whether this recurs on the next chroot session against this same image, or only happened once.
+
+**Cleanup confirmed successful (2026-09-16):** after running the updated sequence in 9m (efivarfs → var/tmp → standard loop), `mount | grep baseos-1032-doca341` returned completely empty — no lingering mounts at all, including the var/tmp scratch entry that's normally expected to persist. Sequence works as written; promote it to the SOP's standard mount-cleanup step.
+
+### 9n. `rack08` explicitly re-provisioned from `maxQ-1029-doca341` to `maxQ-1032-doca341`
+
+**Confirmed via `cmsh -c "device; list"` before any change was made:** all 18 `rack08node01`–`rack08node18` were live and `[UP]` under category `maxQ-1029-doca341` at the time this decision was made (all showing `health check failed`, consistent with the already-tracked known issues — not a new problem introduced by this decision).
+
+**Explicit instruction received to re-provision this same physical rack onto `maxQ-1032-doca341`** — this is a deliberate reuse of already-in-service hardware for the new DOCA 3.4.1/kernel-1032 image, not a fresh/unused rack. Recorded here for traceability given the operational significance (18 previously-running nodes taken down and reinstalled).
+
+**Nodegroup created for this purpose:**
+```
+nodegroup clone rack01group → rack08group
+set nodes rack08node01..rack08node18
+commit
+```
+
+**Category reassignment:**
+```
+device foreach -g rack08group (set category maxQ-1032-doca341)
+commit
+```
+Category change alone does not reboot/reinstall nodes — `installmode FULL` + a reboot (IPMI/PXE) is still required to actually trigger reinstallation. Not yet executed as of this log entry.
+
+### 9o. `installmode FULL` confirmed inherited from category, no per-device override needed
+
+`cmsh -c "category use maxQ-1032-doca341; get installmode"` → `FULL`, carried over correctly from the `maxQ-1029-doca341` clone (9i). Nodes in `rack08group` will pick this up automatically on next boot — no need to set `installmode` per-device, consistent with the "verify what a clone actually carried over" pattern already established for `disksetup`/`finalizescript`.
+
+Category reassignment for `rack08group` → `maxQ-1032-doca341` committed successfully (9n); all 18 nodes flagged `restart required (category)`, still up on their prior install, awaiting reboot to trigger reinstall.
+
+### 9p. New: peer-provisioning role setup for `rack08node01` (not previously documented anywhere in this SOP/log)
+
+For this rack's rollout, `rack08node01` was designated as a local provisioning source for the other 17 nodes in `rack08group`, to test/use peer-to-peer image transfer instead of every node pulling from the head node directly.
+
+**Role name confirmed via `roles; assign` (no argument) → usage list:** `provisioning` (not `provisioningnode` or similar — confirmed against this BCM version's actual command help rather than assumed).
+
+**Assign:**
+```bash
+cmsh
+% device use rack08node01
+% roles
+% assign provisioning
+% commit
+```
+First commit succeeded but warned: `The provisioning role does not contain any images.` — expected, role has no scope configured yet at this point.
+
+**Scope the role — properties confirmed via `set` (no argument) → parameter list:** `localimages`, `sharedimages`, `allimages`, `categories`, `nodegroups`, `racks`, etc.
+```bash
+% set localimages baseos-1032-doca341
+% set categories maxQ-1032-doca341
+% commit
+```
+**Confirmed via `roles; use provisioning; show` afterward:** `Local images: baseos-1032-doca341`, `Categories: maxQ-1032-doca341` — correctly scoped to only this rack's new image/category, not left as `allimages`.
+
+**Important sequencing constraint, not yet executed as of this log entry:** `rack08node01` does not yet have `baseos-1032-doca341` actually installed on itself — none of the 18 nodes have been rebooted onto it yet. A `provisioning` role serving an image the node doesn't locally have yet has nothing to serve. Correct order for this exercise:
+1. Reboot `rack08node01` alone first — it installs from the head node (only provisioning source available at that point).
+2. Confirm `rack08node01` comes up healthy on `baseos-1032-doca341`.
+3. Reboot the remaining 17 `rack08group` nodes — they should now be able to peer off `rack08node01` per the role config above, instead of all 17 pulling from the head node simultaneously.
+
+Not yet validated whether peer-to-peer selection actually happens automatically once the role is set (vs. requiring additional config elsewhere, e.g. network/category-level provisioning-source preference) — worth confirming once node 2+ actually starts provisioning, by checking which source IP their node-installer logs show pulling the image from.
+
+### 9q. Redfish PXE boot-source override for `rack08node01` — 1G port identified, one-shot only (hard constraint)
+
+**BMC:** `10.141.8.101` (Redfish, NVIDIA OEM BMC — `CARLO_NEXT-T1`, `System_0` is the correct `ComputerSystem` resource; `HGX_Baseboard_0` is a separate, non-bootable baseboard endpoint — don't confuse the two).
+
+**1G port confirmed via boot-option enumeration, matched against user-supplied MAC:** `48:21:0B:88:08:8D` → `Boot0002` (`UEFI PXEv4 (MAC:48210B88088D)`). A second MAC, `1ECCEB9AB272`, also appears in the boot options (Boot0004–0007) routed through a `USB(...)` device path in `UefiDevicePath` — pattern suggestive of a USB-attached/BMC-shared virtual NIC rather than a physical DPU port, but **not independently confirmed** which physical adapter (BF3 vs. onboard LOM vs. BMC-shared) either MAC actually belongs to. `EthernetInterfaces` and `NetworkAdapters` Redfish collections both returned `ResourceNotFound` on this BMC — not exposed, couldn't cross-check that way.
+
+**BCM's own interface record for this node is unhelpful for this purpose:** `cmsh -c "device use rack08node01; interfaces; use enP5p9s0; show"` shows `MAC 00:00:00:00:00:00` — BCM does not have the real MAC recorded for the provisioning interface (likely populated at first successful DHCP/PXE, not before). Cannot cross-check the 1G-port identification against BCM's own record for this reason.
+
+**User's real-world operational experience:** boot takes ~3 extra minutes when the 1G port isn't explicitly prioritized, attributed to BF3 being attempted first. Not yet reconciled precisely against the Redfish `BootOrder` evidence, which shows local disk (`Boot000C`)/NVMe (`Boot0001`) ranked *before any* PXE entry, and `Boot0002` (1G, `48210B88088D`) ranked before the `1ECCEB9AB272` entries. Plausible the delay is from local-boot-device attempts rather than BF3-before-1G specifically — not confirmed either way. **Action item for next session: watch the console/node-installer log timing during the actual override boot to determine the real cause of the delay, rather than assuming.**
+
+**Command used — explicitly one-shot, `BootOrder` itself never modified:**
+```bash
+curl -k -u root:0penBmc -X PATCH \
+  -H "Content-Type: application/json" \
+  -d '{"Boot": {"BootSourceOverrideEnabled": "Once", "BootSourceOverrideTarget": "Pxe"}}' \
+  https://10.141.8.101/redfish/v1/Systems/System_0
+```
+**Hard constraint, explicitly required by the user: this override must never be made persistent.** `BootSourceOverrideEnabled: "Once"` is required — `"Continuous"` must not be used for this purpose. `BootSourceOverrideTarget` on this BMC only supports the generic `Pxe` value (enum: `None/Pxe/Hdd/Cd/BiosSetup/Usb` — no `UefiTarget`/`BootNext`-style specific-entry targeting), so which exact PXE NIC it resolves to is inferred from `BootOrder` position, not explicitly forced. If this BMC's firmware ever needs the boot order changed to reliably land on the 1G port, that would be a **persistent** `BootOrder` change — explicitly out of scope for this exercise and would need separate, explicit sign-off before being done, not folded into a "PXE override" request.
+
+### 9r. Redfish one-shot PXE override — confirmed effective; ~3.5 min delay appears to be POST/PXE-boot time, not BF3-vs-1G ordering
+
+**Override consumption confirmed:** `BootSourceOverrideEnabled`/`Target` reverted from `Once`/`Pxe` back to `Disabled`/`None` on its own after the reboot — firmware honored the one-shot override (via `ipmitool -I lanplus ... chassis power cycle`, not a Redfish-native reset action) rather than ignoring it.
+
+**DHCP log for the reboot window (`journalctl -u dhcpd`) shows only one MAC involved — `48:21:0b:88:08:8d`, the confirmed 1G port:**
+```
+19:21:09  DHCPRELEASE  (from 88:08:8d — OS releasing lease during shutdown, pre-power-cycle)
+19:22:58  DHCPDISCOVER (from 88:08:8d — PXE attempt begins)
+19:23:02  DHCPOFFER/DHCPREQUEST/DHCPACK (from 88:08:8d — handshake completes in 4s)
+19:24:46  [INSTALLING] (node-installer started, per cmsh event log)
+```
+**No DHCPDISCOVER from any other MAC appears in this window** — no direct evidence the BF3 (or any other NIC) was attempted first. This is real evidence the 1G-priority override worked as intended.
+
+**Timeline breakdown:**
+- `19:21:09` → `19:22:58` (~1m49s): pre-PXE POST/firmware init, before any DHCP attempt at all.
+- `19:22:58` → `19:24:46` (~1m48s): PXE handshake (fast, ~4s) + TFTP/kernel-initrd download + node-installer startup.
+- **Total ~3m37s, matching the user's previously-reported "~3 minutes" experience.**
+
+**Conclusion — tentative, worth confirming on a second boot before treating as settled:** the delay appears to be normal POST + PXE-software-boot time on this hardware platform, **not** evidence of BF3 being attempted before the 1G NIC. If so, the 1G-priority Redfish override, while working exactly as designed, may not actually reduce the ~3-minute figure — that time was likely never attributable to NIC ordering in the first place. **Open item: compare this timing against a boot *without* the override** (letting firmware use its normal `BootOrder`, which already ranks the 1G PXE entry, `Boot0002`, ahead of the other MAC's entries per 9q) to see if the timing is actually any different — if it's the same, the override may be unnecessary for this specific speed goal, though it may still be worth keeping as an explicit, auditable guarantee rather than relying on `BootOrder` position.
+
+### 9s. `pxe_rack_provision.sh` modified — `--node` now accepts a range (N-M)
+
+User-provided script only supported `--node <N>` (a single node) or the whole rack via `--rack`. For this rollout, needed to target `rack08node02` through `rack08node18` specifically — node01 was already handled manually via the Redfish/ipmitool exercise (9q/9r) and shouldn't be re-touched by re-running the whole rack.
+
+**Change:** `--node` now accepts either a single integer (`--node 18`, unchanged/backward-compatible) or a range (`--node 2-18`), validated the same way `--rack` already validates its own `N-M` range (start ≤ end, both within 1..NODE_COUNT). Range/confirmation labels updated accordingly (e.g. `rack08node02-node18`), and the total-node-count math updated to reflect the actual range size rather than assuming 1.
+
+**Verified via `--dry-run`:**
+- `--rack 8 --node 1` → still targets only `bmc-rack08node01` (backward compatible).
+- `--rack 8 --node 2-18` → correctly targets `bmc-rack08node02` (`10.141.8.102`) through `bmc-rack08node18` (`10.141.8.118`), 17 nodes total, correct BMC IPs per the existing `10.141.<rack>.<100+node>` formula.
+- `--rack 8 --node 2-20` → correctly rejected as out-of-range for an 18-node rack, before anything is sent.
+
+**Confirmed the script's default workflow is compatible with the one-shot-only PXE constraint established in 9q:** `ipmitool ... chassis bootdev pxe options=efiboot` (no `options=persistent`) followed by `chassis power cycle` — this sets the next-boot flag for one boot only, consistent with what was manually validated via Redfish on `rack08node01`. No change needed to that part of the script's behavior.
+
+**Operational note, not yet decided:** default `--delay` is `0`, meaning all nodes in a range/rack hit the head node's DHCP/TFTP simultaneously. Given `rack08node01`'s peer-provisioning role (9p) is not yet confirmed to actually get used automatically by BCM's node-installer, running the remaining 17 with `--delay 0` is a real test of whether peering happens under concurrent load — or a staggered `--delay` may be preferred for this first real run. Left as the operator's choice at execution time, not hardcoded into the script.
+
+### 9t. NEW real issue: `cuda-dcgm` service crash loop on `rack08node01` — DCGM daemon package missing from image, not a restart-fixable problem
+
+After `rack08node01` finished provisioning (`INSTALLING` at 19:24:46 → `UP` at 19:40:58), CMDaemon's service monitor reported `cuda-dcgm` and `mst` repeatedly dying and failing to restart every ~30s continuously (19:41:59 onward, still ongoing at 19:46:00+), leading to `ManagedServicesOk` FAIL at 19:48:01.
+
+**Root cause confirmed, not a transient crash:**
+```bash
+ssh rack08node01 "systemctl list-units --all | grep -iE 'dcgm|mst'"   # → empty, no units exist
+ssh rack08node01 "ps aux | grep -iE 'dcgm|mst'"                        # → no processes running
+ssh rack08node01 "dpkg -l | grep -iE 'dcgm|mst|mft'"
+```
+Shows only `cuda-dcgm-libs` (libraries only) installed — **the actual DCGM daemon package is missing entirely.** `apt-cache search datacenter-gpu-manager` confirms the real daemon package (`datacenter-gpu-manager`, or a versioned variant like `datacenter-gpu-manager-4-core`/`-4-cuda13`/etc.) is available in the repo but was never installed on this image. `which nv-hostengine dcgmi` returns nothing — the actual DCGM binaries don't exist on the node.
+
+**`mst` is a different, likely benign case** — MST is traditionally started via the one-shot `mst start` command (loads the kernel module, creates `/dev/mst/*` device nodes) rather than run as a persistent systemd daemon, so `mst.service` never existing may not indicate a real gap the way the DCGM daemon's absence does. Not yet confirmed either way — pending `mst status` output.
+
+**`cmsh -c "category use maxQ-1032-doca341; services; list"` returned empty** — these health-check/service-monitor entries are not coming from category-level service config. Not yet confirmed whether they're defined at the device level instead, or come from some other BCM default/installer mechanism. Pending `device use rack08node01; services; list` output.
+
+**Important side-finding: `ldap` health check showed `PASS` on this node (19:44:14)** — different from the known `ldap`/`nsswitch` regression documented for the older `1014`/DOCA-3.2.1 image (Section 5). Worth confirming this holds on the other nodes too before revising that known-issue entry — could mean the regression is specific to the older image/fix history and doesn't apply to this archive line.
+
+**Also noted: `"Reboot required: Interfaces have been modified"` warning fired immediately post-install (19:41:12)** — not yet investigated, possibly related or unrelated to the service crash loop. Flagged for follow-up.
+
+**Recommendation: do not proceed to the remaining 17 nodes (rack08node02-18) until this is resolved.** Since the missing DCGM daemon package is an image-level gap (Section 1's driver/DOCA verification checked `dkms status`/`doca-host`/`mlnx-ofed` but did not check for the DCGM daemon specifically), all 17 remaining nodes would hit an identical crash loop if provisioned from the same `baseos-1032-doca341` image as-is. Fix path: add the correct `datacenter-gpu-manager-4-*` package to the image (likely via a chroot `apt-get install`, same pattern as the fabricmanager/chrony fixes — mount cleanup required afterward per Section 1.4), then re-verify before resuming rollout to the rest of the rack.
+
+**Operational note:** SSH host-key mismatch warning is expected on every first-connect to a freshly-reinstalled node (host keys regenerate on every reinstall) — not a real security event, but will recur for all 17 remaining nodes. `ssh-keygen -R <hostname>` before each first connect, or bulk-clear `rack08node*` entries from `known_hosts` ahead of time.
+
+**Confirmed:**
+- `cmsh -c "device use rack08node01; services; list"` → `cuda-dcgm`, `mst`, `nslcd`, `rshim` — all `Monitored: yes, Autostart: yes`, set at the **device level**, not category level (category's own `services; list` was empty, 9t). Strongly suggests this is BCM's own hardware-profile auto-registration for this DGX-class node type, not manual per-node config — meaning the same four expected services will register identically on all 17 remaining `rack08group` nodes once provisioned.
+- `mst status` on the live node: `MST PCI module is not loaded` / `MST PCI configuration module is not loaded` — confirms no mechanism ever ran `mst start` (or equivalent) to load the kernel module, consistent with there being no `mst.service` unit to have done so. Same root pattern as `cuda-dcgm`: BCM expects a running service that has nothing actually providing it on this image.
+
+**Still open:** `nslcd` and `rshim` status not yet checked — `rshim` (BlueField/DPU management) is particularly relevant given this same node (`rack08node01`) also carries the peer-provisioning role from 9p. Pending confirmation of full scope before finalizing the fix plan.
+
+**Scope confirmed: exactly 2 of the 4 device-monitored services are actually broken.**
+- `nslcd` — genuinely healthy, running (`active (running)`, real PID, accepting connections).
+- `rshim` — genuinely healthy, running (`active (running)`, BlueField SoC driver, successfully attached `rshim0` to `pcie-0016:01:00.2`). Important to have confirmed this specifically since `rack08node01` also carries the peer-provisioning role (9p) — no DPU/BlueField management issue on this node.
+- `cuda-dcgm` and `mst` — confirmed broken per 9t, root cause is missing daemon package (`cuda-dcgm`) and un-loaded kernel module with no service to load it (`mst`). **This is an isolated, two-service gap, not a broad image-wide service failure.**
+
+**Side note, not yet investigated further:** `nslcd`'s log (post-reboot) shows `ldap_result() failed: Can't contact LDAP server` and `request denied by validnames option` a few minutes into this boot — worth watching given the already-tracked LDAP-adjacent known issues (Section 5), even though the `ldap` health check itself showed PASS earlier in this same node's lifecycle (19:44:14, pre-this-reboot). Could be timing/transient rather than a regression. Confirmed separately: this reboot did **not** clear the `mst` module-not-loaded state or restart the `cuda-dcgm`/`mst` crash loop — both persisted through the reboot, ruling out "just needed a fresh boot" as an explanation.
+
+### 9u. `cuda-dcgm` root cause fully confirmed — correct package name is `cuda-dcgm`, not a `datacenter-gpu-manager-*` variant
+
+**Cross-check against `rack01node01` (already-live production node, `maxQ-1014-doca321`) disproved the "fleet-wide accepted gap" hypothesis:** `rack01node01` shows `cuda-dcgm: PASS` and `ManagedServicesOk: PASS` — the daemon genuinely works there. This is specific to `baseos-1032-doca341`, not a standing quirk tolerated across the whole fleet.
+
+**Correct package identified by direct comparison:**
+```bash
+ssh rack01node01 "dpkg -l | grep -iE dcgm"
+```
+→ `cuda-dcgm` (the actual daemon, not just libs) **and** `cuda-dcgm-nvvs` (NVIDIA Validation Suite) both installed at `1:4.5.2-100153-cm11.0-3e31a09987` — the **exact same version** already present for `cuda-dcgm-libs` on `baseos-1032-doca341`. Confirms the fix is a straightforward "install the missing sibling packages," not a CUDA-version-variant guessing exercise like the earlier `datacenter-gpu-manager-4-*` speculation (9t) — that speculation is now superseded/incorrect, don't use it.
+
+**Fix for the image (not yet executed as of this log entry):**
+```bash
+cm-chroot-sw-img /cm/images/baseos-1032-doca341
+chmod 1777 /tmp && rm -rf /tmp/*
+apt-cache policy cuda-dcgm cuda-dcgm-nvvs   # confirm same version as already-installed cuda-dcgm-libs before installing
+apt-get install -y cuda-dcgm cuda-dcgm-nvvs
+exit
+```
+Followed by standard mount cleanup (Section 1.4), then separately fixing the already-provisioned `rack08node01` directly via the same `apt-get install` over SSH (image fix alone won't retroactively fix a node already installed from the old image state).
+
+**Still separately open, not resolved by this fix:**
+- `mst`: user has no memory of `mst.service` ever being a real systemd unit — worth treating "MST is a one-shot `mst start`, not a persistent service" as the likely correct model rather than assuming a missing package, pending confirmation of how `rack01node01` handles the same BCM `Monitored: yes, Autostart: yes` expectation for `mst` (not yet checked — worth doing the same cross-check used for `cuda-dcgm`).
+- `ntp`/chrony: confirmed genuinely synced (`chronyc tracking`: `Leap status: Normal`, tight offsets) but off **public internet** NTP servers (`canonical.com`, `hinet-ip`, etc.), not an internal source — the original plan to point chrony at an internal time server was never completed (no internal address was ever provided). Open decision, not a technical blocker: is public-internet NTP acceptable for this cluster's compute nodes, or should they sync off the head node internally?
+- `ldap`/`cmsupport`: `getent passwd cmsupport` succeeding is not conclusive — could be resolving from a local `/etc/passwd` entry rather than real LDAP, while `nslcd`'s own log showed `Can't contact LDAP server` minutes into the same boot. Needs `grep cmsupport /etc/passwd` + `nsswitch.conf` check to determine if `ldap: PASS` is meaningful or masked.
+
+**Recurring operational note:** SSH host-key mismatch warnings appearing even for `rack01node01` (an already-established production node, not freshly reinstalled) suggests `known_hosts` on this head node is generally out of sync across the fleet, not just an artifact of `rack08` reinstalls. Worth a one-time bulk `known_hosts` cleanup for the whole fleet rather than clearing entries one at a time as each is hit.
+
+### 9v. `rack_lifecycle.sh` (uploaded) confirms `cuda-dcgm` fix is a genuine pre-handoff blocker, not just a nice-to-have
+
+New script uploaded, intended for the post-BCM-provisioning handoff/diag/production lifecycle (`status`/`handoff`/`pre-diag`/`post-diag`, `finalize` deliberately unimplemented pending a decision on what "production-ready" means). Directly relevant to the open `cuda-dcgm` finding (9t/9u):
+
+- `do_pre_diag()` explicitly disables `cuda-dcgm.service` before diag testing — confirmed root cause of a prior `SYNC_CLIENT_NOT_REGISTERED` diag failure was DCGM holding `/dev/nvidia*` open and blocking the diag tool's module-unload step. Uses `disable --now`, not just `stop`, specifically because a plain stop doesn't survive a diag-campaign power-cycle.
+- `do_post_diag()` restores `cuda-dcgm.service` to whatever active/enabled state `pre-diag` recorded, read back from `/etc/rack-lifecycle-state`.
+- `do_status()` reports `cuda-dcgm` active/enabled state as part of its standard health snapshot.
+
+**Conclusion: this tooling assumes `cuda-dcgm.service` is genuinely installed and normally running** — handing off a `rack08` node without the real daemon (9t/9u) means `pre-diag` operates on a service that was never active to begin with, silently changing this rack's behavior relative to every other rack this tooling was built against. **Confirms the `cuda-dcgm`/`cuda-dcgm-nvvs` install fix (9u) should happen before handoff, not just before general use.**
+
+**Separate note: this script has no `mst` handling anywhere** — `mst`'s gap (module needing manual `mst start`, no persistent service backing BCM's `Monitored: yes, Autostart: yes` expectation) is entirely outside this script's scope. Not yet decided whether that's acceptable to hand off as-is or needs to be resolved first, same as `cuda-dcgm` was.
+
+**Also worth noting for clarity, not a contradiction:** `do_handoff()`'s LDAP-decoupling steps (stop/disable `nslcd`, strip `pam_ldap.so`, `nsswitch.conf` → `files`, explicitly preserving `cmsupport` as a local account *first*) are a **deliberate, controlled, by-design step** for racks leaving the BCM network — not the same thing as the earlier-documented *accidental* `nsswitch.conf` regression that broke `cmsupport` (Section 5's known issues, tied to an unrelated fix that shouldn't be reapplied). Don't conflate the two: one is an intentional off-cluster transition step with safeguards built in, the other was a bug.
+
+**Script references `gb300_l10_build_log.md §25d`** for further detail on the DNS/LDAP handoff fix's origin — a different filename than this session's `session-summary.md`. Not available in this session; if it's a real, separate document, worth locating for full context on the handoff fixes' origin story, but not blocking for the immediate `cuda-dcgm`/`mst` decision.
+
+### 9w. `cuda-dcgm` fix confirmed working on live node — was a stale health-check snapshot, not a real failure
+
+Installed `cuda-dcgm` (12.3 MB, daemon only — `cuda-dcgm-nvvs` deferred, see 9x) directly on `rack08node01` via SSH. First `apt-get` attempt stalled indefinitely on the 1.24 GB `cuda-dcgm-nvvs` download (0:00 CPU time after 7+ minutes, no growth in cached `.deb` size) and had to be killed (`kill -9`, plain SSH command — no `-t`/pty needed for killing a *new* remote process, only needed when trying to signal an *already-attached* foreground session). `dpkg --configure -a` confirmed clean after the kill, `cuda-dcgm` alone then installed cleanly from the already-fully-cached `.deb` (matches exact expected size, no re-download).
+
+**Verified immediately after install:**
+```bash
+systemctl status cuda-dcgm --no-pager -l
+```
+→ `active (running)`, `nv-hostengine` initialized, listening on port 5555, clean startup log, no errors.
+
+**First `latesthealthdata` check still showed `cuda-dcgm: FAIL`** — but timestamp (58.5s old) aligned almost exactly with the service's own start time, indicating a stale sample caught mid-startup rather than a real persisting failure. **Confirmed via cmsh event log ~2 minutes later:** `The trigger 'Passing health checks' is active because the measurable 'cuda-dcgm' is PASS`. Fix is genuinely working — false alarm was just measurement timing, not a real gap. Worth remembering for future fixes on this SOP: always allow one full health-check cycle to pass before concluding a fix didn't work.
+
+**Still pending:** the corresponding fix has not yet been applied to the **image itself** (`baseos-1032-doca341`) — only to this one already-provisioned live node. Without the image fix, all 17 remaining `rack08group` nodes will still provision with the same gap. Image-level fix (9u) still needs to be run.
+
+**Decision: `cuda-dcgm-nvvs` will NOT be installed** — too large (1.24 GB) for the benefit given it's not required for `ManagedServicesOk`/`cuda-dcgm` health checks or `rack_lifecycle.sh`'s pre-diag/post-diag workflow (both only reference `cuda-dcgm.service`, not `nvvs`). Can be installed later, separately, off-hours or on better bandwidth, if the diag team's validation-suite tooling ends up needing it — not a blocker for this rollout.
+
+**Confirmed via fresh `latesthealthdata` sample:** `cuda-dcgm: PASS`, `ManagedServicesOk` now only lists `mst` — exactly the isolated scope expected. `cuda-dcgm` fix fully validated on the live node.
+
+**Next decision point: apply the same `cuda-dcgm` fix (daemon only, no `nvvs`) to the image itself** (`baseos-1032-doca341`) before provisioning the remaining 17 `rack08group` nodes, so they don't each need this same manual per-node SSH fix after the fact.
+
+### 9x. `mst` confirmed as a pre-existing, fleet-wide condition — NOT related to `--no-cm-cuda-repo` or this build
+
+Direct comparison against `rack01node01` (live production, `maxQ-1014-doca321`, entirely different build history/archive):
+```bash
+ssh rack01node01 "systemctl list-units --all | grep -i mst"   # → empty, same as rack08node01
+ssh rack01node01 "mst status 2>&1"                             # → "MST PCI module is not loaded", identical to rack08node01
+cmsh -c "device latesthealthdata rack01node01" | grep -i mst   # → NO OUTPUT AT ALL - mst doesn't appear as a health row here
+```
+
+**Confirms:** the `mst` module-not-loaded state is a **pre-existing, fleet-wide condition**, present identically on an already-established production rack built via a completely different image/archive. Not caused by `--no-cm-cuda-repo` (ruled out directly — `rack01node01` never used that flag) and not specific to `baseos-1032-doca341` or `maxQ20GA`. MST is genuinely just never auto-started anywhere in this fleet; `mst start` has always been a manual/one-shot action, consistent with the user's own recollection that there's no memory of `mst.service` ever being a real thing.
+
+**Real remaining discrepancy, not yet explained:** `mst` does NOT appear at all in `rack01node01`'s `latesthealthdata` output, but DOES appear in `rack08node01`'s (`ManagedServicesOk` info column, per device-level `services; list` showing `mst: Monitored=yes, Autostart=yes` at the device level for `rack08node01` — 9t). This means BCM is *watching for* `mst` on `rack08node01` but apparently is not on `rack01node01`, despite the underlying MST state being identical on both. Not yet determined why the device-level service-monitoring list differs between these two nodes — worth checking `cmsh -c "device use rack01node01; services; list"` directly to confirm whether `rack01node01`'s device-level service list simply doesn't include `mst`/`cuda-dcgm` at all (different hardware-profile detection outcome?) versus including it but it happening to report clean for some other reason.
+
+**Working conclusion:** `mst`'s underlying gap is a long-standing, fleet-wide, already-accepted condition — not a blocker introduced by this rollout. The open question is purely about BCM's *monitoring configuration* difference between nodes, not about MST itself needing a new fix. Reasonable to treat as non-blocking for handoff, pending the one remaining monitoring-config check.
+
+**Correction to 9x's open question:** device-level service config is **identical** between `rack01node01` and `rack08node01` — both show `cuda-dcgm`, `mst`, `nslcd`, `rshim` all `Monitored: yes, Autostart: yes`. The earlier hypothesis (different monitoring config between the two nodes) is wrong.
+
+**Actual explanation: timing/freshness, not configuration.** `rack01node01` has been up ~1 week+ (per its `gpu_health_*` timestamps, 9j-era data); whatever `mst died`/restart-attempt cycling happened on its own first boot has long since gone quiet — `ManagedServicesOk`'s `Info` column appears to only surface currently-active fail/retry cycling, not a permanently-settled "never was running, stopped trying to restart it" state. `rack08node01` was provisioned only ~30 minutes prior to this check, so it's still inside that same initial noisy window every node goes through on first boot.
+
+**Final conclusion: this is not "rack08 has a problem rack01 doesn't" — it's the same fleet-wide, pre-existing MST gap at two different points in its own per-node lifecycle.** Expect `mst` to eventually stop appearing in `rack08node01`'s `ManagedServicesOk` info column on its own, without further action, once CMDaemon's retry-cycling for it settles the same way it apparently has on every other already-established node. **Non-blocking for remaining rollout and handoff** — consistent with a long-standing, fleet-wide, already-tolerated condition rather than something introduced by this build.
+
+### 9y. Mechanism clarified: why CMDaemon reports "mst died" with no `mst.service` ever existing
+
+`systemctl status mst` on `rack08node01` confirms directly: `Unit mst.service could not be found.` This is not a contradiction with CMDaemon's repeated "Service mst died"/"was not restarted" messages — it explains them. **CMDaemon's generic service-monitoring feature maps a configured service name directly to `systemctl status <name>.service`** — it does not create or provide the unit itself, it only watches for one that's assumed to already exist (from a package or the image). This is the identical mechanism used for `cuda-dcgm`, `nslcd`, and `rshim` in the same device-level `services` list (9t) — CMDaemon has no special-case logic per service name, it treats all four identically.
+
+Since no node in this fleet (confirmed on both `rack08node01` and `rack01node01`) has ever had a real `mst.service` unit, CMDaemon's periodic check will always report "died"/"could not restart" for it — the wording is CMDaemon's generic language for "expected unit not found or not active," not evidence anything was ever actually running and then crashed. Exactly parallel to the `cuda-dcgm` situation before the real daemon package was installed.
+
+**Open question, not resolvable from this session alone — needs an owner:** why is `mst` in the fleet's expected-services list at all, given no `mst.service` unit has apparently ever existed on any node? Two live possibilities:
+1. NVIDIA's reference DGX/GB300 software stack is supposed to ship a real `mst.service` unit (e.g., bundled with `mft`/`mstflint`/`kernel-mft-dkms`), and it's missing from every image built to date — an image-level gap across the entire fleet, not specific to `baseos-1032-doca341`.
+2. BCM's own hardware-profile template for this platform has a stale or incorrect default that was never actually correct — `mst` may have always been intended as a manual/one-shot `mst start`, not a persistent service, and the monitoring expectation itself is wrong.
+
+**Recommendation:** flag this to whoever owns BCM's hardware-profile/category defaults for this platform, or NVIDIA support/docs, for a definitive answer — not something to guess at or silently work around per-rack. Does not block this rollout (confirmed fleet-wide, pre-existing, non-functional-impact), but worth resolving at the source rather than accepting indefinitely across every future rack.
+
+### 9z. `pxe_rack_provision.sh` modified again — added `--pxe-method ipmitool|redfish`
+
+Gap identified: the script only ever used `ipmitool ... chassis bootdev pxe options=efiboot` to set the next-boot PXE flag, even though the mechanism actually validated by hand on `rack08node01` (9q/9r) to correctly land on the 1G NIC was the **Redfish** `BootSourceOverride` PATCH, not ipmitool's boot-flags mechanism. These are two different BMC-level mechanisms and were never confirmed equivalent on this hardware — the script's default behavior was carrying an unvalidated assumption forward.
+
+**Change:** added `--pxe-method ipmitool|redfish` (default `ipmitool`, preserving existing behavior/backward compatibility). When `redfish` is selected, PXE-setting goes through a new `set_pxe_flag()` helper that PATCHes `Boot.BootSourceOverrideEnabled=Once` / `BootSourceOverrideTarget=Pxe` against `https://<bmc-ip>/redfish/v1/Systems/${REDFISH_SYSTEM_ID}` — same one-shot-only semantics as the manually-validated approach (never `Continuous`, never touches `BootOrder`).
+
+**New `REDFISH_SYSTEM_ID` variable ("System_0")** — explicitly flagged in comments as confirmed only for this specific BMC/hardware (NVIDIA "CARLO_NEXT-T1", confirmed via a live `/redfish/v1/Systems` enumeration during the rack08node01 exercise), not a safe universal default. Header comment tells the reader exactly how to re-verify it on different hardware before trusting it.
+
+**Validation added:** `--pxe-method redfish` combined with `-power`-only mode is now rejected at argument-parsing time (that mode never sets a PXE flag at all, so the option would silently do nothing) — errors out with a clear message rather than accepting a no-op combination.
+
+**Verified via `--dry-run`:**
+- Default (`ipmitool`) behavior unchanged — confirmed identical dry-run output to the pre-change version.
+- `--pxe-method redfish --rack 8 --node 1` → correctly shows the `curl -X PATCH .../Systems/System_0` line instead of the ipmitool bootdev line, power-cycle line unchanged.
+- `--pxe-method redfish --rack 8 --node 2-18` → correctly composes with the node-range feature (9s), one PATCH line per node with the correct per-node BMC IP substituted.
+- `-power cycle --pxe-method redfish --rack 8 --node 1` → correctly rejected before running anything.
+
+**Not yet exercised for real** (only dry-run tested) — first real use of `--pxe-method redfish` through this script should be treated as validation, same caution as the original manual exercise: confirm via DHCP log or console which NIC actually PXE'd, don't assume success from HTTP 2xx alone.
+
+### 9aa. Clarification: `System_0` is not 1G-specific — it's the whole-host resource; NIC selection is a `BootOrder` property, not a resource-ID property
+
+Question raised: is `System_0` itself specific to the 1G RJ45 PXE port (as opposed to BF3)? **No.** `System_0` is the Redfish `ComputerSystem` resource for the entire host — confirmed via the `/redfish/v1/Systems` enumeration (9q), which returned exactly two members: `System_0` (bootable host) and `HGX_Baseboard_0` (separate baseboard-management endpoint, not bootable, not NIC-related). Neither is per-NIC.
+
+The 1G-vs-other-NIC distinction lives entirely inside `System_0`'s own `Boot.BootOrder`/`Boot.BootOptions` data — specifically `Boot0002`, matched to the 1G port's MAC (`48210B88088D`) by direct enumeration. The generic `BootSourceOverrideTarget: "Pxe"` PATCH we use does not target a specific NIC — it resolves to **whichever PXE-capable entry ranks first in that system's `BootOrder`** at the time of the boot. It landed on the 1G port only because `Boot0002` already ranked ahead of the other observed MAC's entries (`1ECCEB9AB272`, Boot0004-0007) in `BootOrder`. If `BootOrder` ever changed (firmware update, BIOS setting, etc.) such that a different NIC's PXE entry ranked first, the identical override — same `System_0`, same PATCH — would resolve there instead.
+
+**Still an open, unconfirmed point, not resolved by this clarification:** whether `1ECCEB9AB272` is actually BF3's host-facing NIC representor was never definitively confirmed (9q noted only that its `UefiDevicePath` routes through a `USB(...)` pattern suggestive of a BMC-shared/virtual NIC, not confirmed either way). Separately, BlueField DPUs commonly run their own independent ARM SoC with a separate boot process (sometimes managed via `rshim` rather than the host's main BMC) — whether that's relevant here, or whether the host-visible NIC representor is what's actually at stake, was never directly investigated. `set_pxe_flag()`'s `redfish` method (9z) is scoped only to the host's own `System_0` boot sequence — it makes no claim about, and has no effect on, BF3's own internal SoC boot process if that's a genuinely separate domain.
+
+### 9ab. Evidence suggests BlueField3's own network ports have no PXE boot-option entry at all — not just deprioritized
+
+Cross-referenced the 11 UEFI boot options (9q) against BF3's actual PCIe address, confirmed via `mst status -v` on `rack08node01`:
+```
+BlueField3(rev:1)   0016:01:00.0   mlx5_4   net-ibP22s22f0
+BlueField3(rev:1)   0016:01:00.1   mlx5_5   net-ibP22s22f1
+```
+**None of the 11 boot options reference PCI address `0016:01:00.x` in their `UefiDevicePath`.** The PXE/HTTP-capable entries route only through `PciRoot(0x5).../Pci(0x6,0x0)` (MAC `48210B88088D`, confirmed 1G port) or `USB(0x4,0x0)/USB(0x0,0x0)` (MAC `1ECCEB9AB272`, previously flagged as "maybe BF3" but unconfirmed).
+
+**Revised assessment of `1ECCEB9AB272`: likely NOT BF3.** The `USB(...)` device-path pattern is more consistent with a BMC-shared/virtual management NIC than a physical DPU port, and it doesn't match BF3's real PCIe location either. Combined, this is real (though indirect) evidence that **BlueField3's actual network ports (`mlx5_4`/`mlx5_5`) have no UEFI boot-option entry registered at all** on this system — not merely ranked low in `BootOrder`, but absent from the boot-options collection entirely.
+
+**Practical implication:** the generic `Pxe` override (via either `ipmitool bootdev pxe` or the Redfish method in `set_pxe_flag()`) could never have landed on BF3 in the first place, regardless of `BootOrder` ranking — there's no boot option for firmware to select. This changes the earlier framing (9aa) slightly: it's not just "1G currently ranks first," it may be "BF3 was never a candidate at all" for standard UEFI PXE boot on this hardware/firmware configuration.
+
+**Two explicit limits on this conclusion, not yet resolved:**
+1. BF3 may have its own separate, independent firmware/boot configuration (checked via `mlxconfig` or similar run against the DPU itself) that wouldn't appear in the host's UEFI boot-options list at all — not checked this session.
+2. This is inferred from a PCI-address mismatch, not a direct "PXE: disabled" readout from any tool — worth treating as strong circumstantial evidence, not a confirmed fact, until/unless checked directly against BF3's own config.
+
+**Architectural plausibility check:** consistent with BlueField DPUs typically being used as fabric/RDMA interfaces rather than the host's own provisioning path — matches BCM's own designation of `enP5p9s0`/the 1G port (not any BF3 interface) as the `[prov,dhcp]` provisioning NIC for this node.
+
+### 9ac. Definitive answer: BF3 PXE is not disabled — ports are configured for InfiniBand, not Ethernet
+
+Direct `mlxconfig -d 0016:01:00.0 query` against BF3 itself (via `rshell` on `rack08node01`) settles the question raised in 9ab conclusively:
+
+**PXE is enabled at the device/firmware level:**
+```
+EXP_ROM_PXE_ENABLE       True(1)
+EXP_ROM_UEFI_x86_ENABLE  True(1)
+EXP_ROM_UEFI_ARM_ENABLE  True(1)
+LEGACY_BOOT_PROTOCOL     PXE(1)
+```
+
+**Root cause of no PXE boot-option entry (9ab): link type, not a disabled feature.**
+```
+LINK_TYPE_P1    IB(1)
+LINK_TYPE_P2    IB(1)
+```
+Both BF3 ports are configured for native InfiniBand, not Ethernet. Standard PXE (the DHCP/TFTP Ethernet-layer protocol BCM's provisioning and the host's UEFI boot-option enumeration both use) requires an Ethernet-mode port — `EXP_ROM_PXE_ENABLE` controls whether the option ROM *would* offer PXE if in Ethernet mode, but does not override the port's actual link-type configuration. A port in native IB mode simply doesn't present as a PXE-capable Ethernet NIC to firmware, so no `Boot000X` entry gets generated for it — consistent with 9ab's finding of no boot option at BF3's PCI address, and now fully explained rather than just inferred.
+
+**Consistent with everything else observed this session:** `mst status -v` interface naming (`net-ibP22s22f0`/`net-ibP22s22f1`, "ib" prefix) already implied IB mode; this is BF3 deliberately configured for its IB fabric role on this GB300 NVL node, not an oversight or misconfiguration.
+
+**Correction to any implication that "BIOS should enable BF3 PXE":** there is no BIOS-level PXE toggle at play here — this is a DPU port link-type configuration (`LINK_TYPE_P1`/`LINK_TYPE_P2`), set via `mlxconfig`, not the host's BIOS/UEFI settings. Changing it to `ETH` would be a real, consequential change to the DPU's data-plane fabric role for this node (not merely a "turn on PXE" toggle) and should not be done without deliberately deciding to trade BF3's IB fabric connectivity for Ethernet/PXE capability on those ports — a decision with real operational impact, not a quick fix.
+
+### 9ad. Root cause identified (strong inference, not fully confirmed): BIOS disables option ROM on all x16 fabric NIC slots by design
+
+`dmidecode -t 9` (System Slot Information) cross-referenced against confirmed PCI domains from `mst status -v`/boot option device paths:
+
+| PCI Domain | dmidecode Designation | Confirmed device |
+|---|---|---|
+| `0000` | NIC Slot 1 (x16 Gen5) | ConnectX-8 `mlx5_0`/`mlx5_1` |
+| `0002` | NIC Slot 2 (x16 Gen5) | ConnectX-8 `mlx5_2`/`mlx5_3` |
+| `0005` | NIC Slot 3 (x1 Gen3 — different class) | **1G port** (matches `PciRoot(0x5)` in the confirmed Boot0002 device path) |
+| `0010` | NIC Slot 5 (x16 Gen5) | ConnectX-8 `mlx5_4`/`mlx5_5` |
+| `0012` | NIC Slot 6 (x16 Gen5) | ConnectX-8 `mlx5_6`/`mlx5_7` |
+| `0016` | NIC Slot 7 (x16 Gen5) | **BlueField-3** |
+| `0015` | M.2 NVMe Slot 1 | NVMe (matches `PciRoot(0x15)` in Boot0001) |
+| `0006` | NIC Slot 4 (x16 Gen5, "Available") | Unpopulated |
+
+**Strong numeric/architectural correlation found:** exactly six `x16 PCI Express 5 x16` "NIC Slot" designations exist (Slots 1,2,4,5,6,7 — domains 0000,0002,0006,0010,0012,0016), and the BIOS `Bios/Attributes` payload shows **exactly six** `DisableOptionROM: true` entries, all on `x16`-width slots specifically: `Socket0Pcie0`, `Socket0Pcie2`, `Socket0Pcie6`, `Socket1Pcie0`, `Socket1Pcie2`, `Socket1Pcie6`. Count and width class both match precisely. Meanwhile the 1G port's slot (NIC Slot 3, domain `0005`) is a different class entirely — `x1 PCI Express 3 x1`, not one of the six flagged x16 slots.
+
+**Working conclusion (strong inference, not a confirmed 1:1 documented mapping):** this platform's BIOS appears to deliberately disable PCIe option-ROM execution on all six large fabric-facing NIC slots (4× ConnectX-8 + 1× BlueField-3, `NIC Slot 4` currently unpopulated) — consistent with these being intended purely as data-plane/fabric interfaces (IB/RoCE, GPU-to-GPU, NVSwitch-adjacent), never as host boot devices — while deliberately leaving option ROM enabled only on the small onboard-style 1G management port (NIC Slot 3), which is the one NIC meant for host provisioning/PXE. This is architecturally coherent, not just a coincidence: it would explain, in one consistent story, both why the 1G port has always been the only PXE-capable option and why converting BF3/CX8 to Ethernet link type (9ac) did not — and structurally could not — produce a new PXE boot option, regardless of link type or `EXP_ROM_PXE_ENABLE` being `True` at the NIC level.
+
+**Explicit limits on this conclusion:**
+1. The exact `Socket*Pcie*` attribute → physical "NIC Slot N" mapping is **inferred from matching counts and widths, not confirmed via any documented 1:1 correlation** (e.g., no `dmidecode`/Redfish field directly named both a physical slot and its corresponding BIOS attribute key).
+2. **Not recommended to flip any `Socket*Pcie*DisableOptionROM` setting on this live node without confirming the exact mapping first** (OEM platform documentation for "CARLO_NEXT-T1," or direct confirmation from NVIDIA/vendor support) — an incorrect guess could disable option ROM on an unrelated PCIe root port with unknown consequences on live production-track hardware.
+3. This finding does not change or roll back the completed link-type change (9ac, confirmed durable at the NIC level) — it only explains why that change alone was never going to be sufficient to produce a PXE boot option for BF3/CX8, given the BIOS-level gate sitting above it.
+
+**Recommendation:** treat enabling BF3/CX8 as PXE-bootable via BIOS option-ROM changes as a separate, higher-risk follow-up requiring vendor/OEM confirmation of the exact slot mapping — not something to attempt via inference on live rack08 hardware mid-rollout. The customer's stated Ethernet-mode requirement (link type) is satisfied and durable; PXE-boot-capability on those same ports is a distinct, unresolved, and higher-risk question.
+
+### 9ae. Versioning added to both scripts
+
+Added `SCRIPT_VERSION`, a header changelog block, and a `--version`/`version` way to print it, to both `pxe_rack_provision.sh` and `rack_lifecycle.sh` — no other functional changes in this pass.
+
+- **`pxe_rack_provision.sh` → 1.2.0.** Changelog documents the three revisions made this session: 1.0.0 (original), 1.1.0 (`--node` range support, 9s), 1.2.0 (`--pxe-method ipmitool|redfish`, 9z). `--version` flag added; also printed in the pre-run summary line so it's visible on every real/dry run, not just when explicitly requested.
+- **`rack_lifecycle.sh` → 1.0.0.** No functional changes made yet this session (still matches the originally-uploaded copy) — version/changelog scaffolding only, so future changes to this script have somewhere to record against. `version` subcommand added (consistent with its existing subcommand style, e.g. `rackgroups`), plus `--version` as an alias; both short-circuit before any target-selection logic runs (doesn't require `--ip-range`/`--rackgroup`/etc. just to print a version).
+
+Both verified via `bash -n` (syntax) and direct invocation (`--version`/`version` print correctly; existing dry-run behavior on `pxe_rack_provision.sh` reconfirmed unaffected).
+
+### 9af. Peer-provisioning exercise: definitively did NOT work — role config alone is not sufficient
+
+**Confirmed via `rack08node01`'s own `rsyncd.log`** (BCM's provisioning transport, confirmed rsync-based via the `provisioningtransport` device property seen earlier):
+```bash
+grep 'Sep 17' /var/log/rsyncd.log | wc -l   # → 0 (not just 0 from other node IPs — zero activity at all today)
+ls -la /var/log/rsyncd.log                  # last modified Sep 16 19:40 (rack08node01's own original install, not today)
+```
+**Zero connections from any of the other 16 `rack08group` nodes** (`10.141.168.103`–`.118`) during the entire `12:40`–`~13:42`+ provisioning window on `2026-09-17`. This is a clean, definitive negative result, not an inconclusive one.
+
+**Conclusion: the `provisioning` role setup from 9p (`assign provisioning`, `set localimages baseos-1032-doca341`, `set categories maxQ-1032-doca341`, confirmed correctly committed via `roles; use provisioning; show`) was never actually engaged by BCM's node-installer for the other 16 nodes.** They provisioned via some other path — almost certainly the default fallback of pulling directly from the head node, same as `rack08node01` itself did originally. **Configuring a node's `provisioning` role scope alone does not make BCM prefer it as a source** — this confirms and closes the open question flagged in 9p ("not yet validated whether peer-to-peer selection actually happens automatically once the role is set").
+
+**Not yet determined: what the missing piece actually is.** Plausible candidates, none confirmed this session:
+- A category-level or network-level explicit "preferred provisioning source" setting that needs separate configuration beyond the role itself.
+- The `provisioning` role's own `nodegroups`/`racks` properties (left unset in 9p — only `localimages` and `categories` were set) may need to be populated to actually scope *which nodes* should use this source, rather than the role passively existing and hoping the right nodes discover it.
+- BCM's provisioning-source selection algorithm may factor in something else entirely (network topology/proximity awareness, load-based selection, an explicit per-category `provisioninginterface` binding) that wasn't investigated.
+
+**Timing context (approximate, not precise per-node data):** batch of 17 started ~12:40; `rack08node02` was already in confirmed steady-state (DCGM connected, monitoring active) by ~13:41–13:42, i.e. roughly 61+ minutes elapsed for at least partial batch completion — notably longer than `rack08node01`'s own solo run (~16 minutes). Consistent with (though not proof of) all 17 nodes contending for the head node directly with no load-spreading from peering. Precise per-node start/end timestamps were not captured this session (nobody was watching the live `cmsh` event stream during this run, unlike the node01 exercise) — for future batches, watch the live stream or tee `pxe_rack_provision.sh`'s own output to get real per-node timing rather than reconstructing after the fact.
+
+**Recommendation:** if peer-provisioning is worth pursuing further, the next step is investigating BCM's actual provisioning-source-selection mechanism (documentation or NVIDIA/Bright Computing support) rather than assuming the role's `localimages`/`categories` properties are sufficient on their own — they clearly are not, based on this direct evidence.
+
+### 9ag. Precise per-node provisioning timing — confirms head-node contention (not peering) caused a bimodal slowdown
+
+Computed from real log timestamps: start = each node's first `DHCPACK` (node-installer's own boot, `journalctl -u dhcpd`), end = each node's second `DHCPACK` (final OS reboot) immediately followed (~30s later) by cmdaemon's `Run special node settings: .../update-node-params.py` line (`/var/log/cmdaemon`, filtered to `Sep 17` — the `10:40:28`-`10:40:38` wave in this same log is unrelated, predates the 12:40 batch start entirely, likely a periodic cron-style task, not investigated further).
+
+**Fast group (9 nodes, 15m53s–27m33s):** node13, node11, node08, node12, node10, node09, node17, node15, node14.
+**Slow group (8 nodes, 55m39s–1h01m43s):** node02, node05, node18, node04, node16, node06, node07, node03.
+
+**Total batch wall-clock: 12:44:58 → 13:47:48 = 1h02m50s** for all 17 to complete.
+
+**Key finding: node13 (fastest, 15m53s) is essentially identical to `rack08node01`'s own precisely-measured solo run (16m12s, 9r).** This confirms ~16 minutes is the genuine baseline per-node install time on this hardware/image under no contention. The other 8 nodes took **3.5-4x longer** than that baseline — a clean bimodal split (9 fast / 8 slow), not a smooth distribution, consistent with queuing/contention at a shared resource rather than per-node hardware variance.
+
+**Directly corroborates 9af's negative peering finding rather than sitting separately from it:** since peer-provisioning was confirmed to never engage (zero rsync connections to `rack08node01` from any of the other 16 nodes), all 17 genuinely contended for the head node simultaneously — this timing data quantifies the real cost of that: roughly half the rack paid a 3.5-4x time penalty. If peer-provisioning were made to actually work (the open item from 9af/9p), this contention penalty is the concrete, measured problem it would need to solve.
+
+**Recommendation for future batches of this size:** either get peer-provisioning genuinely working first (see 9af's open questions), or use `pxe_rack_provision.sh --delay <N>` to stagger the batch deliberately, trading a longer *scheduled* rollout for avoiding this unscheduled, uneven 3.5-4x contention penalty on whichever nodes happen to queue behind others.

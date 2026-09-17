@@ -2,6 +2,15 @@
 #
 # rack_lifecycle.sh
 #
+# VERSION: 1.0.0
+#
+# CHANGELOG:
+#   1.0.0 (original) - status/handoff/pre-diag/post-diag subcommands,
+#     --ip-range/--rackgroup/--category/--rack targeting, rackgroups.conf,
+#     finalize deliberately unimplemented pending a decision on what
+#     "production-ready" requires. No functional changes made this
+#     revision - version/changelog scaffolding added for tracking only.
+#
 # Consolidated tool for the stages a rack goes through after BCM
 # provisioning: handed off to a diag-team network, diag testing, and
 # (eventually) on to production/customer. Replaces running the individual
@@ -124,12 +133,19 @@
 #
 set -uo pipefail
 
+SCRIPT_VERSION="1.0.0"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RACKGROUPS_FILE="${SCRIPT_DIR}/rackgroups.conf"
 
 DRY_RUN=0
 SUBCOMMAND="${1:-}"
 shift || true
+
+if [[ "$SUBCOMMAND" == "version" || "$SUBCOMMAND" == "--version" ]]; then
+  echo "rack_lifecycle.sh version $SCRIPT_VERSION"
+  exit 0
+fi
 
 IP_RANGE_START=""
 IP_RANGE_END=""
@@ -238,12 +254,14 @@ elif [[ -n "$RACK" ]]; then
 fi
 
 usage() {
+  echo "rack_lifecycle.sh version $SCRIPT_VERSION"
   echo "Usage: $0 <status|handoff|pre-diag|post-diag> [--dry-run] <hostname|IP>"
   echo "       $0 <status|handoff|pre-diag|post-diag> [--dry-run] --ip-range <start_ip> <end_ip>"
   echo "       $0 <status|handoff|pre-diag|post-diag> [--dry-run] --rackgroup <name>"
   echo "       $0 <status|handoff|pre-diag|post-diag> [--dry-run] --rack <N>            (pre-handoff, RECOMMENDED for whole-rack)"
   echo "       $0 <status|handoff|pre-diag|post-diag> [--dry-run] --category <bcm-category>  (pre-handoff, NOT reliable for whole-rack)"
   echo "       $0 rackgroups                     (list defined rackgroups)"
+  echo "       $0 version                        (print script version and exit)"
   echo "See header comment for full documentation."
   exit 1
 }
