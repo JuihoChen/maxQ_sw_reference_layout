@@ -2,7 +2,7 @@
 #
 # rack_lifecycle.sh
 #
-# VERSION: 1.0.0
+# VERSION: 1.2.0
 #
 # CHANGELOG:
 #   1.0.0 (original) - status/handoff/pre-diag/post-diag subcommands,
@@ -10,6 +10,34 @@
 #     finalize deliberately unimplemented pending a decision on what
 #     "production-ready" requires. No functional changes made this
 #     revision - version/changelog scaffolding added for tracking only.
+#   1.1.0 - added --with-pre-diag flag to the handoff subcommand: runs
+#     pre-diag immediately after handoff completes on each node, in the
+#     same invocation. OPT-IN, and prompts for explicit confirmation
+#     (unless --dry-run) - this compounds two actions with DIFFERENT
+#     reversibility: handoff's network/LDAP changes are ONE-WAY (no
+#     rejoin/finalize path implemented in this script), while pre-diag's
+#     cuda-dcgm disable IS reversible afterward via post-diag - but only
+#     if post-diag actually gets run later.
+#   1.2.0 - two bugfixes found in real use on rack08 (2026-09-17):
+#     (a) do_status's cuda-dcgm/nslcd lines used `$(cmd || echo fallback)`
+#     where cmd (systemctl is-active) prints real output AND returns
+#     non-zero for non-"active" states (failed/inactive/etc) - both the
+#     real output and the fallback text were getting concatenated into a
+#     garbled multi-line mess. Fixed by capturing to a variable first and
+#     using ${VAR:-fallback} instead of the `||` chain.
+#     (b) pre-diag's cuda-dcgm disable can be silently undone by CMDaemon
+#     itself restarting the service minutes later - CMDaemon monitors
+#     cuda-dcgm independently of systemd (device/category `services`
+#     config, confirmed via BCM admin manual, Provisioning Nodes / service
+#     monitoring sections), so a systemd-only disable is NOT sufficient
+#     for a real diag campaign. pre-diag now also calls
+#     `systemctl reset-failed` (clears a cosmetic "failed" state caused by
+#     the unit's own ExecStop script racing the already-completed stop)
+#     and prints a reminder of the actual required fix, which must be run
+#     separately from the head node (not via this script, which is
+#     designed to run from any jump host, not necessarily one with cmsh):
+#       cmsh -c "device foreach -g <nodegroup> (services; add cuda-dcgm;
+#         set monitored no; set autostart no; commit)"
 #
 # Consolidated tool for the stages a rack goes through after BCM
 # provisioning: handed off to a diag-team network, diag testing, and
@@ -81,6 +109,23 @@
 #                 - nsswitch.conf passwd/group/netgroup -> files
 #               Run this once per node, right after a rack moves off the
 #               BCM cluster network. Idempotent - safe to re-run.
+#               --with-pre-diag: also runs pre-diag on each node immediately
+#               after handoff, in the same invocation. OPT-IN, and prompts for
+#               explicit confirmation (unless --dry-run) - this compounds two
+#               actions with DIFFERENT reversibility:
+#                 - handoff's network/LDAP changes are ONE-WAY. There is no
+#                   rejoin/finalize path implemented in this script (see the
+#                   finalize placeholder below) - once run, a node does not
+#                   go back to being BCM-managed on its own or via a reboot.
+#                 - pre-diag's cuda-dcgm disable IS reversible afterward via
+#                   post-diag (which works fine on an already-handed-off node,
+#                   since it only does local systemctl calls + a local state
+#                   file - no BCM/LDAP connectivity needed) - but only if
+#                   post-diag actually gets run later.
+#               Only use --with-pre-diag when diag testing starts immediately
+#               after handoff - otherwise a node can end up permanently
+#               off-cluster with GPU monitoring off and no one remembering to
+#               run post-diag.
 #
 #   pre-diag    Stop AND disable cuda-dcgm.service (it holds /dev/nvidia* open
 #               and blocks onediagfieldmn's module-unload step - confirmed
@@ -109,6 +154,7 @@
 #   ./rack_lifecycle.sh status --ip-range 192.168.132.137 192.168.132.154
 #   ./rack_lifecycle.sh handoff --dry-run --ip-range 192.168.132.137 192.168.132.154
 #   ./rack_lifecycle.sh handoff --ip-range 192.168.132.137 192.168.132.154
+#   ./rack_lifecycle.sh handoff --with-pre-diag --rack 8   (handoff + pre-diag in one go, only if diag starts immediately)
 #   ./rack_lifecycle.sh pre-diag --ip-range 192.168.132.137 192.168.132.154
 #   ...run the diag...
 #   ./rack_lifecycle.sh post-diag --ip-range 192.168.132.137 192.168.132.154
@@ -133,7 +179,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.2.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RACKGROUPS_FILE="${SCRIPT_DIR}/rackgroups.conf"
@@ -153,10 +199,12 @@ SINGLE_TARGET=""
 RACKGROUP=""
 CATEGORY=""
 RACK=""
+WITH_PRE_DIAG=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --with-pre-diag) WITH_PRE_DIAG=1; shift ;;
     --ip-range)
       [[ -z "${2:-}" || -z "${3:-}" ]] && { echo "ERROR: --ip-range requires two IPs (start end)."; exit 1; }
       IP_RANGE_START="$2"; IP_RANGE_END="$3"; shift 3 ;;
@@ -260,6 +308,7 @@ usage() {
   echo "       $0 <status|handoff|pre-diag|post-diag> [--dry-run] --rackgroup <name>"
   echo "       $0 <status|handoff|pre-diag|post-diag> [--dry-run] --rack <N>            (pre-handoff, RECOMMENDED for whole-rack)"
   echo "       $0 <status|handoff|pre-diag|post-diag> [--dry-run] --category <bcm-category>  (pre-handoff, NOT reliable for whole-rack)"
+  echo "       $0 handoff --with-pre-diag [--dry-run] <target>  (runs pre-diag immediately after handoff - only if diag starts right away)"
   echo "       $0 rackgroups                     (list defined rackgroups)"
   echo "       $0 version                        (print script version and exit)"
   echo "See header comment for full documentation."
@@ -286,6 +335,24 @@ case "$SUBCOMMAND" in
     ;;
   *) echo "ERROR: unknown or missing subcommand '$SUBCOMMAND'."; usage ;;
 esac
+
+if [[ "$WITH_PRE_DIAG" -eq 1 && "$SUBCOMMAND" != "handoff" ]]; then
+  echo "ERROR: --with-pre-diag only applies to the 'handoff' subcommand (got '$SUBCOMMAND')."
+  exit 1
+fi
+
+if [[ "$WITH_PRE_DIAG" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+  echo "!!! --with-pre-diag: this runs handoff AND pre-diag together. !!!"
+  echo "    handoff's network/LDAP changes are ONE-WAY - there is no rejoin/finalize"
+  echo "    path implemented in this script. pre-diag's cuda-dcgm disable IS reversible"
+  echo "    afterward via 'post-diag', but only if you remember to run it."
+  echo "    Only proceed if diag testing starts immediately after this."
+  read -rp "Type 'yes' to confirm: " CONFIRM_PRE_DIAG
+  if [[ "$CONFIRM_PRE_DIAG" != "yes" ]]; then
+    echo "Not confirmed. Aborting, nothing was sent."
+    exit 1
+  fi
+fi
 
 [[ -z "$IP_RANGE_START" && -z "$SINGLE_TARGET" && ${#CATEGORY_TARGETS[@]} -eq 0 ]] && usage
 
@@ -320,9 +387,10 @@ do_status() {
   echo "=== $target ==="
   remote "$target" '
 echo "DNS static entry : $(grep "^DNS=" /etc/systemd/resolved.conf 2>/dev/null || echo none)"
-echo "nslcd            : $(systemctl is-active nslcd 2>/dev/null || echo not-installed)"
+NSLCD_STATE=$(systemctl is-active nslcd 2>/dev/null); echo "nslcd            : ${NSLCD_STATE:-not-installed}"
 echo "cmsupport        : $(id cmsupport 2>&1)"
-echo "cuda-dcgm        : active=$(systemctl is-active cuda-dcgm.service 2>/dev/null || echo not-installed) enabled=$(systemctl is-enabled cuda-dcgm.service 2>/dev/null || echo n/a)"
+DCGM_ACTIVE=$(systemctl is-active cuda-dcgm.service 2>/dev/null); DCGM_ENABLED=$(systemctl is-enabled cuda-dcgm.service 2>/dev/null)
+echo "cuda-dcgm        : active=${DCGM_ACTIVE:-not-installed} enabled=${DCGM_ENABLED:-n/a}"
 echo "nsswitch passwd  : $(grep "^passwd:" /etc/nsswitch.conf 2>/dev/null)"
 echo "lifecycle state  :"
 cat /etc/rack-lifecycle-state 2>/dev/null || echo "  (no recorded history)"
@@ -395,10 +463,20 @@ WAS_ENABLED=$(systemctl is-enabled cuda-dcgm.service 2>/dev/null)
 # include reboot/power scenarios), an enabled service comes right back
 # and silently reintroduces the device-lock conflict with no warning.
 systemctl disable --now cuda-dcgm.service 2>&1
+# The unit'"'"'s own ExecStop script races the normal stop and often exits 1
+# (pidfile already gone because systemctl already killed the main process
+# cleanly) - this leaves systemd showing "failed" even though the actual
+# outcome (nv-hostengine not running) is correct. Clear that cosmetic state:
+systemctl reset-failed cuda-dcgm.service 2>/dev/null
 echo "cuda-dcgm: was active=$WAS_ACTIVE enabled=$WAS_ENABLED - now disabled+stopped (survives reboot/power-cycle)"
 echo "pre-diag=$(date -Iseconds):was-active=${WAS_ACTIVE}:was-enabled=${WAS_ENABLED}" >> /etc/rack-lifecycle-state
 echo "verify /dev/nvidia* now free of dcgm:"
 lsof /dev/nvidia-uvm /dev/nvidia0 2>/dev/null | grep -v COMMAND || echo "  (clean)"
+echo "NOTE: if cuda-dcgm reappears as active shortly after this, CMDaemon is"
+echo "still monitoring it at the BCM level (device/category services config,"
+echo "independent of this systemd change) and is restarting it - fix with:"
+echo "  cmsh -c \"device foreach -g <nodegroup> (services; add cuda-dcgm; set monitored no; set autostart no; commit)\""
+echo "run from the head node, before relying on this pre-diag result."
 '
   echo
 }
@@ -430,15 +508,63 @@ echo "current cuda-dcgm: active=$(systemctl is-active cuda-dcgm.service 2>/dev/n
   echo
 }
 
+disable_cmdaemon_dcgm_monitoring() {
+  # Runs ONCE (not per-node) from the head node via cmsh, against the whole
+  # resolved target list. This is a DIFFERENT, smaller action than pre-diag:
+  # it only stops CMDaemon's own monitoring/auto-restart of cuda-dcgm at the
+  # BCM level - it does NOT stop the service itself. Without this, CMDaemon
+  # silently restarts cuda-dcgm within minutes of pre-diag's systemd-level
+  # disable, defeating the whole point (confirmed on rack08, 2026-09-17).
+  # Only fires when targets were resolved via --rack/--category, since that
+  # already proves cmsh is reachable from here. For --ip-range/--rackgroup
+  # targeting (typically already-handed-off, IP-addressed racks), prints a
+  # manual fallback instead of guessing at cmsh availability.
+  if [[ ${#CATEGORY_TARGETS[@]} -eq 0 ]]; then
+    echo "NOTE: cannot auto-run the CMDaemon-level cuda-dcgm monitoring disable -"
+    echo "      this requires --rack or --category targeting (proves cmsh is"
+    echo "      reachable from here). Run manually from the head node if needed:"
+    echo "        cmsh -c \"device foreach -n <hostnames> (services; add cuda-dcgm; set monitored no; set autostart no; commit)\""
+    return
+  fi
+  if ! command -v cmsh >/dev/null 2>&1; then
+    echo "NOTE: cmsh not found on this host - skipping CMDaemon-level cuda-dcgm"
+    echo "      monitoring disable. Run manually from the head node:"
+    echo "        cmsh -c \"device foreach -n $(IFS=,; echo "${CATEGORY_TARGETS[*]}") (services; add cuda-dcgm; set monitored no; set autostart no; commit)\""
+    return
+  fi
+  local hostlist
+  hostlist=$(IFS=,; echo "${CATEGORY_TARGETS[*]}")
+  echo "--- disabling CMDaemon-level monitoring of cuda-dcgm for: $hostlist ---"
+  echo "    (stops CMDaemon auto-restarting/health-flagging cuda-dcgm from now on -"
+  echo "    the service itself is untouched; reverse later with:"
+  echo "    cmsh -c \"device foreach -n $hostlist (services; use cuda-dcgm; set monitored yes; set autostart yes; commit)\")"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[dry-run] would run: cmsh -c \"device foreach -n $hostlist (services; add cuda-dcgm; set monitored no; set autostart no; commit)\""
+  else
+    cmsh -c "device foreach -n $hostlist (services; add cuda-dcgm; set monitored no; set autostart no; commit)"
+  fi
+  echo
+}
+
 run_subcommand() {
   local target="$1"
   case "$SUBCOMMAND" in
     status) do_status "$target" ;;
-    handoff) do_handoff "$target" ;;
+    handoff)
+      do_handoff "$target"
+      if [[ "$WITH_PRE_DIAG" -eq 1 ]]; then
+        echo "--- --with-pre-diag: running pre-diag immediately after handoff ---"
+        do_pre_diag "$target"
+      fi
+      ;;
     pre-diag) do_pre_diag "$target" ;;
     post-diag) do_post_diag "$target" ;;
   esac
 }
+
+if [[ "$SUBCOMMAND" == "handoff" ]]; then
+  disable_cmdaemon_dcgm_monitoring
+fi
 
 if [[ -n "$IP_RANGE_START" ]]; then
   echo "IP range: ${IP_PREFIX_START}.${LAST_OCTET_START} - ${IP_PREFIX_START}.${LAST_OCTET_END}, subcommand: $SUBCOMMAND"
