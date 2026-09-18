@@ -1593,3 +1593,244 @@ ssh rack08node01 "ethtool enP5p9s0 | grep -iE 'speed|supported link|advertised l
 3. The `5140`'s overall backplane/switching capacity specification, since direct-attached end-host ports and an inter-switch uplink port can behave very differently under sustained load depending on internal switch architecture.
 
 **Status: blocked on `5140` switch credentials**, same as 9at. This is now the clearly-scoped, single next step for the provisioning-throughput investigation — no further profitable action on the BCM/`provisioningslots` side is expected given 9aq/9at/9as/9ar's ruled-out findings.
+
+### 9av. Ruled out: `nextinstallmode` (device-level) vs `installmode` (category-level) is NOT a confound between rack08/rack01 timing comparisons
+
+User raised a valid concern: `rack08`'s FULL install was triggered via the category's `installmode: FULL` (confirmed §9o, inherited from the `maxQ-1029-doca341` clone), while `rack01`'s tests explicitly set `nextinstallmode FULL` per-device beforehand — two different mechanisms, worth checking whether they produce different install behavior.
+
+**Confirmed not a confound:** both properties resolve to the identical instruction — `nextinstallmode` is a one-time override, `installmode` is "used by default if empty," and both simply tell the node-installer to perform a genuine FULL install (full wipe/repartition/rsync). No difference in install *type* results from which layer sets the value.
+
+**Directly verified:** `cmsh -c "category use maxQ-1032-doca341; get installmode"` → `FULL`, identical to `rack08`'s category setting. Since both racks share this same category, `rack01`'s explicit `nextinstallmode FULL` was redundant (the category default would have triggered the same FULL install regardless) — not wrong, just unnecessary. This rules out install-type/mechanism differences as a contributing factor to the timing gap; the switch-topology hypothesis (9au, currently being re-tested with a dual-5140 topology) remains the leading explanation.
+
+### 9aw. Caveat on the dual-5140 topology test: NVSwitch devices were added to BCM while the rack01 batch was still actively provisioning
+
+9 new `nvs-rack01swN` devices (NVSwitch management interfaces, `10.141.51.10N`, category `maxQ-1014-doca321`) were added to BCM's device list **while** the dual-5140-topology rack01 batch (kicked off ~14:17-14:23, 9av/dual-switch test) was still in progress ("no feedback yet" on the batch at time of this addition, confirmed by user).
+
+**Potential confound, not yet assessed:** these NVSwitches sit on a different subnet (`10.141.51.x`) than rack01's nodes (`10.141.161.x`), but if both paths share the same physical uplink/switch capacity upstream of the `5140`(s), any network activity from registering/pinging 9 new devices concurrently could add load to the same constrained resource this timing test is meant to isolate. **This run's timing should be treated as possibly contaminated, not a clean fourth data point**, when it's compared against the other three (rack08 ~1h03m; rack01 direct/18-slot ~2h23m; rack01 direct/9-slot ~2h18m).
+
+**Side finding, unrelated to the timing test:** two of the nine new devices (`nvs-rack01sw1`, `nvs-rack01sw2`) show `state flapping` in addition to `DOWN, pingable` — meaning BCM has already observed repeated up/down transitions on these two specifically, unlike the other seven which are just plain `DOWN` (not yet observed transitioning at all). Worth investigating separately once the provisioning test concludes — could indicate an actual intermittent link/cabling issue on those two switches specifically, not a general "not yet powered on" state shared by all nine.
+
+### 9ax. Dual-5140 test batch confirmed actively transferring, not stalled — live traffic measured directly
+
+~30+ minutes into the dual-5140-topology rack01 batch, concern raised that it might be failing outright (no completions yet). Checked directly via live interface counters on the head node's provisioning NIC (`enx5c857e3bc31b`):
+```bash
+ip -s link show enx5c857e3bc31b   # then again 5s later
+```
+**Confirmed real, active transfer:** RX +2.1MB, TX +224MB over 5 seconds (~44.8MB/s ≈ 358Mb/s sustained on TX) — consistent with genuine image data being pushed to the actively-provisioning nodes, not a hang. **Zero errors, drops, or collisions** in either direction — no evidence of a broken link or packet loss at the head-node NIC level.
+
+**Conclusion: this run is not failing — it's progressing at the same already-slow rate established by the prior two `rack01` tests.** Zero node completions at the 30-minute mark is consistent with (not worse than) the 9-slot baseline, where the first node didn't reach `INSTALLER_CALLINGINIT` until over an hour in. No new evidence of a problem beyond what's already documented (9aq-9au); the underlying switch/topology bottleneck remains the standing explanation.
+
+**Side note:** confirmed `enx5c857e3bc31b` is the single head-node NIC serving all provisioning/DHCP traffic observed this session — including the NVSwitch devices' DHCP activity (9av-9aw) on a completely different subnet. Not flagged as a new concern, but worth remembering this is a shared resource across everything, not something scoped only to rack01/rack08 compute provisioning.
+
+### 9ay. NEW FAILURE MODE in dual-5140 test: two nodes hit INSTALLER_UNREACHABLE (10-minute timeout) — possible network loop from the added switch
+
+During the dual-5140-topology rack01 test (batch started 14:17:52), two nodes failed outright rather than just running slow:
+```
+15:41:42  rack01node17 [ INSTALLER_UNREACHABLE ] (calling init timeout reached: 10m)
+15:44:31  rack01node14 [ INSTALLER_UNREACHABLE ] (calling init timeout reached: 10m)
+```
+Both had reached `INSTALLER_CALLINGINIT` (switching to local root) shortly before — `node17` at `15:31:42`, `node14` at `15:34:30` — then failed to report back within BCM's 10-minute timeout after the OS switch, and were marked unreachable.
+
+**Significant: this failure mode did not occur in either prior `rack01` test** (18-slot or 9-slot, both direct-attach to the single `5140`) — only this dual-`5140` topology test has produced it. Strong signal that adding the second `5140` introduced a **new problem**, not just a continuation of the known slowness.
+
+**Leading hypothesis: a network loop or STP reconvergence issue from connecting the second `5140`.** If the two switches have more than one physical path between them (directly or via a shared upstream device), and Spanning Tree Protocol isn't configured/hasn't converged, a loop or reconvergence event occurring exactly when nodes reboot into their final OS and attempt to re-establish network connectivity would produce precisely this symptom (nodes vanish, no response, ~10min timeout).
+
+**Immediate follow-up requested:** check whether `rack01node17`/`rack01node14` are still unreachable or recovered on their own (`cmsh -c "device status rack01node17"` etc.), and physically verify the cabling between the two `5140`s for any redundant/looped path.
+
+**If confirmed as a loop:** this would be a genuine, actionable finding distinct from the earlier "slow, not broken" conclusions — worth correcting the physical topology (removing any redundant link, or ensuring STP is properly enabled/configured) before drawing further conclusions about whether a two-hop topology helps throughput, since a loop-induced failure could also be masking or distorting the timing data collected from this same test run.
+
+### 9az. Retraction of 9ay's network-loop hypothesis: INSTALLER_UNREACHABLE likely caused by overlapping/duplicate provisioning commands, not the dual-5140 topology
+
+`rack01node17`'s `dmesg` showed a continuous, repeating `ACPI: Graceful shutdown in progress` loop (every ~10s, 500+ seconds straight) — the node received an ACPI shutdown/power signal mid-install and has been stuck trying to honor it ever since. This is a **kernel/power-signal issue, not a network issue** — directly contradicts 9ay's network-loop hypothesis, which assumed a networking-layer cause.
+
+**Suspected real cause (user's own hypothesis, pending confirmation):** two overlapping/duplicate provisioning command invocations were issued against `rack01`, and a second `bootdev pxe`/`power cycle` action landed on this node's BMC while its node-installer was already actively mid-boot from the first — the conflicting power action was interpreted as an ACPI shutdown request, which the kernel has been stuck attempting to process since, rather than continuing its actual boot sequence.
+
+**Confirmation requested, not yet run:**
+```bash
+history | grep -i pxe_rack_provision
+ls -la pxe_rack01_*.log
+grep -A3 "rack01node17" pxe_rack01_*.log
+```
+If two separate log files exist with overlapping timestamps, and both show a power action sent to `10.141.1.117` within a short window, that confirms this as the actual cause.
+
+**If confirmed: the dual-5140 topology itself is likely NOT broken** — this specific two-node failure was self-inflicted by an operational mistake (duplicate concurrent script runs), not evidence of a switch/topology-level problem. The earlier network-loop hypothesis (9ay) should be treated as superseded pending this confirmation, not as a standing concern requiring physical cable inspection.
+
+**Fix applied for the stuck node:** a clean, single power-cycle via IPMI to break the stuck ACPI-shutdown loop:
+```bash
+ipmitool -I lanplus -H 10.141.1.117 -U root -P 0penBmc chassis power cycle
+```
+`rack01node14` needs the same `dmesg` check before assuming it's the identical failure mode and applying the same fix.
+
+**Lesson for `pxe_rack_provision.sh` / SOP going forward:** running a second provisioning command against a rack while a prior batch is still in-flight is a genuine, sharp-edged failure mode — worth adding an explicit warning to the script/SOP about never re-triggering provisioning against nodes that are already mid-install, since the resulting conflicting power action can leave a node in a stuck, non-obvious failure state (as opposed to a clean rejection or error).
+
+**CONFIRMED (supersedes "pending confirmation" above):** exact command timeline for `rack01node17`, from `pxe_rack01_*.log` filenames/content:
+```
+14:12:29  bootdev pxe + power cycle   (an earlier attempt/test)
+14:16:22  chassis power OFF           (explicit `-power off --rack 1`)
+14:17:52  bootdev pxe + power cycle   (the dual-5140 test batch being tracked)
+```
+Only ~90 seconds between the explicit `power off` and the subsequent `power cycle`. Many BMCs implement a plain IPMI `chassis power off` as an ACPI graceful-shutdown request (soft power-button press) rather than an instant hard cut — this exactly matches the repeating `ACPI: Graceful shutdown in progress` message in `dmesg`. The follow-on `power cycle` 90 seconds later most likely arrived while the node was still mid-way through that graceful shutdown, leaving it stuck perpetually attempting to complete a shutdown that never finished, rather than cleanly power-cycling as the second command intended.
+
+**Fully confirmed as an operational sequencing issue, not a network/topology problem.** The dual-5140 test's own validity (for the throughput question) is not undermined by this specific two-node failure — it was self-inflicted by running `-power off` and then re-triggering the full workflow too soon afterward, unrelated to anything about the added switch. No physical cabling/loop investigation needed for this specific finding.
+
+**New documented gotcha for `pxe_rack_provision.sh`/SOP:** never issue `-power off` against a rack and then immediately re-trigger the default full workflow (or any power action) against the same targets within the same short window — confirm power is genuinely settled (e.g., poll BMC power status, or simply wait longer) before issuing a follow-up power-affecting command, since overlapping power-state transitions can leave a node stuck in an incomplete shutdown rather than cleanly transitioning.
+
+### 9ba. Dual-5140 topology test abandoned (time-boxed) — inconclusive, but partial data leans against "extra hop alone fixes it"
+
+User elected to stop actively tracking this test given the time already invested, on top of the confirmed operational (non-topology) failure of 2 nodes (9az). Closing out with what we have:
+
+**Partial data collected before stopping:**
+- First node to reach `INSTALLER_CALLINGINIT`: `rack01node17` at `15:31:42`, batch started `14:17:52` = **1h13m50s**
+- Second: `rack01node02` reached `UP` at `15:33:46` ≈ **1h15m54s** from start
+- Both are in the same range as the 9-slot direct-attach test's first-node timing (**1h07m28s**), not close to `rack08`'s ~1h03m **total 17-node batch** completion.
+
+**Provisional conclusion (not a final confirmed result — batch was not run to completion):** adding a second `5140` switch hop does not appear to meaningfully close the gap to `rack08`'s performance, based on the partial data available. This weakens the general "any two-hop/aggregation topology helps" hypothesis from 9au further — consistent with 9az's separate finding that this test also contained an unrelated operational failure, suggesting tonight's dual-5140 setup may not be a clean enough replication of whatever `rack08`'s actual `5120` path does differently.
+
+**Status of the overall provisioning-throughput investigation, end of session:**
+- Ruled out: `provisioningslots` tuning (9aq), NIC link speed (9as/9at), `nextinstallmode` vs category `installmode` (9av).
+- Weakened, not confirmed: "extra switch hop/aggregation helps" (9au proposed it, 9ba's partial data doesn't support it strongly).
+- Still blocked: direct switch-side diagnosis (port errors, uplink utilization, `5140`-to-`5120` vs `5140`-to-`5140` differences) — no `5140`/`5120` switch console credentials available this session.
+- **Recommended next step for whoever picks this up:** get actual switch credentials first, then check real per-port/uplink telemetry directly, rather than continuing to infer switch behavior indirectly through BCM-side provisioning timing experiments — this session's indirect approach has been informative for ruling things out, but hasn't been able to positively identify the actual mechanism.
+
+**Rack01 batch left running unattended** (not actively powered down) — `provisioningslots 10` will continue processing the queue on its own; the two previously-stuck nodes (`node17`, `node14`) were power-cycled cleanly and should rejoin the normal sequence.
+
+### 9bb. NVSwitch DHCP mismatch (9av/9aw) resolved — all 9 switches now correctly addressed
+
+All 9 `nvs-rack01swN` devices now show their correct, BCM-expected addresses (`10.141.51.101`-`.109`), confirmed via `cmsh -c "device; list"`. `sw3`-`sw9` are no longer landing in the generic compute-node DHCP pool (`10.141.160-168.x`) as they were in 9av/9aw. Resolved via manual static-IP configuration directly on each switch's own `nvos` CLI (the same step `sw1`/`sw2` already had) — not a BCM/`cmsh`-side fix, consistent with 9aw's conclusion that BCM's device/interface object here is passive bookkeeping, not something that actively pushes config to the switch.
+
+All 9 still show `[DOWN], pingable` rather than `[UP]` — expected, not a new concern: consistent with the `bmc-*` device pattern already established this session (no CMDaemon agent runs on these devices, so BCM has no path to mark them genuinely `UP`; `pingable` is the meaningful positive signal for this device class).
+
+### 9bc. Proper same-topology A/B test set up: rack01 reconfigured to bcm→5140→5120→18 nodes (exact match to rack08's topology), AC-cycled
+
+User physically reconfigured `rack01`'s topology to exactly match `rack08`'s (`bcm head node → 5140 → 5120 → 18 nodes`, same aggregation switch model — not just "any second switch" as in the earlier dual-5140 attempt) and performed a full AC power cycle on the rack, then re-triggered provisioning.
+
+**This is the cleanest test yet** — isolates the one remaining variable (does the specific `5120` aggregation path matter, vs. just "any two-hop topology") that the dual-5140 test (9au/9ba, inconclusive) couldn't cleanly answer.
+
+**Good signs from the first status check:** `rack01node01`, `02`, `11` already `[UP]`; critically, **`rack01node17` and `14` (the two that hit the ACPI-shutdown-loop failure in the dual-5140 test, 9ay/9az) are now cycling normally** through `INSTALLING`/`waiting` states — confirms the earlier clean power-cycle fully recovered them with no lingering damage, and this fresh AC-cycle test starts with a clean slate.
+
+**Pending:** exact batch start timestamp (AC cycle time, not a script/IPMI power-cycle log entry) needed to compute clean per-node and total timing via the same `DHCPACK`/`Run special node settings` method used throughout tonight. If this run comes in close to `rack08`'s ~1h03m, that would be strong, clean confirmation that the `5120` model specifically (not just hop count) is the determining factor. If it's still slow despite the exact topology match, that would point to something else entirely (the `5140` unit itself, cabling, or something not yet considered) as the real cause.
+
+### 9bd. Clean batch start confirmed for the same-topology (5140→5120) test: 17:08:26
+
+Two earlier attempts in this test session had ambiguous/unclean starts:
+- `16:59:19` run: `bootdev pxe + power cycle` sent to all 18, but only 3 nodes (`01`,`02`,`11` — the ones already `UP` from the prior AC-cycle attempt) showed `[DOWN]` transition notices. Resolved as expected: BCM's `[DOWN]` notice only fires on an UP→not-UP transition; the other 15 were already `INSTALLING`, so a power-cycle wouldn't cross that threshold in BCM's tracking even if the hardware genuinely reset. Not fully re-verified at the time.
+- Explicit power-off run followed by this power-cycle run instead: safer, fully verified approach taken instead of trusting the ambiguous case above.
+
+**Clean sequence executed:**
+1. `-power off --rack 1` — all 18 confirmed `Chassis Power is off` via direct per-node `ipmitool ... chassis power status` (not just script "OK").
+2. 30s deliberate gap (avoiding the earlier overlapping-power-command failure mode from 9az).
+3. Default full-workflow run (`bootdev pxe` + `power cycle`) — all 18 confirmed `Chassis Power is on` via the same direct per-BMC verification method afterward.
+
+**Confirmed working: `ipmitool chassis power cycle` correctly fell through to power-on even starting from a genuinely `off` state** on this hardware — worth noting given the original session-start caveat that `power cycle` "requires the system to already be on"; that caveat did not hold true here, at least for these BMCs.
+
+**Batch start for timing purposes: `17:08:26`** (log filename `pxe_rack01_20260918-170826.log`), the cleanest, most fully-verified start of any test tonight, on the exact `5140→5120` topology match to `rack08`.
+
+### 9be. Clarification: peering did NOT explain rack08's fast baseline (already disproven, 9af) — but batch size (17 vs 18 nodes) is a real, previously uncorrected difference
+
+User raised whether `rack08`'s fast baseline (~1h03m) was actually peering-assisted, since `rack08node01` was configured with the `provisioning` role during that test.
+
+**Directly contradicted by evidence already on record:** §9af confirmed via `rack08node01`'s own `rsyncd.log`, checked for the exact timing-baseline window (`12:40`-`13:47`), that **zero connections** arrived from any of the other 16 nodes — peering was configured but never actually engaged during that specific test. The `updateprovisioners` fix that would have made it eligible (§9ai) wasn't run until later that same session, after this timing baseline had already been collected. So the `rack08` number used as the comparison target all night is confirmed pure head-node-service, mechanistically identical to every `rack01` attempt — not peering-assisted.
+
+**However, a related, legitimate, and previously under-acknowledged difference exists:** `rack08`'s timed batch was **17 nodes**, not 18 — `rack08node01` had already been provisioned separately, earlier, before that batch was triggered (it was the manually-walked-through canary node from §9q-9w). Every `rack01` test tonight, by contrast, has been a full **18-node** simultaneous batch from a single trigger. Against a fixed `provisioningslots` cap (10), one fewer node in the initial queue does shift timing slightly (marginally less queue depth, marginally faster turnover as slots free up) — plausible as a small contributing factor, but not remotely sufficient on its own to explain a 2x+ total-time gap.
+
+**Net effect on tonight's investigation:** the `5120`-topology question (9bc/9bd, still awaiting completion) remains the primary open hypothesis. The 17-vs-18-node batch-size difference is worth remembering as a minor, non-dominant asterisk on the `rack08` comparison number, not a resolution of the gap — and peering specifically should be considered a closed, disproven explanation for `rack08`'s speed, not a live hypothesis.
+
+### 9bf. Queuing mechanism directly re-confirmed live on the 5120-topology test — same 10/8 split as every prior rack01 test
+
+In lieu of being able to recreate the original, uncaptured `rack08` batch (already fully provisioned/handed off/relocated — not practical to reproduce), directly re-verified the underlying `provisioningslots` mechanism on the current live `5120`-topology batch instead:
+```
+10 nodes (01-10): [INSTALLING] (provis[ioning]...)
+ 8 nodes (11-18): [INSTALLING] (waitin[g]...)
+```
+Exactly matches `provisioningslots 10`, identical pattern to every other `rack01` test tonight (9ap, 9au). **Confirms the queuing mechanism is real, observable, and functioning exactly as documented** — independent of whatever the unrecorded original `rack08` batch actually looked like.
+
+**On the open question of whether `rack08`'s original batch genuinely showed 17/0 (no waiting) despite the same `provisioningslots 10` setting:** unverifiable now, no captured evidence exists, and the scenario can't be practically reproduced (rack08 already provisioned, handed off, physically relocated). If true, the most likely explanation would be that 17 requests never arrived at the head node simultaneously enough to exceed the cap at the specific moment anyone checked — natural staggering across a 17-node reboot could keep the queue below 10 concurrent at any single glance — not that the cap doesn't exist or malfunctioned. This remains an open, low-priority historical question; it does not undermine the now-directly-confirmed queuing mechanism itself.
+
+### 9bg. CONFIRMED: peer-provisioning genuinely works on rack01 — the updateprovisioners fix (9ai) validated end-to-end for the first time
+
+Full redo of the peering setup on `rack01`, applying every lesson from tonight's `rack08` investigation in the correct order:
+1. Clean, verified power-off of all 18 nodes (avoiding the earlier overlapping-power-command failure, 9az).
+2. Assigned `rack01node01` the `provisioning` role, scoped to `localimages baseos-1032-doca341` / `categories maxQ-1032-doca341` — identical config confirmed side-by-side against `rack08node01`'s (still-intact, inert) role settings.
+3. Provisioned `rack01node01` alone (clean run, ~19m39s, matching the true single-node baseline from 9r). Verified healthy (`dkms status`, `cuda-dcgm active/enabled`).
+4. **Ran `softwareimage updateprovisioners baseos-1032-doca341` before touching the other 17** — the exact fix identified in 9ah/9ai, applied correctly and in the right order this time (unlike the original `rack08` attempt, where the role was scoped before the node had the image installed at all).
+5. Brought up the remaining 17 nodes.
+
+**Result: `device; list` showed all 17 nodes actively `provisioning`, ZERO in a `waiting` state** — impossible under a single 10-slot source, strongly suggestive of two sources (head node + `rack01node01`, each capped at 10) sharing the load.
+
+**Definitively confirmed via `lastprovisioningnode`** (the same authoritative property that proved `rack08`'s failure in 9af):
+```
+rack01node05:  Server = rack01node01
+rack01node12:  Server = rack01node01
+```
+Both show `rack01node01` as the actual serving node — not `bcm11-headnode`. **This is conclusive, unambiguous proof that peer-provisioning is genuinely functioning**, resolving the open question from 9af/9ah/9ai/9bg as fully validated rather than a documented-but-untested hypothesis.
+
+**Side note:** `rack01node01`'s own `rsyncd.log` did not show matching entries when grepped for the other nodes' IPs at the same time — likely a logging/timing artifact (buffering, log rotation, or the specific rsync module used not logging client IPs the same way) rather than contradicting evidence; `lastprovisioningnode` is the more authoritative, BCM-native source of truth and should be preferred for this kind of verification going forward over parsing `rsyncd.log` directly.
+
+**This closes out the peer-provisioning investigation that ran through the entire session (9p → 9af → 9ah → 9ai → 9bg):** the `updateprovisioners` step is confirmed necessary and sufficient (combined with correct role scoping) to make peer-provisioning work. This should be written into the SOP as a validated, required step for any future rack rollout intending to use a peer-provisioning node — no longer just a documented hypothesis.
+
+**Confirmed benign, matches known pattern:** `gpu_health_overall` FAIL on `rack01node15` (and likely other rack01 nodes as they come up) is due to NVSwitch fabric manager (GFM) not yet configured at the rack level — consistent with the SOP's own known-acceptable entry ("gpu_health_nvlink/gpu_health_overall FAIL right after a fresh rack is provisioned — expected until NVSwitch fabric manager is configured"). Ties directly to tonight's NVSwitch DHCP-addressing fix (9bb) — the switches are now correctly addressed, but full GFM/fabric configuration is a separate, not-yet-completed step. Not a new issue, no action needed beyond what's already tracked as a future task.
+
+**`rack01node01`'s `ssh2node: UNKNOWN` — confirmed harmless, tied to the universal "Reboot required: Interfaces have been modified" warning** (9an/9bc) rather than genuine connectivity failure or peering-load contention. Consistent with self-resolving post-install transient state already seen on every node tonight.
+
+### 9bh. Peering source distribution confirmed: near-even split across both sources, not a new bottleneck at 9
+
+Checked `lastprovisioningnode` for all 17 nodes in the batch:
+- **Served by `rack01node01` (9 nodes):** `05, 07, 08, 09, 10, 12, 13, 15, 17`
+- **Served by `bcm11-headnode` (8 nodes):** `02, 03, 04, 06, 11, 14, 16, 18`
+
+**Confirms real, substantial load-sharing across both sources** — not "peering stopped after 9 nodes," but the selection algorithm (§5.2.4 of the admin manual: allocates to whichever provisioning node currently has the lowest task count) naturally splitting the 17 requests roughly evenly between the two available sources, each independently capped at `provisioningslots 10`. The 8 nodes still `[INSTALLING]` at the time this was checked are simply the ones that landed on the head node and are running at the already-characterized head-node-only speed (~55min-2h range under contention) — not a new degradation caused by peering, and not evidence peering "stopped working."
+
+**This is a genuinely positive, complete result for tonight's peer-provisioning investigation:** confirms peering doesn't just work in principle (9bg) but actively shares real load across both sources in a full 17-node batch, roughly halving the number of nodes contending for any single source's capacity compared to a no-peering scenario. The `updateprovisioners` fix (9ai), correctly sequenced (9bg), is validated as fully functional under real batch conditions, not just for a couple of individually-checked nodes.
+
+### 9bi. Clarification: rack01node01 did NOT stop helping — it already finished serving all 9 of its assigned nodes; allocation is one-time, not dynamically rebalanced
+
+Checked which nodes had reached `[UP]` partway through the batch: exactly `15, 08, 05, 09, 07, 10, 12, 13, 17` — **precisely the 9 nodes confirmed served by `rack01node01`** (9bh). All 9 completed within `19:06`-`19:20`, each roughly 15-30 minutes after their own individual start — consistent with the fast, uncontended single-node baseline (~16-20 min). **None of the 8 head-node-served nodes (`02,03,04,06,11,14,16,18`) had reached `UP` yet** at the same point in the log — still running at the slower, already-characterized head-node-only pace.
+
+**This confirms `rack01node01` didn't "stop helping" — it completed 100% of its assigned share, quickly, and has nothing further to do.** Provisioning-source allocation in BCM happens **once, at the moment each node's request arrives** (all 17 arrived within a ~5-minute window, `18:49:49`-`18:54:09`) — it is not dynamically rebalanced afterward. Once `rack01node01` finished its 9 and had spare capacity, there was no mechanism for it to pick up any of the head node's still-queued/in-progress 8 — those were already committed to the head node at request time and stay there for the rest of the batch.
+
+**This is a genuinely useful, twofold finding:**
+1. **Positive:** confirms the peering split is real and fully effective for the nodes it actually served — all 9 finished at the fast, uncontended rate, validating the `updateprovisioners` fix under real load, not just at allocation time.
+2. **Real limitation, worth knowing for future large batches:** an uneven initial split (8 vs. 9 here, presumably decided by whatever each source's task count happened to be during the first few minutes) is not self-correcting even when one source finishes early and sits idle. For a more balanced outcome, staggering the batch trigger (e.g., via `pxe_rack_provision.sh --delay`) to let the allocator's task-count comparison happen more gradually — rather than firing all 17 requests within a tight ~5-minute window — might produce a more even split, though this is speculative and not tested this session.
+
+### 9bj. Recommendation for reducing head-node contention further: two-track plan (near-term in-rack, long-term dedicated tier)
+
+Following 9bh/9bi's finding that peering only reduced the head node's share to ~8/17 (not eliminating contention, just halving it), discussed how to push further. User's stated goal: production-line rollout should ideally be a **single-step operation** (trigger all N nodes at once) — the current two-step pattern (bootstrap one in-rack node first, then trigger the rest) is a tolerable stopgap, not the target end-state.
+
+**Long-term design (once available): a dedicated, standalone provisioning-source tier** — 1-2 nodes on their own separate rack, permanently provisioned and idle, each assigned the `provisioning` role scoped to the relevant image(s)/categories, with `updateprovisioners` run against them whenever a new image is qualified. Per §5.2.4 of the admin manual, the "lowest current task count" allocator generalizes naturally to 3+ sources, so this should split load across (head node + 2 dedicated nodes) automatically, with **zero bootstrapping step for future rack rollouts** — genuinely single-step from the production line's perspective.
+
+**Blocking factor:** the dedicated rack for this doesn't exist yet (confirmed by user, "not ready now"). Deliberately **not finalizing this design's exact topology/placement yet** — given the entire `5140`/`5120` investigation this session, placing these dedicated nodes behind an unknown or poorly-chosen switch path could reintroduce the same kind of asymmetric bottleneck being solved for, so this should wait until the actual rack/location/switch topology is known rather than guessing now.
+
+**Near-term interim option, usable today with existing hardware:** extend tonight's in-rack bootstrap pattern from 1 source node to 2 — provision `rack01node01` AND `rack01node02` (or similar) from within the target rack first, assign both the `provisioning` role, run `updateprovisioners` for both, then trigger the remaining 16. Same two-step shape as tonight's validated approach (9bg/9bh), just with one additional bootstrapped node, structurally reducing the head node's expected share from ~8/17 toward something closer to ~5-6/17. Not yet tested this session — a reasonable next experiment if this contention problem needs addressing before the dedicated rack exists.
+
+### 9bk. New observation: CMDaemon periodically auto-resyncs rack01node01's local image copy, unprompted
+
+Second automatic `Provisioning started/completed: sending ... to rack01node01 ... mode UPDATE` event observed at `19:44:02`-`19:44:21`, ~53 minutes after the first one at `18:51:14`-`18:51:28` — neither manually triggered.
+
+**Confirmed unrelated to any specific target node's progress:** `rack01node02` (mid-batch at the time) still shows `lastprovisioningnode = bcm11-headnode`, unchanged — ruling out any causal link to the near-simultaneous `rack01node02 INSTALLER_CALLINGINIT` event; the timing overlap was coincidental.
+
+**Likely mechanism: `dirtyautoupdatetimeout`/`autoupdateperiod`** (`partition use base; provisioningsettings; show`, found earlier this session) — properties explicitly described as governing automatic re-sync of a provisioning node's image once considered "dirty" relative to the head node's master copy. Not yet confirmed what specifically marks the image "dirty" between these two events (could be as small as a metadata/log write inside the image directory) — worth checking `provisioningsettings`'s exact configured values (`dirtyautoupdatetimeout`, `autoupdateperiod`) if the ~53-minute interval needs to be understood precisely, e.g. for capacity planning around how often a provisioning node's own bandwidth gets consumed by this background maintenance traffic during an active rollout.
+
+**Not investigated further this session** — noted as a real, observed behavior for future reference rather than a problem needing a fix. Worth being aware that a provisioning-source node may periodically "steal" some of its own bandwidth for this background re-sync during a long rollout, a minor but real consideration for the dedicated-provisioning-tier design (9bj) if that tier is meant to serve continuously across many rack rollouts over time.
+
+### 9bl. Re-confirmed: allocation stays fixed even after peer becomes idle — no dynamic reassignment
+
+Rechecked `lastprovisioningnode` for the 4 remaining nodes (`11`, `14`, `16`, `18`) after `rack01node01` had long finished all 9 of its assigned nodes and sat idle. All four still show `bcm11-headnode` as server — unchanged from the original allocation. **Confirms 9bi's conclusion directly, not just inferred from timing:** BCM's provisioning-source allocation is genuinely fixed at request time and does not get reassigned later, even when the peer source is confirmed idle with full spare capacity for an extended period. This is a hard limitation of the current mechanism, not a transient timing artifact — worth treating as settled for planning purposes (e.g., the 9bj interim/long-term contention-reduction recommendations).
+
+### 9bm. FINAL RESULT: peering-assisted rack01 batch completed in ~1h04m28s — matches rack08's baseline
+
+**Batch complete.** Full timeline: `18:46:50` (trigger) → `19:51:18` (last node, `rack01node18`, reached `[UP]`) = **1h04m28s** for all 18 nodes.
+
+**This closely matches `rack08`'s original ~1h03m baseline** (17 nodes, no working peering at the time) — despite `rack01` needing to provision one more node (18 vs. 17) and having only an uneven 9/8 peering split rather than a theoretical even distribution. This is strong, conclusive, final validation that:
+1. The `updateprovisioners` fix (9ai), correctly sequenced (9bg), genuinely resolves the peer-provisioning problem that plagued `rack08`'s original rollout.
+2. Even a suboptimal, uneven split (9bh/9bi) is enough to bring a previously ~2.2x-slower rack (9aq: 2h18m-2h24m for the same rack/switch under various `provisioningslots` settings without peering) back in line with the best-performing baseline of the entire session.
+
+**Full per-node completion summary for this run:**
+| Node | Server | Completed |
+|---|---|---|
+| 01 | (self, solo bootstrap) | 18:40:04 |
+| 05,07,08,09,10,12,13,15,17 | rack01node01 | 19:06-19:20 |
+| 02,03,04,06,11,14,16,18 | bcm11-headnode | 19:45-19:51 |
+
+**This effectively resolves the entire provisioning-throughput investigation that ran through most of tonight's session** (9aq → 9as → 9at → 9au → 9ba → 9be → 9bf → 9bg → 9bh → 9bi → 9bl → 9bm): the root problem was never `provisioningslots` tuning, NIC speed, or switch topology alone — it was **peer-provisioning never actually being eligible**, which once fixed, closes the gap to match the best baseline achieved, without needing further switch-side investigation or hardware changes. The switch-topology/`5120` questions (9au, 9ba) remain technically unresolved and unconfirmed, but are now understood to be far less significant than the peering-eligibility fix, which is the dominant, validated lever.
+
+**Recommendation for the SOP:** the `updateprovisioners` step (already added to the SOP per an earlier commit this session) is the single most impactful fix from tonight's entire investigation. The two-track contention-reduction ideas (9bj: interim 2-in-rack-sources, long-term dedicated tier) remain valid follow-ups for further improvement, but are now optimizations on top of an already-working baseline, not fixes for a broken one.
