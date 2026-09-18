@@ -1333,3 +1333,263 @@ Computed from real log timestamps: start = each node's first `DHCPACK` (node-ins
 **Directly corroborates 9af's negative peering finding rather than sitting separately from it:** since peer-provisioning was confirmed to never engage (zero rsync connections to `rack08node01` from any of the other 16 nodes), all 17 genuinely contended for the head node simultaneously — this timing data quantifies the real cost of that: roughly half the rack paid a 3.5-4x time penalty. If peer-provisioning were made to actually work (the open item from 9af/9p), this contention penalty is the concrete, measured problem it would need to solve.
 
 **Recommendation for future batches of this size:** either get peer-provisioning genuinely working first (see 9af's open questions), or use `pxe_rack_provision.sh --delay <N>` to stagger the batch deliberately, trading a longer *scheduled* rollout for avoiding this unscheduled, uneven 3.5-4x contention penalty on whichever nodes happen to queue behind others.
+
+### 9ah. Root cause of peering failure and the 9/8 timing split — found in the BCM Administrator Manual, not by further trial-and-error
+
+User provided the actual BCM Administrator Manual (PDF, 1090 pages) after several rounds of live-hardware guessing failed to find the real mechanism. Searched directly (§5.2 "Provisioning Nodes") rather than continuing to guess `cmsh` commands blind.
+
+**Key documented facts, verbatim from the manual:**
+
+1. **"The head node also always has a provisioning role"** — `rack08node01`'s role was never a *replacement* for the head node as a source; it was always competing *alongside* the head node's own implicit provisioning role. This reframes the entire exercise: there was never a scenario where "the head node" wasn't a candidate.
+
+2. **Provisioning Node Selection (§5.2.4):** *"When a node requests provisioning, the head node allocates the task to a provisioning node. If there are several provisioning nodes that can provide the image required, then the task is allocated to the provisioning node with the lowest number of already-started provisioning tasks."* — Selection is load-based (task count), not proximity/GNSS/config-scope-based. Our `localimages`/`categories` settings on `rack08node01`'s role only ever controlled *eligibility*, never *preference*.
+
+3. **Eligibility is tracked, not inferred from disk contents:** *"CMDaemon tracks the provisioning nodes role changes, as well as which provisioning nodes have up-to-date images available"* (§5.2.2) — a provisioning node's local files matching the target image by coincidence is **not** the same as CMDaemon's own internal bookkeeping recognizing it as eligible. The canonical path to that recognition is the `updateprovisioners` command (§5.2.4), which runs automatically on role-property changes, or on a request when CMDaemon itself is driving an image change.
+
+4. **Likely actual root cause of zero engagement:** `rack08node01`'s role scope (`localimages`/`categories`) was set (9p) **before** the node had `baseos-1032-doca341` installed on itself at all — `updateprovisioners` ran then, with nothing yet to sync. The node later acquired the image through a **normal client FULL install** (PXE/node-installer), not through the `updateprovisioners` push mechanism. Per the manual's distinction between these two pathways, this plausibly means CMDaemon's internal "has up-to-date images" tracking was **never actually updated** for `rack08node01` after its own install completed — it may have remained perpetually ineligible despite having the correct files on disk, explaining the clean **zero** engagement (9af) rather than a partial/statistical split.
+
+5. **Provisioning Tasks Deferral (§5.2.4), directly explains 9ag's bimodal timing split:** *"A provisioning request is deferred if the head node is not able to immediately allocate a provisioning node for the task. Whenever an ongoing provisioning task has finished, the head node tries to re-allocate deferred requests."* Combined with **`Provisioning Slots` defaulting to 10** per provisioning node (§5.2.1) and **`MaxNumberOfProvisioningThreads` defaulting to 10000** cluster-wide (Appendix C — confirmed NOT the bottleneck, far too high) — if all 17 requests landed on the head node's own implicit provisioning role alone (per point 4), its default 10-slot cap would explain the fast/slow split almost exactly: ~9-10 nodes served immediately, the remainder deferred until a slot freed, closely matching both the group sizes (9 fast / 8 slow) and the ~40-45 minute gap between them.
+
+**Recommended fix for the next batch (not yet applied to this already-completed rollout):**
+```bash
+# After rack08node01's own install completes and is confirmed healthy,
+# BEFORE rebooting the other 17 - forces CMDaemon to explicitly
+# re-register the node as having a genuinely up-to-date image:
+cmsh -c "softwareimage; updateprovisioners baseos-1032-doca341"
+
+# Also worth checking/raising the head node's own implicit provisioning
+# role's Provisioning Slots if it's still at the default 10:
+cmsh -c "device use bcm11-headnode; roles; use provisioning; show"
+```
+
+**Not yet re-tested this session** — this is a documented, well-supported explanation, not yet re-validated by actually running `updateprovisioners` and re-checking `rack08node01`'s rsync log on a future batch. Treat as the leading hypothesis, confirm with real evidence next time rather than treating as fully closed.
+
+**Broader lesson for this whole investigation:** several rounds of plausible-sounding but wrong guesses (`minimalloadforoffload`'s real meaning turned out to be about keeping provisioning nodes' own cached images in sync, not routing client installs; head-node CPU load was correctly ruled out but for a different reason than assumed) were resolved quickly once the actual manual was searched directly. Worth checking documentation before further trial-and-error on live hardware for BCM-specific mechanisms generally, not just this one.
+
+### 9ai. CONFIRMED: `rack08node01`'s image was never recognized as up-to-date by CMDaemon until `updateprovisioners` was run manually
+
+```
+[bcm11-headnode->softwareimage]% updateprovisioners
+updateprovisioners [ COMPLETED ]
+Thu Sep 17 15:03:13 2026 [notice] bcm11-headnode: Provisioning completed: sent
+  bcm11-headnode:/cm/images/baseos-1032-doca341 to rack08node01:/cm/images/baseos-1032-doca341,
+  mode UPDATE, dry run = no
+```
+
+This confirms 9ah's central hypothesis directly: if CMDaemon had already tracked `rack08node01` as having an up-to-date copy of `baseos-1032-doca341` (which it did, physically, on disk — that's what it had just finished installing as its own OS), this command would have been a no-op. **It explicitly sent/updated the image instead** — proving CMDaemon's own internal "provisioning nodes with up-to-date images" state genuinely did not recognize `rack08node01` as eligible, despite the files being physically correct. The node's own normal client FULL install never satisfied CMDaemon's tracked-eligibility requirement — only an explicit `updateprovisioners` run does that.
+
+**This is now the confirmed root cause of the peering failure (9af), not just a hypothesis.** For the next rack of this kind, running `softwareimage updateprovisioners` (scoped to the target image, or run for all) **after the designated provisioning node's own install completes and before rebooting the rest of the rack** should make it genuinely eligible for selection — closing the loop that caused zero engagement and the resulting 3.5-4x contention penalty on 8 of 17 nodes (9ag).
+
+**Not yet re-validated end-to-end** — this rack's 17 nodes are already provisioned, so there's no further live test to run against them specifically. The confirmed fix should be written into the SOP as a required step before the next new rack/category's rollout, and validated for real on that occasion (checking `rack08node01`'s — or the next rack's provisioning node's — rsync log afterward, same method used to detect the original failure).
+
+### 9aj. `rack_lifecycle.sh` modified — `--with-pre-diag` flag added to `handoff` (1.0.0 -> 1.1.0)
+
+Added an opt-in `--with-pre-diag` flag to the `handoff` subcommand that runs `pre-diag` on each node immediately after `handoff` completes, in the same invocation. Deliberately **not** folded into `handoff` unconditionally — `handoff` (moving off the BCM network) and `pre-diag` (about to run diag tooling, disables `cuda-dcgm`) are different lifecycle moments that don't always happen back-to-back; making `pre-diag` automatic would lose GPU monitoring on any rack that isn't starting diag testing immediately.
+
+**Validated:** rejects `--with-pre-diag` on any subcommand other than `handoff`; dry-run confirms `do_pre_diag` correctly chains after `do_handoff` for each target when the flag is set.
+
+**Separately, an unresolved bug surfaced this session during rack08's real handoff run:** `cmsupport` ended up present in **neither** LDAP-resolvable form nor as a local account on all 18 nodes after handoff (`grep cmsupport /etc/passwd` and `/etc/group` both empty). Initial theory (step 1's DNS edit breaking step 2's `id cmsupport` check) was **disproven** — `getent hosts ldapserver` resolves fine via static `/etc/hosts`-style cluster aliases, independent of the DNS setting that was changed. Root cause not yet found; the console output from the actual `handoff` run (not the dry-run, which doesn't execute anything) would show which branch step 2 took on each node and hasn't been captured/reviewed yet. **Not yet fixed in the script** — needs the real root cause before changing step 2's logic, to avoid guessing a fix for the wrong problem a second time. Immediate mitigation (manually recreating `cmsupport` locally with the known `uid=1000, gid=1000, group=pega` values) was offered but not yet confirmed as executed.
+
+**Correction to 9aj, same session:** user correctly flagged that `handoff`'s changes are one-way — there is no rejoin/finalize path implemented in this script at all, so a node never returns to BCM-managed state on its own or via reboot. This is a materially different kind of permanence than `pre-diag`'s `cuda-dcgm` disable, which **is** reversible afterward via `post-diag` (confirmed this works via local `systemctl` + a local state file only, no BCM/LDAP connectivity required, so it functions fine even on an already-handed-off node). The two actions `--with-pre-diag` compounds have **asymmetric reversibility** — worth being precise about rather than treating them as equivalently "different lifecycle moments."
+
+**Script strengthened accordingly:** `--with-pre-diag` now requires an explicit typed `yes` confirmation (skipped only under `--dry-run`) stating this asymmetry plainly before proceeding, rather than just a passive header comment. Verified: `--dry-run` skips the prompt entirely; rejecting the prompt aborts cleanly (exit 1) before touching any node; accepting proceeds normally to `do_handoff` + `do_pre_diag`.
+
+### 9ak. CONFIRMED: `pre-diag` fix works — CMDaemon-level `monitored: no` stops the silent restart; `failed` state was a benign ExecStop race
+
+Real test on rack08: after applying `services; add cuda-dcgm; set monitored no; set autostart no; commit` via `device foreach -g rack08group (...)` (device-level override, confirmed via `services; list` showing `cuda-dcgm no no` with no bracket prefix — genuine device-level entry, not the implicit `[general]` one), ran `pre-diag --rack 8` for real, waited, and confirmed via `journalctl`: **no new restart occurred** — `Active: inactive (dead)` held after `reset-failed`, unlike every prior attempt where CMDaemon revived it minutes later.
+
+**The `active=failed` state seen in `status` right after `pre-diag` is benign, not a new problem:**
+```
+nv-hostengine pidfile /var/run/nvhostengine.pid could not be read.
+Unable to terminate host engine, it may not be running.
+cuda-dcgm.service: Control process exited, code=exited, status=1/FAILURE
+```
+`systemctl disable --now` kills the main process cleanly first (`ExecStart` shows `status=0/SUCCESS`); the unit's own `ExecStop` script then runs anyway, finds no pidfile (process already gone), exits 1, and systemd reports that as `failed` even though the actual outcome (`nv-hostengine` not running) is exactly correct. `systemctl reset-failed` clears the cosmetic state with no functional effect — confirmed `inactive (dead)` afterward, no auto-clear on its own needed.
+
+**Confirmed complete fix sequence for a real diag campaign, going forward:**
+1. `cmsh -c "device foreach -g <nodegroup> (services; add cuda-dcgm; set monitored no; set autostart no; commit)"` — from the head node, **before** `pre-diag`. This is the piece that actually stops CMDaemon reviving the service; without it, `pre-diag`'s systemd-level disable is silently undone within minutes.
+2. `bash ./rack_lifecycle.sh pre-diag --rack <N>` (or `--with-pre-diag` combined with `handoff`) — now genuinely durable.
+3. After diag testing: `post-diag` restores `cuda-dcgm`'s systemd state; separately, `cmsh -c "device foreach -g <nodegroup> (services; use cuda-dcgm; set monitored yes; set autostart yes; commit)"` (or `services; remove cuda-dcgm; commit` to fall back to the `[general]` default) restores CMDaemon-level monitoring — **not automatic**, must be done separately, easy to forget.
+
+**Script fixes applied (1.1.0 -> 1.2.0):**
+- Fixed a real bug in `do_status`: `$(systemctl is-active X 2>/dev/null || echo fallback)` concatenated the command's real stdout (printed even on non-zero exit, e.g. `failed`/`inactive`) with the fallback text, producing garbled multi-line output — exactly what was seen in the `status --rack 8` transcript after `pre-diag`. Fixed via two-step variable capture (`VAR=$(cmd 2>/dev/null); echo "${VAR:-fallback}"`) instead of the `||` chain, for both `nslcd` and `cuda-dcgm` status lines.
+- `pre-diag` now runs `systemctl reset-failed cuda-dcgm.service` automatically after disabling it, and prints an inline reminder of the required CMDaemon-level fix (with the exact command), since that fix cannot be run from within this script itself (requires `cmsh` on the head node; this script is designed to run from any jump host).
+
+**Not yet folded into the script directly**: the CMDaemon-level `services` fix itself, since it requires `cmsh`/head-node access this script doesn't assume. Currently a documented manual step (in the script's own inline reminder and here) rather than automated — worth reconsidering if this workflow becomes routine enough to justify breaking the jump-host-portability assumption.
+
+### 9al. `rack_lifecycle.sh` — CMDaemon-level `cuda-dcgm` monitoring disable folded into `handoff` itself (1.2.0, same version — pre-release addition)
+
+Per explicit request: the confirmed fix from 9ak (`cmsh ... services; add cuda-dcgm; set monitored no; set autostart no; commit`) is now run **automatically as part of `handoff`**, not left as a manual step or tied to `--with-pre-diag`. Added `disable_cmdaemon_dcgm_monitoring()`, called once (not per-node) right before the main per-target dispatch loop, only for the `handoff` subcommand.
+
+**Design constraints handled:**
+- This command needs `cmsh` on the machine running the script, and operates on the whole target list in one call — a different shape than the rest of the script's per-node SSH loop. Only fires automatically when targets were resolved via `--rack`/`--category` (which already proves `cmsh` is reachable, since that's how those hostnames got resolved). For `--ip-range`/`--rackgroup` targeting, prints a clear manual-fallback command instead of guessing at `cmsh` availability — those paths are typically already-handed-off, IP-addressed racks where `cmsh`/hostname resolution isn't guaranteed anyway.
+- Explicitly a **smaller, different, more permanent** action than `pre-diag`: only stops CMDaemon's own monitoring/auto-restart of `cuda-dcgm` — does not stop the service itself. Documented inline (printed at runtime) so this isn't silent, along with the exact reversal command (`services; use cuda-dcgm; set monitored yes; set autostart yes; commit`) — **not** automatically undone by `post-diag`, which only manages the systemd-level state.
+- Respects `--dry-run` (prints the command instead of running it).
+
+**Syntax verified against the BCM admin manual before implementing** (given several prior guessed-`cmsh`-syntax failures this session): confirmed comma-separated `foreach -n` lists are valid (`foreach -n node001,node008..node016,node032`, manual example), and confirmed the exact `services; add <name>; set ...` chain pattern is a documented example — with one deliberate deviation: the manual's example issues `commit` as a separate top-level command after the `foreach` block, while this script keeps `commit` inside the parentheses (as we did tonight, and independently confirmed working live via `services; list` afterward) — kept the empirically-validated-on-this-cluster form over the textbook form.
+
+**Tested:** both fallback branches (empty `CATEGORY_TARGETS`, missing `cmsh`) verified correct via isolated logic test — this sandbox has no `cmsh` binary, so the actual `cmsh` invocation branch could not be exercised end-to-end here; its command construction is identical to the already-manually-verified-working command from earlier in this session, just parameterized with the resolved hostname list.
+
+### 9am. Root cause of DNS/cuda-dcgm reversion found: category exclude lists don't cover the files we edit — AND category commits trigger a rack-wide service re-sync
+
+**Confirmed via `excludelistupdate`/`excludelistsyncinstall` comparison against what `handoff`/`pre-diag` actually edit:**
+- The exclude list protects `/etc/resolv.conf` — but `handoff` edits **`/etc/systemd/resolved.conf`** (a different file, the resolved daemon's own config containing the `DNS=` line). Not excluded at all — any category sync is free to restore it from the image.
+- The exclude list has explicit `/etc/systemd/system/*.wants/<service>.service` entries for many named services (`dhcpd`, `munge`, `slurmd`, etc.) but **no entry for `cuda-dcgm`** — any sync is free to recreate `multi-user.target.wants/cuda-dcgm.service`, silently re-enabling it. This exactly matches the `"Removed .../multi-user.target.wants/cuda-dcgm.service"` line `pre-diag` printed on several nodes earlier in this session.
+
+**Fix applied:** added both missing paths to `excludelistupdate` and `excludelistsyncinstall` at the `maxQ-1032-doca341` category level:
+```
+- /etc/systemd/resolved.conf
+- /etc/systemd/system/*.wants/cuda-dcgm.service
+```
+Edited via `cmsh`'s interactive editor (`category use maxQ-1032-doca341; set excludelistupdate` — opens `vi`, no non-interactive `append` shortcut exists for this property per the admin manual). Confirmed present in both lists via `get` afterward.
+
+**Major new discovery, bigger than the exclude-list gap itself:** immediately after `commit`-ing this **category-level** change (unrelated to services), CMDaemon fired `Service cuda-dcgm was started` on **all 18 nodes simultaneously** — silently undoing `pre-diag`'s stop across the entire rack as a side effect of an unrelated category commit. `rack08node02` additionally hit `"Service cuda-dcgm was not started (init.d script timeout)"` during this restart storm (later confirmed benign — clean `inactive (dead)` state after a manual `pre-diag` re-run, no orphan process, port 5555 free).
+
+**Operational implication for the SOP, more important than the exclude-list fix itself:** ANY category-level `commit` — not just service-related changes — appears to trigger CMDaemon to re-assert/re-sync service state across the whole category, which can silently re-enable `cuda-dcgm` on nodes that were deliberately stopped for active diag testing. **This means `pre-diag` must be treated as fragile against any subsequent category-level change during a live diag campaign, not a one-time "set and forget" action.** Recommend: avoid category-level `commit`s entirely during an active diag campaign on that category if at all possible; if one is unavoidable, immediately re-run `pre-diag --rack <N>` afterward and verify via `status` before trusting the rack's diag-safe state again.
+
+**Not yet fully explained:** why a category commit re-triggers service state assertion even when the CMDaemon-level `services` override (`monitored: no`, `autostart: no`, confirmed intact via `services; list` earlier) should have suppressed exactly this behavior. Possible explanations not yet tested: the override itself gets briefly reset/reprocessed during a category commit's internal re-sync before being reapplied, or the actual restart trigger is a different mechanism entirely (the periodic sync onto disk restoring the `.wants/` symlink, with systemd's own `multi-user.target` then starting anything newly present there, independent of CMDaemon's `monitored` flag). Worth a longer-window observation test (make an unrelated category commit, immediately check `cuda-dcgm` state on all nodes) to isolate this precisely, rather than treating it as settled.
+
+### 9an. `provisioningslots` raised to 18 made batch provisioning SLOWER, not faster — real head-node bandwidth bottleneck, not a connection-count limit
+
+Following up on 9ag's finding (default `Provisioning Slots: 10` correlating with the 9-fast/8-slow split on rack08's 17-node batch), raised the head node's own implicit `provisioning` role to `provisioningslots 18` (intending to remove the queuing bottleneck entirely) and tested on `rack01`'s 18-node batch (same conditions otherwise: no peer-provisioning node configured, category `maxQ-1032-doca341`).
+
+**Result: batch took ~2h24m total** (`17:47` first `INSTALLING` → `20:07` last `UP`), compared to rack08's ~1h03m for 17 nodes under the old 10-slot cap — **roughly 2.3x slower**, despite removing the concurrency limit that was causing nodes to queue.
+
+**Confirmed via user: `provisioningslots 18` was committed before this batch was triggered** — not a mid-flight change, so the full batch ran under the new setting throughout.
+
+**Conclusion: the head node's real constraint is disk/network transfer bandwidth, not the number of concurrent connections.** The old 10-slot cap wasn't an arbitrary throttle causing unwanted queuing — it was inadvertently protecting per-node transfer speed by limiting how many image transfers competed for the same finite pipe simultaneously. Raising the cap let all 18 nodes contend for that same fixed bandwidth at once; each individual transfer slowed down enough that total wall-clock time got substantially worse, not better. This directly contradicts the intuitive assumption that removing a concurrency cap should only help.
+
+**Action taken: reverted `provisioningslots` back to `10`**:
+```bash
+cmsh -c "device use bcm11-headnode; roles; use provisioning; set provisioningslots 10; commit"
+```
+
+**Not yet empirically tuned to an actual optimum** — `10` is the known-working default, not confirmed as the best value. If this matters for future large batches, worth a controlled test sweeping a few values (e.g. 6, 10, 14) against the same rack size to find the real throughput-optimal concurrency, rather than assuming the original default is precisely correct just because it's better than 18.
+
+**Separately, positive findings from this same rack01 batch, worth noting:**
+- `ntp` and `ldap` both showed clean, fast `PASS` on every one of the 18 nodes (seconds to ~2 minutes after `UP`) — a genuine improvement over the persistent issues fought all session on `rack08`'s category/image history. Not yet understood why this category behaves better for these two checks specifically — worth a comparison if it matters later.
+- `"Reboot required: Interfaces have been modified"` fired on literally every node in this batch, not just isolated cases — confirms this is a routine, universal post-install artifact (already suspected from a single rack08 occurrence, now confirmed universal) rather than something node-specific or concerning. No observed negative effect on any node's subsequent health.
+
+### 9ao. CORRECTION to 9an: the rack08-vs-rack01 comparison was confounded by different switch hardware
+
+**Important correction:** 9an's conclusion ("raising `provisioningslots` to 18 caused the 2.3x slowdown") compared `rack08`'s batch against `rack01`'s batch as if `provisioningslots` were the only variable — but **`rack01` uses a different physical switch (HPE 5410) than whatever `rack08` is on.** This is a real confound: switch backplane bandwidth, port speed, and buffering behavior could account for some or all of the timing difference, independent of the slot-count change. 9an's finding should be treated as a **plausible but unconfirmed** hypothesis, not a clean result, until re-tested with the switch held constant.
+
+**Corrected experimental plan:** re-test on `rack01` again (same switch, same category/image), this time with `provisioningslots` set to `9`, to isolate the slot-count variable properly against the already-collected `18`-slot rack01 baseline (~2h24m, 9an). This is a genuine same-rack, same-switch A/B comparison, unlike the original rack08-vs-rack01 comparison.
+
+```bash
+cmsh -c "device use bcm11-headnode; roles; use provisioning; set provisioningslots 9; commit"
+```
+Then a fresh full reinstall of all 18 rack01 nodes, timed the same way as before (first `INSTALLING` → last `UP`, per-node via `DHCPACK`/`Run special node settings` if precise per-node timing is wanted again per 9ag's method).
+
+**Once this second data point exists, three-way comparison becomes possible:** rack01 @ 18 slots (~2h24m, confounded baseline) vs. rack01 @ 9 slots (pending) vs. rack08 @ 10 slots on its own switch (~1h03m, different hardware). If rack01 @ 9 slots comes in dramatically faster than rack01 @ 18 slots, that supports 9an's bandwidth-contention theory on this switch specifically. If it's similar to the 18-slot result, the switch hardware itself (or something else about rack01 specifically) is the more likely explanation, and the slot-count theory from 9an would need to be reconsidered.
+
+### 9ap. `provisioningslots 9` — queuing behavior directly observed and confirmed (not just inferred from timing)
+
+Unlike the original `rack08`/10-slot and `rack01`/18-slot batches (where slot-limited queuing was only inferred after the fact from timing gaps), this batch's queuing was directly observed live via `cmsh -c "device; list"` and `device status`:
+
+- **9 nodes actively transferring:** `device status` shows `"provisioning started (FULL), waiting for completion)"`.
+- **9 nodes queued:** `device status` shows the distinct, explicit wording `"waiting for FULL provisioning to '/' to start"`.
+
+This is a clean, unambiguous, directly-observed confirmation that `provisioningslots` genuinely gates concurrent transfers at exactly the configured value (9) — not something inferred from a bimodal timing distribution after the fact, as it was for the original `rack08` batch (9ag).
+
+**Correction/clarification carried over from 9ao's confound-flagging:** the earlier `rack01` all-`DOWN` status and `ssh ... uptime` check that triggered a false alarm (suspected category-commit side effect, suspected outage) was resolved as normal batch-in-progress behavior — `rack01node01` had already completed its own install (`uptime`: "up 7 min") while BCM's own per-node status still lagged showing `"waiting for completion"`. No actual incident occurred; the earlier `excludelistupdate`/`excludelistsyncinstall` edit (9am) was confirmed by the user to have happened **before** this test entirely, not concurrently — ruling it out as a contributing cause for this batch specifically.
+
+**Pending:** final batch completion time and per-node timing breakdown for the clean rack01-same-switch, 9-slot vs. 18-slot comparison (9ao's corrected experimental plan). Will follow up once the batch finishes.
+
+### 9aq. Switch hardware, not `provisioningslots`, is the likely real bottleneck — slot count change produced negligible improvement
+
+Completed the corrected same-switch A/B test from 9ao: `rack01` (HPE5410 switch) re-provisioned at `provisioningslots 9`, compared against the prior `rack01`/HPE5410 run at `provisioningslots 18`.
+
+**Results:**
+- `rack01` @ 18 slots: `17:43:43` → `20:06:59` = **2h23m16s** (18 nodes)
+- `rack01` @ 9 slots: `08:57:06` → `11:15:13` = **2h18m07s** (18 nodes)
+- **Halving the slot count saved only ~5 minutes (~3.6%)** — nowhere near proportional to the 2x concurrency reduction. This strongly suggests `provisioningslots` was never the dominant lever on this hardware.
+
+**Compared against `rack08` (switch model "5120" per user, `provisioningslots 10`, 17 nodes): ~1h03m total** — roughly **2.2x faster** than either `rack01`/HPE5410 result, despite a similar node count and a slot setting between the two `rack01` tests. This gap tracks consistently with switch hardware, not with the BCM-side setting tuned across these tests.
+
+**User's hypothesis, well-supported by this data: the HPE5410 switch itself (not `provisioningslots`) is the real bottleneck for `rack01`'s batch-provisioning throughput.** Recommended next diagnostic (not yet run): check actual **negotiated** link speed on the provisioning NIC directly, rather than assuming from switch model/datasheet specs:
+```bash
+ssh rack01node01 "ethtool enP5p9s0 | grep -i speed"
+```
+If this shows a lower-than-expected negotiated speed (e.g., falling back to 1G), that alone could explain the gap independent of the switch's rated capability — a cabling, SFP, or autonegotiation issue rather than a switch-capacity ceiling per se. Worth checking before concluding it's a hardware capacity limit rather than a misconfiguration.
+
+**Action recommended: revert `provisioningslots` to `10`** (matching `rack08`'s known-working value) since this data shows it isn't the primary lever for `rack01`'s slowdown — no further slot-tuning experiments are likely to yield meaningful improvement until the actual switch/link-speed question is resolved.
+
+**Positive/neutral finding carried forward from this run too:** the universal `"Reboot required: Interfaces have been modified"` warning on every node (confirmed again, consistent with 9an) continues to show no observed negative impact on node health — same benign pattern as before.
+
+### 9ar. CONFIRMED root cause: `rack01`'s provisioning NIC is negotiating at only 1Gb/s
+
+```bash
+ssh rack01node01 "ethtool enP5p9s0 | grep -i speed"
+# Speed: 1000Mb/s
+```
+
+**This fully explains the ~2.2x+ slowdown versus `rack08`** (9aq) without needing switch-model speculation — a 1G link is a hard bandwidth ceiling for full-image transfers to 18 nodes, regardless of `provisioningslots` tuning. This settles the `provisioningslots`-vs-switch question from 9aq/9ao in favor of the switch/link-speed explanation: the negligible improvement from 18→9 slots (9aq) makes complete sense if the actual constraint is a fixed 1Gb/s pipe rather than a concurrency limit.
+
+**Switch corrected: rack01's switch is model 5140 (HPE), not 5410 as earlier stated** — no switch-side console access available at time of this finding (no password on hand for the `5140`). Diagnosis proceeding from the node side first.
+
+**Immediate follow-up check requested, not yet run:**
+```bash
+ssh rack01node01 "ethtool enP5p9s0 | grep -iE 'speed|supported link|advertised link'"
+```
+To determine whether the NIC itself is only capable of 1G (unlikely for this hardware class, but worth confirming) or capable of more and simply negotiated down — which would point at a cable/SFP/port-configuration issue rather than a hardware capability ceiling.
+
+**Also requested, not yet run:** checking the head-node-side interface facing rack01's segment for its own negotiated speed, to determine whether this is a two-sided negotiation problem or isolated to this one link/port.
+
+**Not yet actionable:** no credentials currently available for the `5140` switch itself to check/correct port speed configuration directly. This is the most likely next step once access is available, given a fixed 1G negotiation between two 10G+-capable endpoints commonly indicates a switch port hard-set to 1G, a faulty/mismatched SFP, or an autonegotiation failure that a switch-side port reset/reconfiguration would resolve.
+
+### 9as. CORRECTION to 9ar: the 1G link speed is likely normal/expected for this port, not a rack01-specific problem — premature conclusion
+
+**Retracting 9ar's "CONFIRMED root cause" framing.** Two things missed at the time:
+
+1. **The `ethtool` output itself was internally inconsistent** and should have been a red flag: `Supported link modes: 10baseT/Half 10baseT/Full` (10 **Megabit**) while `Speed: 1000Mb/s` — the reported speed exceeds what the same command claims is supported. This is a known quirk of some onboard/management NIC drivers misreporting supported/advertised fields while `Speed` reflects the real link rate — not something that should have been treated as clean, reliable evidence without noting the inconsistency.
+
+2. **`enP5p9s0` is the identical "1G management/provisioning port" already mapped platform-wide in §9ad** — the single PXE-capable NIC on this hardware design, present identically on every node on every rack (`rack08` included), not something specific to `rack01`. A `1000Mb/s` reading here is very likely this port's normal, full rated speed by design, not a degraded/misconfigured value unique to this rack.
+
+**Corrected reasoning:** since both racks provision over an architecturally identical 1G-capacity port, that fact alone cannot explain why `rack01` (2h18-2h23m) took ~2.2x longer than `rack08` (~1h03m) — a shared, by-design constraint doesn't produce a between-rack difference. The real explanatory variable must be something that actually *differs* between the two setups.
+
+**Corrected next step (requested, not yet run):** check `rack08`'s equivalent reading for direct comparison:
+```bash
+ssh rack08node01 "ethtool enP5p9s0 | grep -iE 'speed|supported link|advertised link'"
+```
+- If `rack08` shows the same `1000Mb/s`, this NIC-speed line of investigation is a dead end, and the real difference is more likely switch-side: port-level errors/retransmits, oversubscription ratio on the uplink, or a genuine per-port issue on the `5140` specifically that isn't visible from the node's own `ethtool` output at all.
+- If `rack08` shows something different (higher), that would restore the original hypothesis, but on firmer ground than this session's premature conclusion.
+
+**Lesson for the log itself:** a "CONFIRMED" label was applied one step too early in 9ar, based on a single data point without the necessary control comparison (the same reading on the already-fast rack). Worth being more conservative about the word "confirmed" until a genuine A/B point exists, not just a single plausible-looking number.
+
+### 9at. Confirmed: NIC speed is identical on both racks — dead end, real difference must be switch-side
+
+```bash
+ssh rack08node01 "ethtool enP5p9s0 | grep -iE 'speed|supported link|advertised link'"
+# Supported link modes:   10baseT/Half 10baseT/Full
+# Advertised link modes:  10baseT/Half 10baseT/Full
+# Speed: 1000Mb/s
+```
+
+**Identical to `rack01`'s reading** (same inconsistent 10baseT supported/advertised fields, same 1000Mb/s actual speed). Confirms 9as's correction: this is normal, expected behavior for this platform's onboard management/provisioning NIC on every node, not a `rack01`-specific NIC/negotiation fault. **This line of investigation is closed — dead end.**
+
+**The real explanatory difference between `rack08` (~1h03m/17 nodes) and `rack01` (~2h18-2h23m/18 nodes) must be switch-side**, not node-side, given the node-side NIC configuration is now confirmed identical. Candidate causes for the next session, none yet checked:
+- Port-level error counters on the switch ports serving `rack01` (CRC errors, retransmits, collisions) — a marginal cable/SFP/port issue can silently degrade effective throughput well below nominal negotiated speed without showing up in the node's own `ethtool` output.
+- Uplink oversubscription ratio — how many 1G access ports share a single uplink on each switch, and that uplink's own capacity; 18 nodes sharing a more oversubscribed uplink on the `5140` vs. `rack08`'s switch could fully explain the gap.
+- Switch model/generation differences in backplane capacity, buffering, or QoS/rate-limiting policy.
+
+**Blocked pending `5140` switch credentials** (not available to the user as of this session) — this is the concrete next step once access is available: check per-port error counters and uplink utilization on the `5140` during a live batch, compared against the equivalent view on `rack08`'s switch if accessible.
+
+### 9au. Topology clarified — shared 5140 switch, rack01 direct-attached vs rack08 via aggregation switch (5120); extra hop correlates with BETTER performance, a real and counterintuitive signal
+
+**Confirmed topology, both racks:**
+- `rack08`: `bcm head node → 5140 → 5120 → 18 rack08 nodes` (two switch hops)
+- `rack01`: `bcm head node → 5140 → 18 rack01 nodes` (nodes attached directly to the 5140; the `5120` is also attached to this same `5140`, serving `rack08`)
+
+**Critical clarification: the `5140` is a single switch shared by both racks** — not two separate units. Any concurrent `rack08`/`rack01` activity would contend for shared resources on this one switch (though no such overlap is currently known to have occurred during either timed test — see 9au's timestamps vs. `rack08` activity, mostly `Sep 17` evening vs. `rack01`'s `Sep 18` morning tests).
+
+**Genuinely counterintuitive finding worth highlighting:** `rack08` has the *additional* switch hop (via `5120`) yet was ~2.2x **faster** than direct-attached `rack01` — the opposite of the naive "more hops = slower" expectation. This is a real signal, not noise, and reframes the investigation:
+
+**Working hypothesis (not yet confirmed, no switch access available):** the `5120` may function as a dedicated aggregation switch, isolating `rack08`'s 18 nodes onto their own local fabric and presenting a single (likely higher-capacity) uplink back to the `5140`. `rack01`'s nodes, being directly attached to the `5140` itself, may instead be contending directly for that switch's own backplane/ASIC capacity alongside everything else connected to it — a structurally different (and potentially worse, if the `5140`'s per-port/backplane capacity is limited) traffic pattern than one aggregated uplink carrying the same total load.
+
+**Concrete checks recommended once `5140` credentials are available, in order of expected diagnostic value:**
+1. The `5140→5120` uplink port's own negotiated speed and utilization during a live `rack08` batch — if it's a single higher-speed aggregated link, that would structurally explain the advantage.
+2. Per-port error/utilization counters on the specific `5140` ports `rack01`'s 18 nodes are directly attached to, during a live batch.
+3. The `5140`'s overall backplane/switching capacity specification, since direct-attached end-host ports and an inter-switch uplink port can behave very differently under sustained load depending on internal switch architecture.
+
+**Status: blocked on `5140` switch credentials**, same as 9at. This is now the clearly-scoped, single next step for the provisioning-throughput investigation — no further profitable action on the BCM/`provisioningslots` side is expected given 9aq/9at/9as/9ar's ruled-out findings.
