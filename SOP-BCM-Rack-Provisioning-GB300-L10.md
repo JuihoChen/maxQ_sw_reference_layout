@@ -120,7 +120,14 @@ cmsh -c "category use <category-name>; set softwareimage <image-name>; commit"
 3. Watch status in `cmsh`/Base View.
 4. Run L11 partnerdiag once all 18 are up.
 
-**Staged rollout (recommended for a new archive):** provision node01 alone first, verify Section 4 checks pass clean, then bring up the rest with `pxe_rack_provision.sh --rack <N> --node 2-18` (supports single node or a range — see script's own `--help`).
+**Staged rollout (recommended for a new archive):**
+1. Provision node01 alone first, verify Section 4 checks pass clean.
+2. If node01 was assigned the `provisioning` role (to serve the rest of the rack), run this **before** rebooting the other 17 — required, not optional:
+   ```bash
+   cmsh -c "softwareimage; updateprovisioners <image-name>"
+   ```
+   Without this, CMDaemon does not recognize node01 as having an up-to-date image (its own client FULL install does not count), and all 17 remaining requests silently fall through to the head node's own default provisioning role — capped at 10 concurrent slots, causing ~half the rack to queue and take 3.5-4x longer. Confirm the log shows `Provisioning completed: sent ... to <node>:...` — if it says nothing to send, node01 was already current.
+3. Bring up the rest with `pxe_rack_provision.sh --rack <N> --node 2-18` (supports single node or a range — see script's own `--help`).
 
 Any error not covered here → pull the exact log line, escalate. Don't guess.
 
