@@ -1842,3 +1842,72 @@ Flagged by user: the SOP described `cmsh -c "softwareimage; updateprovisioners <
 - `rack01` (9bg, tonight's redo): **scoped** `updateprovisioners baseos-1032-doca341` **with** the image name — produced a different, asynchronous `"Provisioning nodes will be updated in the background"` response, confirmed working only indirectly afterward (rsync byte count, then `lastprovisioningnode`).
 
 **Both forms are individually confirmed to work — but never the same form on the same rack.** No cross-test exists showing the bare form works on `rack01`'s setup, or the scoped form works on `rack08`'s. The SOP's recommended command (scoped-by-image-name) is accurate to what was actually run and confirmed on `rack01` — just shouldn't be described as identically validated to the `rack08` finding, since that used the other form. Corrected the SOP wording to specify exactly which command was tested where, rather than implying one uniform tested command across both racks.
+
+---
+
+## 10. Addendum — Stalled provisioning request incident (2026-09-21)
+
+**Context:** three days after the rack01 peer-provisioning validation batch (§9bg-9bm) completed, `bcm11-headnode` was found to have been logging an hourly recurring warning, unnoticed, since that same night.
+
+### 10a. Symptom
+
+Starting **Fri Sep 18 20:41:34 2026**, continuing unbroken for ~63 hours:
+```
+[warning] bcm11-headnode: Provisioning requests (1/1) are stalled
+```
+`cmsh -c "events details <id>"` gave only a generic hint on every occurrence — *"Check provisioning roles, provisioningstatus and fspart locked"* — no node or request identifier included.
+
+Two events inside the same window were checked and ruled out as unrelated:
+- Two automatic `mode 2` (UPDATE) self-resync pushes to `rack01node01`, a day apart (Sep 19 15:59:51→15:59:41 completion, Sep 20 15:59:51→16:00:01 completion) — confirmed as the expected daily auto-resync mechanism (see 10c), not the stall.
+- `gpu_health_nvlink`/`gpu_recovery_check` FAIL on `rack01node11` (Sep 20 09:38) — timing doesn't align with the stall's onset two days earlier; unrelated.
+
+### 10b. Investigation path
+
+1. `cmsh -c "device; list" | grep -iE "installing|waiting"` → **empty**. No node anywhere in the fleet was actually mid-install — ruled out "a real node is stuck provisioning" and reframed this as an internal CMDaemon accounting/queue issue.
+2. `cmsh -c "device use bcm11-headnode; roles; use provisioning; show"` and the same for `rack01node01` → both provisioning roles looked completely normal (10 slots each; `rack01node01` correctly scoped: `Local images: baseos-1032-doca341`, `Categories: maxQ-1032-doca341`). Nothing exhausted or misconfigured.
+3. `cmsh -c "partition use base; provisioningsettings; show"` → **`Auto update period: 1d`**. This **confirms** (previously only suspected, per §9bk) that CMDaemon periodically re-pushes a provisioning-role node's own image copy once a day on its own — fully explaining the two Sep 19/20 15:59 events as normal, unrelated background activity.
+4. `cmsh -c "device use bcm11-headnode; latesthealthdata" | grep -i provision` → **empty**. Confirmed this isn't a per-node health-check measurable; it's coming from a different subsystem entirely.
+5. `grep "stalled requests" /var/log/cmdaemon` (current log, covering Sep 20 00:00 onward) → found the real, persistent internal counter, recurring hourly, unchanged:
+   ```
+   ProvisioningScheduler: main loop sleeping, no new requests, active requests: 0, stalled requests: 1, all: 1, timeout: 3600
+   ```
+   `active requests: 0` confirms this isn't even trying to transfer — it's sitting flagged as stalled, inside CMDaemon's own `ProvisioningScheduler`, not a display artifact.
+6. Located the origin in the rotated log `/var/log/cmdaemon.1` (covers Sep 13→20, so it still held the Sep 18 event at the time it was checked, before that file itself would next rotate out):
+   ```
+   Sep 18 19:44:02  Constructed ProvisioningRequest ...880309e3... target rack01node01, mode is 2
+   Sep 18 19:49:32  Constructed ProvisioningRequest ...b06d73c7... target rack01node01, mode is 2   ← never resolves
+   Sep 18 19:51:17  ProvisioningScheduler: ... all: 1, timeout: 3017   (still counting down normally)
+   Sep 18 20:41:34  ProvisioningScheduler: ... stalled requests: 1, all: 1, timeout: 3600   (flipped to stalled)
+   ```
+   **Gotcha hit while searching for this:** an initial attempt to grep `.1` and `.2.gz` together with `tail -40` returned the wrong, older Sep 6-11 entries — a shell-glob ordering artifact. `.1` prints *before* `.2*` in the concatenated stream but covers *later* dates than `.2.gz`, so `tail` grabbed the wrong end of the combined, non-chronological stream. Grepping `.1` alone (`grep "Sep 18" /var/log/cmdaemon.1 | grep -E "Constructed ProvisioningRequest|stalled requests"`) surfaced the real origin. **Worth remembering for any future log-forensics on this head node: never `tail` a multi-file rotated-log grep without checking whether the glob order matches chronological order.**
+
+### 10c. Root cause
+
+The stuck request (`b06d73c7-d55c-46e2-b996-b1a11ee3b0fa`, constructed **2026-09-18 19:49:32**) was CMDaemon's own daily self-resync (`mode 2`) trying to update `rack01node01`'s local copy of `/cm/images/baseos-1032-doca341` — **at the exact moment `rack01node01` was still actively serving as the peer-provisioning source for the rest of the rack** (the head-node-served half of that evening's batch was still finishing between 19:45 and 19:51 per §9bm; `rack01node01` had been busy as a source since ~18:40).
+
+**The self-resync request needed to write into the same FSPart (`/cm/images/baseos-1032-doca341`) that `rack01node01` was simultaneously using to serve reads to other nodes as a provisioning source.** This is exactly what CMDaemon's own trigger hint text points at ("fspart locked"): the fspart was locked for source-serving use at the moment the self-update tried to claim it for a write, the request was never dispatched, sat idle until its internal timeout (`~3600s`/1hr) expired, and was marked `stalled` at that point — with no retry and no self-clearing mechanism. It then persisted, unchanged, for ~63 hours until CMDaemon was restarted.
+
+**This is a new failure mode, not previously surfaced anywhere earlier in this log:** a provisioning-role node's own periodic self-resync (`Auto update period: 1d`) can collide with that same node being actively used as a peer-provisioning source at the moment the resync fires, and the resulting stuck request does not self-heal — it requires manual intervention to clear.
+
+### 10d. Fix applied
+
+```bash
+systemctl restart cmd
+```
+Run 2026-09-21. Flushes CMDaemon's in-memory `ProvisioningScheduler` request queue, clearing the stuck entry. Cluster-wide action (brief monitoring interruption for all ~144 managed nodes), but non-destructive — does not affect already-provisioned nodes' running state.
+
+**Not yet confirmed post-restart:** whether the hourly warning has actually stopped. Next-session check:
+```bash
+grep "stalled requests" /var/log/cmdaemon | tail -5
+```
+Expect `stalled requests: 0` going forward. If `1` reappears, this didn't fully clear and needs a different approach.
+
+### 10e. Open items / follow-ups
+
+1. **Not yet verified that the restart actually cleared the stuck entry** — check per 10d in the next session.
+2. **No prevention mechanism identified yet.** Since `Auto update period: 1d` fires daily and indefinitely on any provisioning-role node, the same stall could reproduce any time a batch rollout happens to still be running when the daily resync fires against the node currently serving as a source. Candidate mitigations, none evaluated:
+   - Time rollouts to avoid the daily auto-update window on the designated peer-provisioning node (impractical to guarantee — exact fire time relative to a rollout's own schedule isn't obviously controllable).
+   - Investigate whether the self-resync can be suppressed/deferred while a node is actively serving as a source (not investigated — unclear if BCM exposes this).
+   - Accept the risk and treat `grep "stalled requests" /var/log/cmdaemon` as a periodic health check, restarting `cmd` if it ever sticks at ≥1 for more than a day.
+3. **Directly relevant to the dedicated-provisioning-tier design** (§9bj: long-term, blocked on hardware not existing yet). A permanently-idle dedicated tier would be up and available continuously across many rollouts over time, making this exact self-resync-vs-serving collision a recurring risk, not a one-off — worth a real answer before that tier is built, not just noted as a curiosity now.
+4. **This event's origin line would have been permanently lost** if `/var/log/cmdaemon.1` had rotated out one cycle earlier — it was found with only hours to spare before the next rotation. Worth remembering how thin BCM's default `cmdaemon` log retention window is if this class of issue needs investigating again in the future.
