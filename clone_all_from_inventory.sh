@@ -1,5 +1,30 @@
 #!/bin/bash
 #
+# *** DEPRECATED 2026-09-22 -- DO NOT USE FOR NEW RACKS ***
+#
+# Superseded by resync_rack_macs.sh. Production-line provisioning is
+# now rack-by-rack through fixed bay slots (rack01, rack08, ...): the
+# BCM device objects for each slot are built once and stay in place;
+# a new physical rack rotating into a slot only needs its MAC
+# addresses swapped in, not a fresh set of cloned device objects.
+# resync_rack_macs.sh does exactly that (device use <existing-hostname>;
+# set mac <new-mac>; commit) and additionally covers the
+# SWITCH TRAY NVOS section that this script never did.
+#
+# This script's clone sources (base-bmc, maxq106) have been REMOVED
+# from cmsh as of 2026-09-22 -- running this as-is will fail
+# immediately on the first "clone" command. It's kept here only for
+# historical reference (e.g. if a genuinely new bay slot/rack position
+# needs to be built from scratch for the first time, in which case the
+# clone-from-source approach below is still the right starting point --
+# but note it was found to be unsafe to clone from a *live* node that
+# holds a BCM role (see 2026-09-21 investigation: cloning from
+# rack01node01 while it held the `provisioning` role would have carried
+# that role onto every cloned node). Any revival of this approach needs
+# a clean, role-free source device re-created first.
+#
+# --- Original header below, left unmodified for reference ---
+#
 # Parses inventory.list and clones cmsh device objects for every
 # "COMPUTE TRAY BMC" and "COMPUTE TRAY OS" entry, across all
 # rowXcolumnY sections. Single pass, single cmsh invocation.
@@ -30,6 +55,15 @@
 # Usage: ./clone_all_from_inventory.sh [-n|--dry-run] inventory.list
 #   -n, --dry-run   Parse the inventory and print the generated cmsh
 #                   script, but do not actually invoke cmsh.
+
+echo "*** clone_all_from_inventory.sh is DEPRECATED as of 2026-09-22 ***" >&2
+echo "Use resync_rack_macs.sh instead for rack-by-rack MAC resync of" >&2
+echo "existing bay-slot device objects. See the header of this script" >&2
+echo "for why, and for when reviving this approach would still be" >&2
+echo "appropriate (a genuinely new bay slot, never built before)." >&2
+echo "Refusing to run. Remove this guard only if you've re-verified" >&2
+echo "the clone-source setup (see header) and really mean to use this." >&2
+exit 1
 
 set -e
 
