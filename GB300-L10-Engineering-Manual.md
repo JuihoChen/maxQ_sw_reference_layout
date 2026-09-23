@@ -487,6 +487,40 @@ Even with peering working, the head node still serves roughly half the rack (~8/
 - **Near-term, usable today:** extend the one-peer-node pattern to two — provision and scope two in-rack nodes as peer sources before triggering the remaining 16, structurally reducing the head node's expected share from ~8/17 toward roughly ~5-6/17. Still a two-step operation, just with one more bootstrap node. Not yet tested.
 - **Long-term (blocked, hardware doesn't exist yet):** a dedicated, standalone provisioning-source tier — 1-2 nodes on their own separate hardware, permanently provisioned and idle, each scoped with the `provisioning` role and kept current via `updateprovisioners` whenever a new image is qualified. Per the manual's "lowest task count" allocator, this generalizes naturally to 3+ sources with **zero bootstrapping step per rack rollout** — genuinely single-step from the production line's perspective. Deliberately **not** finalized on topology/placement — the target rack for this doesn't exist yet, and given everything learned about switch-path sensitivity this session, placing these nodes behind an unknown or poor switch path could reintroduce the exact bottleneck class being solved for.
 
+### 5.6 Source-count scaling test (post-peering) and a critical topology finding — 2026-09-23
+
+Follow-on investigation, run after §5.2's peering fix was already in place and validated. Question: once peer-provisioning eliminates the head-node bottleneck, does adding more sources or tuning slot counts meaningfully reduce total rack-reinstall time further? Target: rack01 (18 nodes), source pool: `bcm11-headnode` plus `rack08node01/02/03`, image `baseos-1032-doca341` (~19GB).
+
+**Results (all times = real transfer window, first `INSTALLING`/dispatch to last node `UP`):**
+
+| Config | Sources (slots) | Time | Notes |
+|---|---|---|---|
+| 2-source | rack08node01/02 (10/10) | ~48-49 min | Clean, no TCP collapse |
+| 3-source | bcm11-headnode (1) + rack08node01/02/03 (6/6/6) | ~45m45s | ~5% faster than 2-source; excludes an ~8min scheduler-stall detour |
+| 0-slot attempt | bcm11-headnode (0) + rack08node01/02/03 (6/6/6) | did not run | reproduced the 0-slot scheduler stall bug below |
+| 3-source repeat, **new topology** | bcm11-headnode (1) + rack08node01/02/03 (6/6/6) | **18m24s** | Same config as the row above, but with a physical topology change applied first — see below. Not a clean cold-state comparison (see caveat). |
+
+**Source distribution was near-perfectly even** across the three rack08 peers relative to their equal slot counts (6/6/5 split of the 17 non-head-node nodes, confirmed via `lastprovisioningnode` per node), consistent with §5.2's documented "lowest task count" allocator.
+
+**New bug found: a literal `0`-value `provisioningslots` on any pool member stalls the scheduler entirely**, distinct from anything in §5.2-§5.4. Reproduced three times:
+1. `bcm11-headnode` set to `provisioningslots 0` explicitly.
+2. A separate run where the head node's role was never actually unassigned from a prior test and still held a stale nonzero value, unexpectedly inflating the candidate pool.
+3. A deliberate 0/6/6/6 test (head node at 0, three rack08 peers at 6 each).
+
+Symptom, from `cmdaemon`: the scheduler correctly enumerates the 0-slot node as a candidate (`possible group providers for request X: N, cache size: N` includes it), then immediately logs `main loop sleeping, no new requests, active requests: 0, ... timeout: ~5900-7200s` — it finds providers but dispatches nothing and sleeps for roughly two hours. **Fix, confirmed twice:** set the 0-slot source's `provisioningslots` to a nonzero value (`1` is sufficient), or fully `unassign` the provisioning role from that host — either unsticks the scheduler immediately. **Constraint:** BCM refuses to let a head node fully unassign its own provisioning role (`error: Head nodes need a provisioning role`), so a literal "head node fully excluded" test isn't achievable on a head node — `provisioningslots 1` is the practical floor.
+
+**TCP-level health, checked throughout via `ss -tni dst <rack01-subnet> | grep -E "cwnd|retrans"` on every source:** all runs this round were healthy — `cwnd` in the hundreds, `rwnd_limited` under ~2%, no retransmission lines at all, `bytes_acked` climbing steadily to multi-GB per connection. No repeat of an earlier-session TCP `cwnd:1` congestion-collapse incident (pinned `cwnd:1`, >3% retransmission ratio, flat `bytes_acked`) — flagged here as the healthy/collapsed reference pattern for future runs, since it isn't documented elsewhere in this manual. Note: the `notsent` field in `ss` output is in **bytes**, not GB — do not read it as a remaining-transfer-size indicator; `bytes_acked` growth is the correct progress signal.
+
+**Critical finding — network topology change dominates over source count, and materially updates §5.4's "still open" switch-topology question:**
+
+- **Before:** `bcm → 5140 → 5120 → rack01` and `bcm → 5140 → 5120 → rack08` — rack01 and rack08 provisioning traffic shared the same `5140→5120` aggregation uplink. Every config tested under this topology (2-source, 3-source) landed in the same 45-50 minute band regardless of source count — consistent with the uplink itself, not source count, being the ceiling.
+- **After:** `rack08node01~03` reconnected directly alongside rack01, bypassing the shared `5140/5120` hop for that traffic.
+- **Result:** the identical 3-source (1/6/6/6) configuration dropped from 45m45s to **18m24s** — roughly 2.5x faster — under the new topology alone, no source-count or slot change.
+- This directly corroborates §5.4's closed-but-technically-unresolved switch-topology dead end from the earlier peering investigation (that case found a two-hop `5140→5120` path *outperforming* a direct one, for reasons never diagnosed at the switch level) — here, in a different rack pairing, a **direct** path outperformed the shared two-hop path by a wide margin. The two results aren't necessarily contradictory (different switches/ports/congestion state), but both point at the same conclusion: **switch-level path and contention, not BCM-side source count or slot tuning, is the dominant lever for aggregate provisioning throughput** once the peering fix (§5.2) and the 0-slot bug (above) are both accounted for. Direct switch-side diagnosis (per-port counters, uplink utilization) still has never been done in either investigation — see updated §10 item 12.
+- **Caveat, not fully isolated:** the new-topology run reinstalled nodes that had just been reinstalled ~20 minutes earlier (during the failed 0/6/6/6 attempt). Since provisioning transfer is rsync-based, some of the speedup could in principle reflect warm/delta-friendly destination disks rather than topology alone. Given the magnitude of the change, topology is judged the dominant factor, but a clean cold-target re-run under the new topology has not yet been done to fully separate the two effects.
+
+**Open follow-on question:** whether adding a 4th source (e.g. `rack08node04`) helps further under the new topology is unresolved. TCP stats from the 18m24s run weren't at line-rate saturation (`cwnd` healthy but not maxed, low `rwnd_limited`), which argues there may be headroom for another source to help — unlike under the old topology, where the uplink bottleneck made 2-vs-3-source differences negligible (~5%). Not yet tested.
+
 ---
 
 ## 6. PXE Boot, BMC, and Network Topology
@@ -608,7 +642,7 @@ Nine `nvs-rack01swN` NVSwitch management-interface devices were added to BCM's d
 9. **`BF3PcieInterfaceTraffic` partnerdiag fix — delivery mechanism (the `127.0.1.1` hostname fix) is validated, but whether it actually fixes the original partnerdiag failure has never been re-confirmed.** §4.3.
 10. **`mst`'s presence in the fleet's expected-services list — needs an owner to give a definitive answer**, not blocking. §4.8.
 11. **Cascade/orchestration layer for 144 nodes/8 racks — design discussed, not built**, blocked on the team's own topology decision (direct SSH vs. jump-host-per-rack vs. multi-hop) and inventory format. §11.
-12. **Switch-topology question for provisioning throughput — technically unresolved**, though practically superseded by the peering fix. Blocked on switch console credentials that were never obtained. §5.4.
+12. **Switch-topology question for provisioning throughput — technically unresolved**, though practically superseded by the peering fix. Blocked on switch console credentials that were never obtained. §5.4. **Updated 2026-09-23:** a second, independent test corroborates topology (not source count) as the dominant lever — moving rack08node01-03 off a shared `5140→5120` uplink onto a direct path cut an identical source config's time by ~2.5x. Per-port/uplink-utilization diagnosis still not done. §5.6.
 13. **`rack_lifecycle.sh`'s `cmsupport`-missing bug — unresolved root cause**, needs the real `handoff` console output reviewed. §7.1.
 14. **Whether an off-box backup of the reference host's pre-BCM-capture state exists — never explicitly confirmed**, worth checking given the root LV has zero LVM snapshot headroom (§1).
 15. **Per-node identity regeneration (machine-id, SSH host keys, hostname) — not yet confirmed how/whether BCM's node-installer handles this automatically.** Check the BCM "Assigning Images to Nodes and Post Installation Configurations" documentation section directly rather than assuming.
@@ -645,6 +679,8 @@ Nine `nvs-rack01swN` NVSwitch management-interface devices were added to BCM's d
 | SSH host-key mismatch warning on first connect to a freshly-reinstalled node | Expected — every reinstall regenerates host keys. `ssh-keygen -R <hostname>` before first connect. Also seen on already-established nodes, suggesting the fleet's `known_hosts` is generally out of sync — worth a one-time bulk cleanup rather than clearing entries one at a time. |
 | "Reboot required: Interfaces have been modified" warning immediately post-install | Universal, routine post-install artifact confirmed on effectively every node across every rack tested — no observed negative effect on subsequent health. |
 | `cuda-dcgm`/`mst` reported "died"/"not restarted" by CMDaemon on a node with no such systemd unit ever installed | For `mst`: fleet-wide, pre-existing, non-functional-impact condition — see §4.8. For `cuda-dcgm`: only benign if the real daemon package (`cuda-dcgm`, not just `-libs`) is confirmed installed and just caught mid-startup (§4.7) — if the package itself is missing, this is a real gap, not acceptable. |
+| A `provisioningslots` value of literal `0` on any provisioning pool member (including via a stale, never-unassigned role) | **Not acceptable — stalls the whole scheduler.** It finds providers (`cache size: N` includes the 0-slot node) but then dispatches nothing (`active requests: 0`) and sleeps ~2hrs. Set to `1` or fully `unassign` the role instead; a head node cannot fully unassign its own role, so `1` is its practical floor. §5.6. |
+| TCP `cwnd:1` pinned with a retransmission ratio >3% and flat `bytes_acked` during a peer-provisioning transfer | **Not acceptable — real congestion collapse**, distinct from the healthy pattern (`cwnd` in the hundreds, `rwnd_limited` under ~2%, `bytes_acked` climbing steadily). Check via `ss -tni dst <target-subnet> \| grep -E "cwnd\|retrans"` on the sources. §5.6. |
 
 ## Appendix B — Quick Command Reference
 
