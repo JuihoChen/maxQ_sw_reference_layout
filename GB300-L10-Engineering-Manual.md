@@ -469,7 +469,7 @@ Both forms individually work; they simply report differently. Don't describe the
 
 - **The split will be uneven** (e.g. 9-vs-8, not 9-vs-9) — each request is assigned to whichever source has the lowest task count *at that moment*; both sources are independently capped at the default 10 concurrent slots.
 - **Allocation is fixed at request time and never dynamically rebalanced.** If the peer node finishes its entire assigned share early and sits idle for an extended period while the head node is still working through its own queue, that is expected — there is currently no mechanism to move an already-allocated (or even already-queued) request to an idle source later. Confirmed directly: rechecking `lastprovisioningnode` for the head-node-served nodes after the peer had long finished and sat idle showed no reassignment at all.
-- **CMDaemon will periodically auto-resync a provisioning node's own local image copy, unprompted** — observed roughly every ~53 minutes on one run, unrelated to any specific target node's progress, most likely governed by `dirtyautoupdatetimeout`/`autoupdateperiod` (found under `partition use base; provisioningsettings; show`). Not investigated further, but worth remembering that a peer node may periodically consume some of its own bandwidth for this background maintenance during a long rollout — relevant to the dedicated-tier design idea in §5.5.
+- **CMDaemon will periodically auto-resync a provisioning node's own local image copy, unprompted** — observed roughly every ~53 minutes on one run, unrelated to any specific target node's progress, most likely governed by `dirtyautoupdatetimeout`/`autoupdateperiod` (found under `partition use base; provisioningsettings; show`). Not investigated further, but worth remembering that a peer node may periodically consume some of its own bandwidth for this background maintenance during a long rollout — relevant to the dedicated-tier design idea in §5.5. **Caught delaying a real target dispatch, 2026-09-23:** on a rack01 rerun (new topology, §5.6), `rack01node11` — confirmed via `lastprovisioningnode` to be served by `bcm11-headnode`'s single slot — sat in `INSTALLING` for **~8m20s** (14:55:26 → 15:03:46) while the log showed three concurrent inter-source sync events (`bcm11-headnode`→`rack08node01`, `rack08node01`→`rack08node03`, `bcm11-headnode`→`rack08node02`, all 15:03:32-15:03:57); node11's real transfer only completed once those syncs finished, versus 1-3 minutes for every other node in the same run. First time this background behavior was caught actually blocking a real dispatch with matching timestamps, not just observed running in isolation.
 - A pending node's `cmsh` status showing `"waiting for FULL provisioning to '/' to start"` is normal queuing behind the slot cap, not a failure.
 
 ### 5.4 Dead ends — ruled out, don't re-test these
@@ -521,6 +521,39 @@ Symptom, from `cmdaemon`: the scheduler correctly enumerates the 0-slot node as 
 
 **Open follow-on question:** whether adding a 4th source (e.g. `rack08node04`) helps further under the new topology is unresolved. TCP stats from the 18m24s run weren't at line-rate saturation (`cwnd` healthy but not maxed, low `rwnd_limited`), which argues there may be headroom for another source to help — unlike under the old topology, where the uplink bottleneck made 2-vs-3-source differences negligible (~5%). Not yet tested.
 
+**Second new-topology data point, 2026-09-23, partially resolves the warm-cache caveat above.** A repeat rack01 rebuild (same 1/6/6/6 config, new topology, not run back-to-back this time — power was cycled normally beforehand) completed in **26m11s** (14:55:26 first `INSTALLING` → 15:21:37 last node `UP`), versus the original run's 18m24s. Both are still far faster than any old-topology result (45-50 min), so topology remains the dominant factor even accounting for some of it being warm-cache-assisted in the first run — but the gap between 18m24s and 26m11s confirms the warm-cache caveat wasn't negligible, either. Treat **~26 min as the more realistic cold-ish figure** for this new topology at 1/6/6/6 until a fully controlled cold-target test is run.
+
+**Confirms §5.3's periodic-resync behavior directly delaying real dispatch — see updated §5.3 entry.**
+
+**4-source test, 2026-09-23 — answers the open question above.** Added `rack08node04` as a 4th peer, connected directly alongside rack01 same as node01-03 (§8.4 covers the topology/MAC work that got this node into place). Two configs tested:
+
+| Config | Sources (slots) | Result | Notes |
+|---|---|---|---|
+| 1/6/6/6/6 | bcm11-headnode(1) + rack08node01-04(6 each) | **~25m41s** (17:52:18→18:17:59) | Dispatched immediately, all 18 in `INSTALLING` within seconds. No faster than the 3-source baseline. |
+| 1/5/5/5/3 | bcm11-headnode(1) + rack08node01-03(5 each) + rack08node04(3) | **~23m17s** total (`18:44:04` dispatch→`19:07:21` last `UP`); **~15m13s** real-transfer-only (`18:52:08`→`19:07:21`) | See resync-tax finding below. |
+
+**Finding: a 4th source does not improve on the best 3-source result, and with 1/6/6/6/6 the scheduler produces a real distribution imbalance.** `lastprovisioningnode` sweep showed `rack08node01` and `rack08node03` served **zero** targets, `rack08node02` served 4, and `rack08node04` alone served the remaining 4 (node06/10/11/17) as a single-source tail — confirmed via `ss` showing 6 simultaneous active connections on node04 while node01/node03 showed none. Effective parallelism was closer to 2 sources than 4, despite even slot configuration. Root cause not diagnosed — the "possible group providers" candidate-pool logic (§5.2-family) does not appear to guarantee even spread once the pool grows past 3 peers.
+
+**Rebalance attempt (1/5/5/5/3) surfaced a second, distinct mechanism — corrected finding.** Initial read during the live test was that this config reproduced the 0-slot scheduler-stall bug (§5.6 above): `cmdaemon` showed `possible group providers: 5, cache size: 5` immediately followed by `main loop sleeping, active requests: 0, timeout: ~7170s` (~2hr), repeating unchanged for 15+ minutes across two independent attempts (the first interrupted by an unrelated `cmd` restart — see hazard below — the second let to run longer). **This diagnosis was wrong.** The BCM event log (`cmsh -c "device; events"`-equivalent, not the `cmdaemon` scheduler-only grep) showed the real sequence: all 18 nodes reached `node installer started` within a 28-second window (`18:44:04`-`18:44:32`), then nothing else happened until `18:52:08`, when the log revealed **inter-source image resync** — `bcm11-headnode → rack08node01`, `rack08node01 → rack08node04`, `rack08node01 → rack08node03`, `bcm11-headnode → rack08node02` — the same background inter-source cache-resync mechanism already documented in §5.3 (there it delayed one node by 8m20s; here, with 4 rack08 sources all needing a fresh 19GB image copy simultaneously, the resync chain itself took ~7.5-8 minutes before any real target dispatch could begin). Once resync finished, real dispatch to rack01 targets was fast and evenly spread (`bcm11-headnode`:2, `rack08node01`:4, `rack08node02`:5, `rack08node03`:4, `rack08node04`:3 — a much more even split than 1/6/6/6/6 achieved), completing all 18 in 15m13s — the best pure-transfer rate seen in this whole investigation.
+
+**Practical conclusion:** 1/5/5/5/3 is not broken — it pays a one-time resync tax that scales with how many sources need a cold image copy, then delivers better distribution and better raw throughput than 1/6/6/6/6. But the tax was large enough that total wall time (23m17s) still didn't beat the clean 18m24s 3-source result at the time this was written. **Two follow-on 1/5/5/5/3 runs, both pre-warmed via the §5.8 `updateprovisioners` workaround, closed this gap — see updated table row below and §5.8 for the workaround.**
+
+| Config | Sources (slots) | Result | Notes |
+|---|---|---|---|
+| 1/5/5/5/3, pre-warmed | bcm11-headnode(1) + rack08node01-03(5 each) + rack08node04(3) | **~19m17s** (`13:44:00`→`14:03:17`) | 2026-09-24. `updateprovisioners` called several times manually during the `DOWN`/POSTing window before this power-cycle; zero resync events appeared in the event log once targets booted — cache was already warm, so all 18 dispatched straight into real transfer. Matches the best 3-source baseline (18m24s) despite the extra source. |
+| Unconfirmed config, pre-warmed | (source split not confirmed via `lastprovisioningnode`) | **~20m11s** (`12:57:56`→`13:18:07`) | 2026-09-24, same day, run immediately prior to the row above. Also showed zero resync-wait gap; likely still-warm cache from a preceding run rather than an explicit pre-warm this time. Consistent with the pre-warmed/warm-cache result above. |
+
+**Correction, 2026-09-24 — pre-warmed, 4-source (1/5/5/5/3) actually beats 3-source (1/6/6/6), reversing the earlier conclusion.** The "neither 4-source config improves on the best 3-source baseline" conclusion above was drawn entirely from *unwarmed* comparisons, where the 4-source resync tax outweighed its throughput/distribution advantage. A same-day, back-to-back head-to-head, both pre-warmed via §5.8's `updateprovisioners` workaround:
+
+| Config | Total (power-cycle→last UP) | Transfer-only window (last `node installer started`→last `UP`) |
+|---|---|---|
+| 1/5/5/5/3, pre-warmed | **19m17s** (`13:44:00`→`14:03:17`) | **~15m4s** (`13:48:13`→`14:03:17`) |
+| 1/6/6/6, pre-warmed | 22m41s (`14:15:20`→`14:38:01`) | 18m28s (`14:19:33`→`14:38:01`) |
+
+1/5/5/5/3 pre-warmed won by ~3.5min on total time and ~3.5min on transfer-only time. The 1/6/6/6 transfer-only figure (18m28s) closely reconfirms the original 18m24s 3-source baseline, so that number is solid; it's the 4-source comparison that changes. **Once the resync tax is removed via pre-warming, more sources with better distribution wins outright — the extra source was never the problem, the unwarmed resync cost was.** Updated recommendation: **1/5/5/5/3 (or re-adding a comparable 4th source) with the pre-warm workaround applied is the fastest confirmed configuration on this rack**, ahead of the plain 3-source baseline. The scheduler's `cmdaemon`-log-only view (`ProvisioningScheduler` grep) is actively misleading during a resync window — it shows the same "active requests: 0, sleeping" signature as the real 0-slot bug, with no visible indication that inter-source resync is the actual cause. **Use the BCM event log (`cmsh` device-events stream), not just the `cmdaemon` scheduler grep, to distinguish a real scheduler stall from a resync-in-progress window before concluding either way.**
+
+**⚠️ New operational hazard: `systemctl restart cmd` kills all in-flight provisioning sessions cluster-wide.** During the first (later-understood-to-be-a-false-alarm) 1/5/5/5/3 stall, `cmd` was restarted on the head node on the assumption it was safe (it had previously been used successfully to force a stale health-check re-sample, §8.3, when no provisioning was active). This time, with nodes actively `INSTALLING`, the restart killed **all 18** provisioning sessions simultaneously (`INSTALLER_FAILED`, "provisioning failed, session was killed"), requiring a full re-trigger. **Do not restart `cmd` while any node is actively `INSTALLING` — it does not pause gracefully, it kills the session.** If the scheduler appears stalled, check the BCM event log for a resync-in-progress explanation first (see above) and be prepared to simply wait out the ~2hr timeout window rather than intervening.
+
 ---
 
 ## 6. PXE Boot, BMC, and Network Topology
@@ -557,6 +590,93 @@ Full chain of investigation, now conclusively resolved:
 During one topology test, two nodes failed with `INSTALLER_UNREACHABLE` (10-minute timeout) after reaching `INSTALLER_CALLINGINIT`. Initially hypothesized as a network loop from an added switch — **retracted**. Root cause, confirmed via `dmesg`: a continuous, repeating `ACPI: Graceful shutdown in progress` loop, meaning the node received an ACPI shutdown signal mid-install and got stuck trying to honor it. Confirmed via the exact command timeline: an explicit `-power off --rack N` was followed only ~90 seconds later by the default full-workflow's own `power cycle` — many BMCs implement a plain `chassis power off` as a graceful ACPI shutdown request rather than an instant hard cut, and the follow-on power-cycle command arrived while the node was still mid-shutdown, leaving it stuck rather than cleanly cycling. **This was a self-inflicted operational sequencing mistake, not a topology or network defect** — the dual-switch test's own validity for the throughput question was not undermined by it. Fix for the stuck node: a single clean `ipmitool ... chassis power cycle`.
 
 **Standing rule for `pxe_rack_provision.sh`/SOP use: never issue a power-off against a rack and then immediately re-trigger the default full workflow (or any other power action) against the same targets within the same short window.** Confirm power is genuinely settled first (poll BMC power status, or wait longer) before any follow-up power-affecting command.
+
+### 5.7 Monitoring a live provisioning run — diagnostic command reference
+
+Consolidated from ad-hoc commands used throughout §5.6's testing. Use these together, not in isolation — each answers a different question and the wrong one alone is misleading (see the resync-tax correction in §5.6, which was first misdiagnosed by relying on the `cmdaemon` scheduler grep alone).
+
+**1. Per-source TCP transfer health** — is a source actually pushing data right now, and is it healthy or congestion-collapsed:
+```bash
+for h in <source1> <source2> <source3> <source4>; do
+  echo "== $h =="
+  ssh $h "ss -tni dst <target-subnet>/24 | grep -E 'cwnd|retrans'"
+done
+```
+Healthy: `cwnd` in the hundreds, `rwnd_limited` under ~2%, no `retrans` lines, `bytes_acked` climbing on a repeat check. Collapsed: `cwnd:1` pinned, >3% retransmission ratio, flat `bytes_acked`. No connections at all can mean either "not dispatched yet / already finished" or "genuinely stuck" — can't tell which from this alone, see #4.
+
+**2. Which source actually served which target** — confirms real distribution, not just configured slots:
+```bash
+for n in $(seq -w 1 <N>); do
+  echo -n "<rack>node$n: "
+  cmsh -c "device use <rack>node$n; lastprovisioningnode" 2>/dev/null
+done
+```
+
+**3. Device status snapshot** — coarse view of who's `INSTALLING` vs `UP`, and what install sub-stage each `INSTALLING` node is in:
+```bash
+cmsh -c "device; status" | grep -E "^<rack>node"
+```
+`(waiting for FULL provisioning to "/" to start)` vs `(provisioning started (FULL), waiting for completion)` distinguishes "queued, not yet dispatched" from "actively transferring" — but neither this nor #1 explains *why* something is still queued.
+
+**4. The real story — BCM event log, not just the scheduler grep.** The `cmdaemon` grep for `ProvisioningScheduler` only shows the scheduler's own internal decision loop, and during a resync-in-progress window looks identical to a genuine stall (`active requests: 0`, `main loop sleeping`) — this misled the initial diagnosis of the 1/5/5/5/3 "stall" in §5.6 before the real cause (inter-source resync, gated by `dirtyautoupdatetimeout`, §5.8) was found. The device event log shows the actual sequence of `node installer started` → `Provisioning started/completed` (including inter-source resync) → `INSTALLER_CALLINGINIT` → `UP` transitions with real timestamps, and is the authoritative source for computing real run timing:
+```bash
+cmsh
+device
+# then just watch the live event stream in this shell, or scroll back through it
+```
+(Captured by pasting the live `cmsh` session output directly — there is no separate one-shot command used so far to dump this retroactively from a log file; if one exists it hasn't been identified yet.) Use this, not the `ProvisioningScheduler` grep, as the primary source for "first dispatch" and "last completion" timestamps when computing a run's total time.
+
+**5. Scheduler-internals grep** — useful only for confirming the scheduler's own candidate-pool view (`possible group providers: N, cache size: N`) and its sleep/timeout state, not for telling a real stall apart from a resync window:
+```bash
+grep -iE "ProvisioningScheduler" /var/log/cmdaemon | tail -20
+```
+
+### 5.8 The ~7.5min pre-dispatch gap — root cause unexplained, but a reliable operational workaround is confirmed, 2026-09-24
+
+**Status: root cause still unresolved, but a practical, confirmed fix exists — see the workaround at the end of this section before treating the gap as unavoidable.** The ~7-8min gap between rack01 nodes hitting `node installer started` and the first real `Provisioning started` (inter-source resync) event, seen consistently across three independent 1/5/5/5/3 runs (§5.6), was investigated as a candidate BCM-internal timer but **the leading hypothesis was tested and ruled out**. Documenting the full chase since the negative result and methodology are worth keeping, not just the conclusion.
+
+**Hypothesis (plausible, ultimately wrong):** BCM's admin manual (§5.2.4, "Provisioning Role Change Notification With `updateprovisioners`") documents that a provisioning node's image copy is only resynced from its upstream source on demand or on a periodic timer, not instantly when a target node first requests it. `autoupdateperiod` was checked and ruled out first (confirmed at its default `1d`/midnight-UTC, unrelated to a per-run gap). A second, separate partition-level property, **`dirtyautoupdatetimeout`** (found via `cmsh -c "partition use base; provisioningsettings; show"`, not documented by that exact name in the admin manual text searched), was confirmed on this cluster at its default **300 seconds (5 minutes)** — a suspiciously close match to the observed ~7m30-40s gaps (5min debounce + normal overhead).
+
+**Test, 2026-09-24:** changed `dirtyautoupdatetimeout` `300`→`30`:
+```bash
+cmsh
+partition use base
+provisioningsettings
+set dirtyautoupdatetimeout 30
+commit
+```
+Re-ran rack01 under the same 1/5/5/5/3 config immediately after. **Result: no effect.** The gap measured **7m37s** (`09:09:59` last `node installer started` → `09:17:36` first real `Provisioning started`) — statistically identical to the two prior runs (7m38s, ~7.5-8min) that ran under the *old* 300s setting. The `cmdaemon` scheduler log during the wait showed the exact same `possible group providers: N, cache size: N` → `main loop sleeping, active requests: 0` signature as every previous stall, confirming the setting change had taken effect (`get dirtyautoupdatetimeout` returned `30`) but produced no behavioral change.
+
+**Conclusion: `dirtyautoupdatetimeout` does not govern this gap.** Either it applies only to a different "dirty" trigger (e.g. an explicit config/role change marking a source's cache stale) rather than a cold image-cache-miss after a plain power-cycle with no role changes, or the real mechanism is something else entirely — possibly a fixed internal interval not exposed as a documented admin-facing setting. **Reverted back to `300`** since the change had no benefit:
+```bash
+cmsh
+partition use base
+provisioningsettings
+set dirtyautoupdatetimeout 300
+commit
+```
+**Recommendation:** don't keep guessing through more `AdvancedConfig`/`cmsh` properties blind for the *root cause* — if that's still wanted, escalate to BCM support directly with the three reproducible measurements (7m38s, ~7.5-8min, 7m37s) and ask what determines the delay between a provisioning node being marked as needing a resync and that resync actually being dispatched. But for day-to-day use, the workaround below removes the need to chase the root cause further.
+
+**Confirmed operational workaround, 2026-09-24: manually forcing `updateprovisioners` repeatedly right after power-on eliminates the gap entirely.** Tested on a fresh rack01 power-cycle under a 3/5/5/5/3 config (head node bumped to 3 slots for an unrelated reason, rack08 unchanged at 5/5/5/3): immediately after `pxe_rack_provision.sh --rack 1`, ran `cmsh -c "softwareimage; updateprovisioners"` repeatedly (once every ~10-30s, by hand) while nodes were still `DOWN`/POSTing. Each call walked the resync chain forward by one hop — `bcm11-headnode→rack08node01`, `rack08node03→rack08node04`, `rack08node02→rack08node03`, `rack08node01→rack08node02` — fully warming all 4 rack08 sources' image caches *before* any target node had even reached `node installer started`. Once targets did boot and request provisioning, **all 18 dispatched immediately** — `cmsh -c "device; status"` showed zero nodes stuck at "waiting for FULL provisioning to start"; every node was already `provisioning started (FULL), waiting for completion` or further along (`recreating partitions and file systems`, `mounting disks`) within ~3-4 minutes of power-on, versus every prior run's 7-8 minute stall.
+
+**Practical SOP addition:** after triggering a rack power-cycle for a multi-source (3+) provisioning pool, run `cmsh -c "softwareimage; updateprovisioners"` several times in quick succession (a handful of calls, a few seconds apart, is enough to walk a 4-5-source chain) rather than waiting for the automatic trigger. This is now the recommended practice for this cluster's multi-source runs, independent of whatever the underlying automatic-trigger delay mechanism turns out to be.
+
+**Two further confirmations, 2026-09-24, both on 1/5/5/5/3:**
+
+1. `bcm11-headnode` reconfigured back down to 1 slot (from the 3/5/5/5/3 test above), `updateprovisioners` called manually ~7 times during the `DOWN`/POSTing window before power-cycling rack01. Two real resync hops were observed during the manual calls (`bcm11-headnode→rack08node01`, `rack08node02→rack08node03`). Once targets booted, `cmsh -c "device; status"` immediately showed all 18 at `provisioning started (FULL), waiting for completion)` — zero queued. **Result: ~19m17s** total (`13:44:00` power-cycle → `14:03:17` last node `UP`), with **no resync events at all** in the event log once targets came up (all pre-cleared by the manual calls) — essentially matching the best 3-source baseline (18m24s) with an extra source in play.
+2. An earlier same-day run (config/source-split not confirmed) also showed **no gap**, completing in **~20m11s** (`12:57:56`→`13:18:07`), most likely because the source caches were still warm from a preceding run rather than an explicit pre-warm.
+
+**Important correction to the SOP: the workaround is not always necessary, only conditionally.** It's needed specifically when a source's local image cache is stale or missing relative to what it needs to serve. When the cache is already warm — e.g. a repeat run shortly after a prior successful one, with the same image — no resync is needed and there's no gap regardless of whether `updateprovisioners` was called. The rule of thumb: if re-running soon after a previous successful run with the same image, the pre-warm step is likely unnecessary; if the image changed, a source was newly added to the pool, or it's been a while since that source last served the image, pre-warm to be safe. What still triggers a source's cache to go stale in the first place remains unconfirmed (see below).
+
+**Admin manual re-searched, 2026-09-24, specifically for what governs this staleness/trigger timing — no new mechanism found.** Searched for `checksum`/`md5`/hash-comparison, `poll interval`/`check interval`/`sync interval`, `background update`, `provisioning association`, and `ProvisioningScheduler`/`provisioning thread` terms across the full manual text. The only relevant hit (line ~48930) describes **HA active/passive head node image sync**, not general peer-to-peer provisioning-node resync: it confirms the "5 minutes by default" timeout matches `dirtyautoupdatetimeout` and "midnight" matches `autoupdateperiod` — both parameters we already tested/ruled out or confirmed as unrelated — but this passage is specifically about a passive head node syncing from an active head node in an HA pair, not about rack08-style peer provisioning nodes resyncing from each other or from a non-HA head node. It may or may not share the same underlying trigger logic; unconfirmed. `MaxNumberOfProvisioningThreads` (default 10000, cluster-wide concurrency cap) was also found but is very unlikely to be a per-source delay mechanism and hasn't been directly tested. **Manual search is considered exhausted at this point** — if root-causing the staleness trigger (rather than living with the conditional workaround) is still wanted, escalate to BCM support with the reproducible measurements in this section.
+
+**Side effect found while making this change, unrelated to provisioning but worth flagging separately:** the `base` partition had **stale/dangling references** in `wlmjobpowerusagesettings` (`cpuPowerMetrics`/`gpuPowerMetrics` fields pointing at deleted metric-object UUIDs) that silently blocked **any** partition-level `commit` on this cluster, not just this one. Symptom: `commit` fails with `error: CPU/GPU power metrics not found: <uuid>, index: 0, was it committed already?`, even though `show` on the offending fields displays blank (the dangling reference isn't visible, only its failure to resolve on commit). Fix: `clear gpupowermetrics` / `clear cpupowermetrics` in that submode, then `commit`, before retrying whatever partition-level edit was actually intended. **Confirmed as a real, separate pre-existing issue on this cluster — check for it first if any future partition-level `commit` fails with an unrelated-looking metrics error.** Also confirmed: any partition-level commit re-triggers the same fleet-wide `mst` false-positive service notice already documented in §4.8/§3.2.10 (all nodes logged "Service mst was not started (exit code: 5)" immediately after) — expected, not a new problem.
+
+### 6.5 Old ("1.0.6") rack wiring — visual confirmation of the shared-uplink topology behind §5.6
+
+![Old 1.0.6 rack topology — rack01 compute nodes and NVSwitches, plus rack08 "fixture" peer-provisioning nodes, both routed through the shared HPE5120/5240 aggregation pair before reaching the BCM headnode](topology-diagram-old-1.0.6-rack.png)
+
+Diagram from the hardware team, documenting the pre-change wiring. Confirms in writing what §5.6 inferred behaviorally: rack01's 18 compute nodes (orange, "Old 1.0.6 Rack") and the rack08 "fixture" peer-provisioning nodes (yellow) both route through the same `HPE5120/5240` aggregation switch pair before reaching the headnode — the shared hop identified as the dominant bottleneck in the 45-50min-regardless-of-source-count results. This turns that finding from inferred-from-behavior into confirmed-from-the-actual-wiring.
 
 ---
 
@@ -615,6 +735,24 @@ First surfaced as a `cm-create-image` failure (`Validating repo configuration` �
 
 Nine `nvs-rack01swN` NVSwitch management-interface devices were added to BCM's device list while a provisioning timing test was actively in progress — flagged as a possible confound for that test's timing data (different subnet, but potentially sharing upstream switch capacity), and separately, two of the nine (`sw1`, `sw2`) showed `state flapping` rather than a simple `DOWN`, suggesting an actual intermittent link/cabling issue worth investigating on its own. Several of the nine (`sw3`-`sw9`) subsequently landed in the generic compute-node DHCP pool instead of their expected static range — resolved via manual static-IP configuration directly on each switch's own `nvos` CLI (not a BCM/`cmsh`-side fix), consistent with BCM's device/interface object for this device class being passive bookkeeping rather than something that actively pushes config to the switch. All nine correctly show `[DOWN], pingable` rather than `[UP]` afterward — expected, not a new concern, since no CMDaemon agent runs on these devices at all; `pingable` is the meaningful positive signal for this device class.
 
+### 8.3 `rack01node11` GPU2 — confirmed hardware fault (Bianca board), not software — 2026-09-23
+
+Follow-on from the `sw1`/`sw2` flapping note in §8.2 and the `gpu_health_nvlink`/`gpu_health_overall` FAIL pattern in Appendix A: `rack01node11` GPU 2 (UUID `GPU-2eb111f7-0b9c-861d-66ec-5f5f1c8c8a9a`) showed all 18 NVLinks inactive (`nvidia-smi nvlink -s`: `NVML: Unable to retrieve NVLink information as all links are inActive`), while GPUs 0/1/3 on the same node were fully healthy.
+
+**Switch-side corroboration:** on `nvs-rack01sw1`, ports `acp44` and `acp116` — the same relative port index on each of the tray's two internal switch ASICs (`116 − 72 = 44`; `acp1-72` → IC#1, `acp73-144` → IC#2), meaning both trace to the same GPU's NVLink fan-out — both showed `Down`/`Polling`. Counters were clean (`in-errors`/`out-errors`/`in-symbol-errors`/`local-link-integrity-errors`/`rcv-icrc-errors`/`tx-parity-errors` all `0`) but `link-downed: 7` — repeated failed link-training attempts with no traffic-layer error signature, consistent with a marginal physical connection or transceiver failing training rather than a noisy/degrading cable.
+
+**Attempted software fix — worked only transiently:**
+```bash
+systemctl stop cuda-dcgm
+systemctl stop nvidia-persistenced   # both were holding /dev/nvidia2 open (fuser -v /dev/nvidia2)
+nvidia-smi -r -i 2
+systemctl start nvidia-persistenced
+systemctl start cuda-dcgm
+```
+This briefly cleared the symptom (`gpu_health_nvlink gpu0-3` all showed `PASS` immediately after), but `acp44`/`acp116` dropped again shortly after on their own, and a subsequent full rack01 reinstall (§5.6, the 26m11s run) reproduced the identical fault immediately post-boot (`gpu_health_nvlink:gpu2` and `gpu_recovery_check` both `FAIL` at 15:10:01). **A full OS reinstall surviving-through the fault is the clinching evidence this is not software/driver/image-state** — confirmed hardware, most likely the Bianca compute-tray board's GPU2 NVLink connector/transceiver. Recommend handling as a hardware ticket/RMA candidate rather than further BCM-side troubleshooting.
+
+**Side finding, general technique:** `systemctl restart cmd` (node-side CMDaemon) on a node forces a fresh health-check sample rather than waiting for the automatic sampling interval — useful for confirming whether a `latesthealthdata` result is genuinely current after a live fix, separate from the aggregate `gpu_health_overall` mismatch question in Appendix A/§10 item 16 (this node's bare `gpu_health_overall` stayed `FAIL` even with `gpu_health_nvlink gpu0-3` all `PASS` post-fix, consistent with that still-unexplained aggregate behavior, not evidence the `cmd` restart failed).
+
 ---
 
 ## 9. Tooling / Scripts Reference
@@ -646,7 +784,7 @@ Nine `nvs-rack01swN` NVSwitch management-interface devices were added to BCM's d
 13. **`rack_lifecycle.sh`'s `cmsupport`-missing bug — unresolved root cause**, needs the real `handoff` console output reviewed. §7.1.
 14. **Whether an off-box backup of the reference host's pre-BCM-capture state exists — never explicitly confirmed**, worth checking given the root LV has zero LVM snapshot headroom (§1).
 15. **Per-node identity regeneration (machine-id, SSH host keys, hostname) — not yet confirmed how/whether BCM's node-installer handles this automatically.** Check the BCM "Assigning Images to Nodes and Post Installation Configurations" documentation section directly rather than assuming.
-16. **`gpu_health_overall` FAIL despite all per-GPU sub-checks PASS** on at least one node (`rack01node01`) — cause unknown, not investigated.
+16. **`gpu_health_overall` FAIL despite all per-GPU sub-checks PASS** on at least one node (`rack01node01`) — cause unknown, not investigated. **Reproduced repeatedly since** (widely, 13-18 of 18 nodes on multiple rack01 runs, §5.6/§8.3) including on `rack01node11` even after its underlying GPU2 NVLink fault was cleared — still unexplained, but confirmed not simply a stale/cached sample (`systemctl restart cmd` forces a fresh check and the mismatch persists).
 17. **`finalize` subcommand of `rack_lifecycle.sh` — deliberately unimplemented**, pending a decision on what "production-ready" actually means for a handed-off node (rejoin BCM, or move to a separate production network keeping the off-cluster fixes).
 
 ---
