@@ -587,9 +587,53 @@
 #                       capture right now" vs "mid bring-up", so it reports
 #                       current state only rather than asserting a target
 #                       that would false-flag every normal build.
+#   0.4.30 2026-09-29  Re-pinned EXPECTED_MFT/_DOCA/_BF3_FW/_CX8_FW against the
+#                       current RN-11874-001_2.0.0GA PDF (rev 18, Sep 17 2026)
+#                       - this script's last full GA reconciliation was
+#                       v0.4.21-29 on 2026-09-14, but NVIDIA has since revised
+#                       the same document three more times (rev 15 Sep 10
+#                       "updated firmware tables", rev 16 Sep 11 "corrected
+#                       versions in SBIOS+EROT table", rev 17/18 Sep 17
+#                       "updated firmware tables" / "corrected CoRIM entries
+#                       in CX8 N/S table") without this script being re-diffed
+#                       against it until now. Four real, sourced changes,
+#                       confirmed against every table in the "Multi-Node
+#                       System Software Stack Package Contents" section (not
+#                       just the ones that changed) so nothing else was missed
+#                       silently the way EXPECTED_DCGM was pre-v0.4.27:
+#                       (1) EXPECTED_MFT "4.36.0" -> "4.37.0" (Host Software
+#                       Components table, "MFT Tools" row: 4.37.0-154). NOTE:
+#                       distinct from Table 9's separate "MSTflint" GitHub
+#                       tool entry (v4.36.0-1, unrelated open-source flint
+#                       build) - confirmed the script's actual check command
+#                       (`mst version`/`flint -v`) reports the MFT Tools
+#                       package string, not the Table 9 tool, by matching it
+#                       against this host's own live output format ("mst,
+#                       mft 4.37.0-154. Git SHA Hash: ...").
+#                       (2) EXPECTED_DOCA "3.4.1" -> "3.5.0" (DOCA_Host row:
+#                       3.5.0-082000 - DOCA documentation link in the same
+#                       table also bumped to v3.5.0, consistent).
+#                       (3) EXPECTED_BF3_FW "32.49.1118" -> "32.50.1002" (BF3
+#                       row, Host Software Components table).
+#                       (4) EXPECTED_CX8_FW "40.49.1118" -> "40.50.1002" (CX8
+#                       N/S section version line) - this is very likely
+#                       exactly what rev 18's "corrected CoRIM entries in the
+#                       CX8 N/S table" changelog line refers to.
+#                       Every other EXPECTED_* (_DRIVER/_IMEX 580.173.10,
+#                       _CUDA/_CUDA_TOOLKIT 13.0/13.0.2, _DCGM 4.6.0,
+#                       _HGX_BMC_FW/_HGX_EROT_FW/_HGX_CPLD_FW/_HGX_FPGA_FW/
+#                       _MCU_SMA_FW/_VBIOS/_GFM_NVOS) re-checked against the
+#                       current PDF tables and confirmed unchanged - not
+#                       silently skipped, just no diff found.
+#                       Not added: an NMX-M check. Host Software Components
+#                       lists NMX-M 85.1.1100, but (as already noted in
+#                       v0.4.21 item 6) this script has never tracked NMX-M
+#                       and adding a new check is out of scope for a version
+#                       reconciliation pass - flagging here for a future
+#                       version, not silently dropped.
 # ------------------------------------------------------------------------
 
-SCRIPT_VERSION="0.4.29"
+SCRIPT_VERSION="0.4.30"
 
 set -uo pipefail
 
@@ -638,19 +682,39 @@ EXPECTED_CUDA_TOOLKIT="13.0.2" # cuda-toolkit-13-0 meta-package version, per the
 # checked) that MOFED/OFED is NOT independently versioned in this release; it
 # is absorbed into DOCA_Host (3.4.1-010000, already correct above). The
 # "MOFED Version" check below is now informational-only (no PASS/FAIL target).
-EXPECTED_DOCA="3.4.1"          # per Host Software Components matrix (3.4.1-010000);
-                                # unchanged by GA (§0a)
+EXPECTED_DOCA="3.5.0"          # per Host Software Components matrix (DOCA_Host
+                                # 3.5.0-082000); corrected 2026-09-29 from stale
+                                # 3.4.1-010000 - RN-11874-001 rev 15/17/18
+                                # (Sep 10/17 2026) updated firmware tables after
+                                # this script's last GA reconciliation (§0a,
+                                # 2026-09-14) without a re-diff until now
 EXPECTED_DCGM="4.6.0"          # corrected 2026-09-14: was "3.3" since v0.1.0, an
                                 # unsourced placeholder guess that was never
                                 # actually verified against anything. GA release
                                 # notes Table 9 gives the real target: DCGM 4.6.0,
                                 # NVOnline 1139880.
-EXPECTED_MFT="4.36.0"          # per Host Software Components matrix (4.36.0-147);
-                                # unchanged by GA (§0a)
-EXPECTED_BF3_FW="32.49.1118"   # per Host Software Components matrix; unchanged by GA (§0a)
-EXPECTED_CX8_FW="40.49.1118"   # per Host Software Components matrix (CX8 entry,
-                                # NVOnline 1160245); confirmed via ibstat mlx5_5;
-                                # unchanged by GA - also matches GA notes' "CX8 N/S" section
+EXPECTED_MFT="4.37.0"          # per Host Software Components matrix ("MFT Tools"
+                                # row, 4.37.0-154); corrected 2026-09-29 from stale
+                                # 4.36.0 (was 4.36.0-147 in an earlier revision of
+                                # RN-11874-001 - the doc has since moved to
+                                # 4.37.0-154, rev 15/17/18). Distinct from Table 9's
+                                # separate "MSTflint" GitHub tool entry (v4.36.0-1,
+                                # a different, unrelated open-source build) - this
+                                # script's actual check command (`mst version`/
+                                # `flint -v`) reports the MFT Tools package string,
+                                # confirmed against this host's live output format.
+EXPECTED_BF3_FW="32.50.1002"   # per Host Software Components matrix (BF3 row);
+                                # corrected 2026-09-29 from stale 32.49.1118 -
+                                # RN-11874-001 rev 15/17/18 updated firmware tables
+                                # after this script's last GA reconciliation (§0a)
+EXPECTED_CX8_FW="40.50.1002"   # per Host Software Components matrix (CX8 N/S
+                                # section version line); corrected 2026-09-29 from
+                                # stale 40.49.1118 - almost certainly what
+                                # RN-11874-001 rev 18's changelog line "Corrected
+                                # CoRIM entries in the CX8 N/S table" (Sep 17 2026)
+                                # refers to. Re-confirm against `ibstat`/`flint -d
+                                # ... q` on a live unit once available, same as the
+                                # existing per-card caveat below.
 EXPECTED_IMEX="$EXPECTED_DRIVER" # matches EXPECTED_DRIVER - installed via
                                 # nvidia-imex-aarch64-<ver>.run (build log §7), same
                                 # version as the driver .run, not a separate release
