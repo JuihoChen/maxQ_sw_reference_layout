@@ -256,6 +256,13 @@ Any error not covered here → pull the exact output, escalate. Don't guess — 
 | `cmsupport` missing after handoff | Known bug, not yet root-caused — see Section 5.2. Always verify with `status`, don't assume it worked. |
 | `/swap.img` bloats image ~8GB | Known, cosmetic/storage only. |
 
+**⚠️ Leftover category `installmode=FULL` reinstalls a whole rack on a plain power cycle — not just an explicit trigger. `pxelabel=localdrive` gives NO protection against this.** Confirmed 2026-09-30: a rack08 category still set to `installmode=FULL` from the original build pass (SOP §3) reinstalled 15/18 nodes from nothing more than a **plain AC power off/on** — no `pxe_rack_provision.sh` call, no manual PXE override, no explicit trigger of any kind. `pxelabel=localdrive` was set on every node at the time and made no difference at all. Check and verify:
+```bash
+cmsh -c "device foreach -g <group> (get installmode)"          # per-node override, if any
+cmsh -c "category use <category-name>; get installmode"        # the real default most nodes inherit
+```
+**If a category shows `FULL` after Section 4 verification has passed, reset it** (to `AUTO`, `NOSYNC`, or whatever your intended steady-state behavior is) **before the rack is power-cycled again for any reason** — including a routine AC power event, not just a deliberate reinstall command. Do not treat `pxelabel=localdrive` as protection here; it has no observed effect on this behavior. See Engineering Manual §6.5 for the full investigation, including the earlier (wrong) `pxelabel`-based theory this superseded.
+
 ## 7. Known-Acceptable (do not re-investigate)
 
 | Symptom | Verdict |
