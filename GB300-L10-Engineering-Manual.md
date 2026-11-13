@@ -14,6 +14,7 @@ Two reference images/archives have gone through this pipeline so far:
 |---|---|---|---|
 | `maxQ106` (`baseos-1014-doca321`) | `6.17.0-1014-nvidia-64k` | `3.2.1-044413` | ✅ Held/pinned, DKMS clean, **real partnerdiag PASS**. First validated reference layout. |
 | `maxQ20GA` (`baseos-1032-doca341`) | `6.17.0-1032-nvidia-64k` | `3.4.1-010000` | ✅ Built and provisioned to a full rack (rack08, then rack01). First DOCA-3.4.1-line archive through this pipeline (§9 of the log). |
+| `baseos-1032-doca350` (category `maxQ-1032-doca350`) | `6.17.0-1032-nvidia-64k` (node `/proc/cmdline`) | 3.5.0-line per the image/category name — exact version not recorded | ⚠️ In use on 12 nodes as of 2026-11-13 (log §11). Its build was **not** documented through this manual/SOP. Known gaps: `cuda-dcgm` daemon missing (§4.7), category still `installmode FULL` (§6.6). The SOP's `--no-cm-cuda-repo` STOP point applies (confirmed only for doca341). |
 
 **`maxQ106` baseline detail:**
 - Kernel packages held: `linux-image/modules/headers-6.17.0-1014-nvidia-64k` + `linux-nvidia-6.17-headers-6.17.0-1014` — all 4 confirmed `hi` in dpkg.
@@ -180,13 +181,14 @@ If empty, set the validated layout:
 ```
 Applied via `cmsh`'s interactive `set disksetup` editor (paste, save, exit), then `commit`. No swap partition defined — consistent with the swap-removal decision documented for `/swap.img` (§3.3.8). Root cause of the halt is strongly suspected (not fully confirmed) to be simply an unset/empty `disksetup` property rather than a wrong `blockdev`/scheme — the XML applied was byte-identical to a layout already reviewed earlier. Add a pre-flight `get disksetup` check for every remaining rack rather than discovering this only via a live halt.
 
-**3.2.9 — Category `finalizescript`:** confirm set to the validated hostname-fix script:
+**3.2.9 — Category `finalizescript`:** confirm it is set to the current combined finalize script:
 ```bash
 cmsh -c "category use <category-name>; get finalizescript"
-# expect: finalize-hosts-127-v3.sh
-cmsh -c "category use <category-name>; set finalizescript finalize-hosts-127-v3.sh; commit"
+# current (2026-11-13): finalize-hosts-127-v7.sh  — Part 1 hosts fix (= v3), Part 2 LDAP detach /
+#   local cmsupport / service masks (v4), Part 3 link-watch provisioning-NIC re-plug fix (v5-v7)
+cmsh -c "category use <category-name>; set finalizescript finalize-hosts-127-v7.sh; commit"
 ```
-Full history and why v1/v2 didn't work is in §4.3.
+`finalize-hosts-127-v3.sh` (hosts fix only) is still valid for a category that should **not** get v4's LDAP detach. Choose deliberately: Part 2 makes nodes LDAP-independent by design (§4.3). Full history: §4.3 (v1–v4), §6.7 (v5–v7). The category commit can re-sync services across the category (§4.4), so re-run `pre-diag` afterwards if a diag campaign is active.
 
 **3.2.10 — Suppress the `mst` false-positive service monitor** (see §4.8 for why this is a real, permanent, fleet-wide condition and not something to "fix"):
 ```bash
@@ -215,8 +217,10 @@ ls -la /etc/systemd/system/nvidia-fabricmanager.service   # expect -> /dev/null
 # config directories (3.2.7)
 ls -la /etc/network/interfaces.d/ /etc/ntpsec/
 
-# nsswitch.conf — confirm the removed SSSD-hang fix is NOT present (§4.5)
+# nsswitch.conf — confirm the removed SSSD-hang fix is NOT baked into the IMAGE (§4.5)
 grep -E "^(passwd|group|netgroup):" /etc/nsswitch.conf     # expect default SSSD-backed lines, not 'files' on all three
+# (On a provisioned NODE in a category using finalize v4+, files-only is expected - Part 2 sets it on
+#  /localdisk at install time, together with a local cmsupport; that is by design, see §4.3.)
 
 # chrony (§4.6)
 dpkg -l | grep -i -E "^ii\s+(ntp|chrony)"
@@ -327,6 +331,19 @@ Two paths, in order of preference:
 
 **Still genuinely open:** whether this actually makes `BF3PcieInterfaceTraffic` partnerdiag pass has never been independently re-verified — the `/etc/hosts`-content theory for that failure was only assumed from how the fix was originally proposed, never proven. Re-run partnerdiag with this fix in place before treating the *original problem* (not just the delivery mechanism) as closed.
 
+**Later versions — one combined script per category (BCM accepts only one `finalizescript`):**
+- **v4 (2026-09-29):** Part 1 = the v3 hosts fix, unchanged. Part 2 merges the filesystem side of `rack_lifecycle.sh handoff` into the install, all written under `/localdisk`:
+  - local `cmsupport` (UID/GID 1000, locked password, home dir), written straight into `passwd`/`shadow`/`group`;
+  - `nslcd`, `nscd` and `sssd` masked, and their caches cleared;
+  - `pam_ldap.so` / `pam_sss.so` stripped from the four `common-*` PAM files;
+  - `nsswitch.conf` `passwd/group/shadow` set to `files`;
+  - `cuda-dcgm` masked.
+
+  The script header explains why this is **not** the §4.5 regression: `cmsupport` is created locally first, and this fleet has no in-cluster LDAP dependency. Writing the account at finalize time also avoids the `useradd`-vs-live-LDAP ordering race the v4 header identifies as the cause of `handoff`'s `cmsupport`-missing bug (§7.1). Per its own header, v4's `cuda-dcgm` mask had not been re-tested after a change from symlink-removal to masking. Not covered by v4: the CMDaemon-level `cuda-dcgm` monitoring disable (head-node side) and the stale-DNS fix (`resolved.conf` — see §4.4 for why a finalize-time fix would be needed there).
+- **v5 → v7 (2026-11-12/13):** Part 3 added — the `link-watch` provisioning-NIC re-plug fix. Full story in §6.7. Parts 1 and 2 verified identical to v4 by code diff and by running both on identical test `/localdisk` trees.
+- **Current:** `finalize-hosts-127-v7.sh` in `/cm/local/apps/cmd/etc/htdocs/scripts/finalize/`. Its Part 3 header comment carries the full evidence trail.
+- **Never run the finalize script by hand on a live node** to "apply" one part — it applies all three parts (LDAP detach, PAM and `nsswitch` changes included).
+
 ### 4.4 Category exclude lists (`excludelistupdate` / `excludelistsyncinstall`)
 
 These lists control what a periodic BCM category sync will and won't overwrite on a live node. Two gaps found (both now fixed at the `maxQ-1032-doca341` category level, relevant to any rack that will run `rack_lifecycle.sh`'s `handoff`/`pre-diag` — see §7):
@@ -339,6 +356,8 @@ Fix — both paths added to `excludelistupdate` and `excludelistsyncinstall`:
 /etc/systemd/system/*.wants/cuda-dcgm.service
 ```
 Edited via `cmsh`'s interactive `vi` editor (`category use <category>; set excludelistupdate`) — there is no non-interactive append shortcut for this property per the admin manual.
+
+**Limit of this fix, found 2026-11-12 (log §11h):** exclude lists only govern **syncs**. The node-installer **rewrites `/etc/systemd/resolved.conf` on every install** — it is listed in the node's `/var/log/modified-by-node-installer.log` (BCM 11 Admin Manual Appendix A.2.3 documents this log and `filewriteinfo`). So `handoff`'s DNS edit is lost on any reinstall of a handed-off node, whatever the exclude lists say. A durable fix would have to run at install time (finalize, same `/localdisk` pattern) — not done; v4's header lists the DNS fix as out of scope. That log is also the quickest way to tell BCM-generated files from image content on any node. On `sn267548730002` it listed `ifcfg-enP5p9s0`, `resolved.conf`, `hosts`, `postfix/main.cf`, `ntpsec/ntp.conf`, `fstab`, `hostname`, cmd/LDAP certs and `disks.xml`, among others. Files written by a finalize script do **not** appear in it.
 
 **Bigger discovery than the exclude-list gap itself:** immediately after committing this **category-level** change (unrelated to services), CMDaemon fired `Service cuda-dcgm was started` on **all 18 nodes simultaneously** — silently undoing `pre-diag`'s stop across the entire rack as a side effect of an unrelated commit. **Operational rule, more important than the exclude-list fix:** any category-level `commit` — not just service-related ones — appears to trigger CMDaemon to re-assert/re-sync service state across the whole category. Treat `pre-diag`'s effect as fragile against *any* subsequent category-level change during a live diag campaign, not "set and forget." If a category commit during an active campaign is unavoidable, immediately re-run `pre-diag --rack <N>` afterward and verify via `status` before trusting the rack's diag-safe state again. **Not fully explained:** why this happens even with the CMDaemon-level `services` override (`monitored: no`) in place — possibly the override itself gets briefly reset/reprocessed during the category resync before reapplying, or the actual trigger is systemd reacting to the `.wants/` symlink being restored on disk, independent of CMDaemon's `monitored` flag. Worth an isolated observation test if this needs to be pinned down precisely.
 
@@ -412,6 +431,17 @@ Then standard mount cleanup, then separately fix any node that was **already pro
 **Live-node fix confirmed working, including one false-alarm timing trap worth remembering generally:** immediately after installing and starting `cuda-dcgm` on the live node, a `latesthealthdata` check still showed `cuda-dcgm: FAIL` — but the sample timestamp was only 58.5s old, aligning almost exactly with the service's own start time. A check ~2 minutes later confirmed clean `PASS`. **General lesson for this whole SOP: always allow one full health-check cycle to pass before concluding a fix didn't work** — a fail right after a service starts is often just a stale sample caught mid-startup, not a real gap.
 
 **Still pending at the time this was found:** the image-level fix had not yet been applied to `baseos-1032-doca341` itself, only to the one already-provisioned `rack08node01` — apply the image fix before provisioning further nodes from this line so they don't each need the same manual per-node SSH fix.
+
+**Same gap on `baseos-1032-doca350` (log §11h, 2026-11-12):** finalize v4+ logged `WARNING: /localdisk/usr/lib/systemd/system/cuda-dcgm.service not found - skipping cuda-dcgm mask`, i.e. the daemon unit isn't in that image either. On `sn267548730002` the CMDaemon **service** entries were already off:
+
+| Service | Level | Monitored / Autostart |
+|---|---|---|
+| `rshim` | `[general]` | yes / yes |
+| `mst` | `[maxQ-1032-doca350]` | no / no |
+| `nslcd` | `[maxQ-1032-doca350]` | no / no |
+| `cuda-dcgm` | device-level | no / no |
+
+Yet the node still showed `[ UP ], health check failed` — from the separate **`cuda-dcgm` health check** (a `latesthealthdata` row of its own, distinct from `ManagedServicesOk`), which service monitoring settings don't cover. It needs disabling in BCM's monitoring setup for that category (user handling, exact method not recorded yet). Decide per category: install `cuda-dcgm` (SOP 1.3a), or — where finalize v4+ masks it by design — exclude the health check.
 
 **Side finding while investigating this:** the `ldap` health check showed `PASS` on `rack08node01` (different from the confirmed `1014`-image regression in §4.5) — worth confirming this holds fleet-wide on this newer archive before revising that known-issue entry, since it may mean the regression is specific to the older image/fix history and doesn't apply to `maxQ20GA` at all. A separate caution surfaced alongside this: `getent passwd cmsupport` succeeding on its own is not conclusive proof of real LDAP resolution — it could be a local `/etc/passwd` fallback — while `nslcd`'s own log on the same node showed `Can't contact LDAP server` minutes into the same boot. Confirming whether `ldap: PASS` is genuinely meaningful (vs. masked by a local fallback) needs an explicit `grep cmsupport /etc/passwd` + `nsswitch.conf` check, not yet done.
 
@@ -666,6 +696,8 @@ Full chain of investigation, now conclusively resolved:
 
 **Explicit limits on this conclusion, not resolved:** the exact `Socket*Pcie*` BIOS attribute → physical slot mapping is inferred from matching counts/widths, not from any documented 1:1 correlation. **Do not flip any `DisableOptionROM` setting on live hardware without confirming the exact mapping via OEM platform documentation or vendor support first** — a wrong guess could disable option ROM on an unrelated PCIe root port with unknown consequences. This finding does not roll back the link-type change (that remains durable and correct for the IB fabric requirement); it only explains why that change alone could never have been sufficient for PXE. Treat enabling BF3/CX8 as PXE-bootable via BIOS changes as a separate, higher-risk follow-up needing vendor confirmation, not something to attempt mid-rollout on production-track hardware.
 
+**⚠️ Update 2026-11-13 — no longer true on at least one node:** on `sn267548730002` (category `maxQ-1032-doca350`) the UEFI boot manager lists a PXE entry for BF3 port 2, **first** in the list. See §6.8.
+
 ### 6.4 Power-sequencing gotcha: never chain a power-off immediately followed by another power action
 
 During one topology test, two nodes failed with `INSTALLER_UNREACHABLE` (10-minute timeout) after reaching `INSTALLER_CALLINGINIT`. Initially hypothesized as a network loop from an added switch — **retracted**. Root cause, confirmed via `dmesg`: a continuous, repeating `ACPI: Graceful shutdown in progress` loop, meaning the node received an ACPI shutdown signal mid-install and got stuck trying to honor it. Confirmed via the exact command timeline: an explicit `-power off --rack N` was followed only ~90 seconds later by the default full-workflow's own `power cycle` — many BMCs implement a plain `chassis power off` as a graceful ACPI shutdown request rather than an instant hard cut, and the follow-on power-cycle command arrived while the node was still mid-shutdown, leaving it stuck rather than cleanly cycling. **This was a self-inflicted operational sequencing mistake, not a topology or network defect** — the dual-switch test's own validity for the throughput question was not undermined by it. Fix for the stuck node: a single clean `ipmitool ... chassis power cycle`.
@@ -705,6 +737,108 @@ cmsh -c "category use maxQ-1032-doca341; get installmode"    # → FULL
 The category itself has `installmode=FULL`. `FULL` forces a complete reinstall on **every boot**, unconditionally — this alone fully explains the mass reinstall from a plain power cycle, with no need for any PXE-response gating theory. `pxelabel` was never the deciding factor in either test; it likely has no effect at all while `installmode=FULL` is set, since BCM has already decided to reinstall before `pxelabel`'s passive-boot default would ever come into play. Whether `pxelabel` does anything once `installmode` is set to something that doesn't force install (`AUTO`, `NOSYNC`, etc.) is untested and remains open.
 
 **Operational implication — this is a real hazard, and it is the leftover `installmode=FULL` from the build/bring-up phase (SOP §3) that causes it.** `installmode=FULL` is expected and correct *during* image bring-up, but if it's never reset afterward, **any power cycle of that category's nodes — including an incidental AC power event — wipes and reinstalls them**, with no PXE override, no explicit trigger, and no warning. This is materially more dangerous than the original `pxelabel`-based theory suggested, and needs a category-level fix (reset `installmode` away from `FULL` once a rack passes verification), not a `pxelabel` workaround. See SOP §6 for the corrected operator-facing warning.
+
+**Recurred 2026-11-12 on `maxQ-1032-doca350`** (log §11b): category `installmode FULL`, nodes inheriting it (device `installmode`/`nextinstallmode` empty). Operators had started **unplugging the provisioning RJ45 before reboots** to dodge the reinstall — which exposed the separate re-plug problem in §6.7. A plain `reboot` with the cable connected network-booted straight into a FULL install again during testing and had to be stopped from the boot menu. Same fix as above. Unplugging the cable is not a substitute.
+
+### 6.7 Provisioning NIC plugged in after boot — node never gets an address; `link-watch` fix (finalize v5→v7), 2026-11-12/13
+
+Found and fixed on `sn267548730002` (`maxQ-1032-doca350`; provisioning NIC `enP5p9s0`, MAC `48:21:0b:88:08:ec`, reserved address `10.141.168.101`). Full dated record: log §11.
+
+**Symptom.** Booted with the provisioning RJ45 unplugged (§6.6 recurrence), cable plugged in afterwards: `enP5p9s0` had carrier but no IPv4, node `[ DOWN ]` in cmsh indefinitely.
+
+**Root cause 1 — BCM's network config runs DHCP once, at boot.**
+- The node-installer writes `/etc/network/interfaces.d/ifcfg-enP5p9s0` = `auto enP5p9s0` / `iface enP5p9s0 inet dhcp` (ifupdown; "generated by cmd, do not edit").
+- `ifup` runs `dhcpcd` once. With no carrier it logs `waiting for carrier`, times out (~30s), `ifup@enP5p9s0` retries once, then everything exits. Journal: `15:30:29` waiting → `15:30:59` / `15:31:29` timed out → link up `17:21:55` with nothing reacting.
+- Ruled out as contributors:
+  - `systemd-networkd` and NetworkManager are inactive and `ifplugd` isn't installed, so nothing watches carrier;
+  - the leftover `/etc/netplan/50-cloud-init.yaml` is inert, because no netplan backend runs;
+  - the `waiting for lock on /run/network/ifstate.<if>` journal line is two ifupdown runs colliding, not netplan.
+
+**Root cause 2 — the node's `cmd` doesn't reconnect by itself.** After a manual `ifup` (lease `10.141.168.101` in seconds), the node stayed `[ DOWN ], pingable` until `systemctl restart cmd` **on the node**. This reproduced on every address change. `cmd` reaches the head node as `https://master:8081` (its own journal). (Restarting `cmd` on the *head node* during installs is the dangerous one — §5.6.)
+
+**Facts the fix relies on.**
+- **The fixed address comes from the server.** BCM writes a DHCP reservation in `/etc/dhcpd.internalnet.conf` (`hardware ethernet 48:21:0B:88:08:EC; fixed-address 10.141.168.101;` plus PXE-only `filename`/`configfile` options that an OS client ignores), so any DHCP client on that MAC gets the reserved address. The interface is DHCP on purpose. The dynamic pool `10.141.160.0–168.255` overlapping the node addresses is intentional per the user.
+- **BCM's dhcpd is `not authoritative`** (`/etc/dhcpd.conf`), so it never NAKs a lease from another network. The office DHCP server (`192.168.24.185`) does.
+- **`dhcpcd` follows the cable once it holds a lease.** It stays running and handled BCM → office → BCM moves itself: `rebinding lease of 10.141.168.101` → `NAK` → `leased 10.254.196.35` in ~5 s, no stale route left. The gap is only the boot-time `dhcpcd` that already exited, plus `cmd`.
+- **`enP5p9s0 [prov,dhcp]` is the only interface BCM configures on these nodes.**
+
+**What BCM supports (BCM 11 Administrator Manual, searched by the user's copy):**
+- **Appendix A.2.3:** the node-installer writes `/etc/network/interfaces.d/ifcfg-*` (Ubuntu only). ifupdown is BCM's model for Ubuntu nodes, and no setting switches nodes to a network daemon (`Start if` only offers HA-related choices). The manual's only netplan mention is a manual tip for one bond option.
+- **§5.4:** a node not booting via PXE must use the kernel device name instead of `BOOTIF`, because `BOOTIF` only resolves on a PXE boot. That explains the user's earlier "no IP after reboot" with `BOOTIF`, and confirms the `enP5p9s0` naming. Renaming back to `BOOTIF` wouldn't help the re-plug problem anyway: BCM writes the same one-shot config.
+
+**Rejected alternatives:**
+
+| Option | Why not |
+|---|---|
+| `systemd-networkd` / NetworkManager | ifupdown would have to be masked for the NIC; BCM's ifcfg files would no longer apply, so later BCM interface changes (other than the IP via the reservation) would silently not reach the node. NetworkManager would also grab the CX8/BF3/`tmfifo_net0` interfaces. Not confirmed supported by BCM. |
+| `ifplugd` | Standard ifupdown link daemon, but needs a package in the image (apt in `cm-chroot-sw-img`, §3.3.9 / §3.2.4 discipline) and takes the NIC down on unplug. |
+| Editing ifcfg (e.g. `allow-hotplug`) | cmd-generated, and `allow-hotplug` reacts to device appearance, not carrier. |
+| Disk-first boot order | Persistent, needs sign-off (§6.2), and doesn't fix the re-plug case. |
+
+**Fix shipped — Part 3 of the category finalize script.** Writes three files under `/localdisk`:
+- `/usr/local/sbin/link-watch.sh`
+- `/etc/systemd/system/link-watch.service`
+- the enable symlink in `multi-user.target.wants`
+
+None of these are in the node-installer's file list. The watcher polls every 15 s:
+1. **No address:** if the NIC has carrier, no IPv4, and no `ifup`/`dhcpcd` is running for it, run BCM's own `ifup enP5p9s0`.
+2. **Restart needed:** after (1), or when the NIC's IPv4 changes to a different address, mark a `cmd` restart as needed.
+3. **Restart when reachable:** carry out the restart only once `master` answers ping (`systemctl restart --no-block cmd`). Otherwise log once that it's pending.
+
+It never touches BCM's config, does nothing while healthy, never restarts `cmd` on a normal boot (the first address is only recorded), and never takes the NIC down on unplug.
+
+| Version | Change | Real-node result |
+|---|---|---|
+| v5 (11-12) | ifup + blocking `cmd` restart | Boot with cable out, plug in: `13:38:12` carrier → `13:38:23` ifup OK → `13:38:30` cmd restarted → UP. Normal boot: silent. |
+| v6 (11-13) | + restart on address change | BCM→office→BCM worked unaided but slowly: useless ~95 s restart on the office network (loop blocked), ~70 s to cmd up after moving back. |
+| v7 (11-13) | restart deferred until `master` reachable; non-blocking | BCM→office→BCM: `17:56:40` change → `17:56:42` "restart pending: 'master' not reachable" (none done); `17:59:11` back → cmd active `17:59:17` (~6 s) → UP. Normal boot: silent. |
+
+**Not yet run on a real node with v7:** boot with the cable out, then plug in. Same path as v5 plus the `master` check; passed in simulation.
+
+**Operations:**
+- **Check:** `systemctl is-active link-watch`; `journalctl -t link-watch -b`; `sed -n 2p /usr/local/sbin/link-watch.sh` (shows the version).
+- **Before a deliberate `ifdown enP5p9s0`** with the cable in, run `systemctl stop link-watch`. Otherwise the NIC comes back within ~15–30 s.
+- **Roll back:** set `finalizescript` back to v4 and reinstall.
+- **`imageupdate`:** a live `imageupdate` (no finalize) may delete the three files. Dry-run `imageupdate -n <node>` (no `-w`), and if they're listed for deletion, add them to `excludelistupdate`. `excludelistsyncinstall` isn't needed, because finalize rewrites them after every install-time sync.
+
+**Rollout as tested:** copy the script into the finalize directory, `chmod 755`, `bash -n`; set `finalizescript` at **device** level first (avoids a category commit, §4.4); reinstall; check `/var/log/node-installer` for `link-watch` lines.
+
+### 6.8 BlueField-3 port 2 appears as a PXE boot option — and first in the boot menu, 2026-11-13
+
+On `sn267548730002` the UEFI boot manager lists, in order:
+1. `UEFI PXEv4 (MAC:DC73FC01DB55)` — BF3 port 2, `enP22s22f1np1`
+2. `UEFI PXEv4 (MAC:48210B8808EC)` — the 1G provisioning port
+3. `Ubuntu` (local disk)
+4. …then PXEv6 / HTTP entries for the 1G port, the UEFI shell, the NVMe, and the BMC USB NIC entries (§6.9).
+
+**This contradicts §6.3,** where BF3 had no boot option at all because its ports were IB and option ROM was disabled on x16 slots. It is consistent with the later Ethernet link-type change mentioned in log §9ac/§9ad, plus option ROM now evidently enabled for that slot on this node. How this came about isn't known.
+
+**Effects:**
+- Every network boot tries BF3 first. That is likely the source of the `npSyncSendPacket: No network cable detect` message, and it adds delay.
+- If that port is ever cabled to a network with a DHCP/PXE server, the node could boot from the wrong network.
+
+**Status:** boot-order and option-ROM changes need sign-off (§6.2/§6.3) — noted, not changed. Check the fleet with `efibootmgr -v | grep -iE 'BootOrder|PXE'`, looking for a PXE entry whose MAC matches the node's `enP22s22f*` port.
+
+### 6.9 The `enx<MAC>` USB NIC is the BMC's virtual USB Ethernet (OpenBMC gadget) — and the virtual-media exposure that comes with it, 2026-11-13
+
+**Resolves the open point in §6.3 step 1 / log §9q, §9aa, §9ab** about the boot option whose path runs through `USB(...)`. On `sn267548730002`, `enxda437cea0cd8` (MAC `da:43:7c:ea:0c:d8`, a locally-administered address) is confirmed as the BMC's virtual USB Ethernet:
+
+| Check | Result |
+|---|---|
+| `ethtool -i` | driver `cdc_ether`, firmware `CDC Ethernet Device` |
+| sysfs device path | `.../0005:08:00.0/usb1/1-1/1-1.1/1-1.1:1.0` (a USB controller next to the 1G NIC at `0005:09:00.0`, hence the shared `PciRoot(0x5)`) |
+| `lsusb` | `0525:a4a2 Linux-USB Ethernet/RNDIS Gadget` behind `1d6b:0107 USB Virtual Hub` — an OpenBMC USB gadget |
+| `efibootmgr -v` | `Boot0002`–`Boot0005` = PXEv4/PXEv6/HTTPv4/HTTPv6 on `USB(4,0)/USB(0,0)/MAC(da437cea0cd8)`, all `{auto_created_boot_option}` |
+
+It is a host-to-BMC link (Redfish host interface), not a network and not BCM's. It is `DOWN` with no address in the OS, which is fine. Its boot entries rank after `Ubuntu`, and nothing on that link serves DHCP/PXE, so they are harmless leftovers. Don't select them in the boot menu by mistake.
+
+**Security exposure, for whoever owns platform security:** the same BMC can present **virtual media** (an ISO as a USB CD/disk) and force a one-time boot from it via the same override mechanism as §6.2 (`Cd`/`Usb` instead of `Pxe`). With the **default OpenBMC login** (`root` / `0penBmc`) used throughout this manual's scripts, anyone who can reach the `10.141.8.x` BMC network can take full control of a node. Nothing was mounted at check time (`lsusb`: only hub + Ethernet gadget; `lsblk -o NAME,TRAN | grep usb` is the check).
+
+Suggested, all persistent and needing sign-off:
+- change the BMC password, and `pxe_rack_provision.sh`'s `-U`/`-P` defaults;
+- keep the BMC network isolated;
+- check Secure Boot (`mokutil --sb-state`; the OS boots via `shimaa64.efi`);
+- disable virtual media if unused.
 
 ---
 
@@ -791,6 +925,7 @@ This briefly cleared the symptom (`gpu_health_nvlink gpu0-3` all showed `PASS` i
 | `l10-upgrade.sh` | 0.1.1 | Single-node, 3-step gated/idempotent **field** upgrade script (not BCM-based) — kernel exact-pin swap (self-terminates on reboot, manual re-invoke), DOCA+driver+IMEX install, BF3/CX8 firmware flash (needs a full power cycle, not just reboot). Config-driven (all versions in one editable block), versioned, kept as a single file per team preference. Firmware tool invocations (`bfup`, `mlxfwmanager`) are **unverified placeholders** — confirm against real `--help` output before trusting on hardware. |
 | `pxe_rack_provision.sh` | 1.2.0 | Rack-range PXE/power orchestration. History: 1.0.0 original → 1.1.0 added `--node N-M` ranges → 1.2.0 added `--pxe-method ipmitool|redfish`. See §6.1-§6.2. |
 | `rack_lifecycle.sh` | 1.2.0 | Post-BCM-provisioning handoff/diag lifecycle (`status`/`handoff`/`pre-diag`/`post-diag`; `finalize` unimplemented). See §7. |
+| `finalize-hosts-127-v7.sh` | v7 (2026-11-13) | Combined category finalize script: Part 1 hosts fix (§4.3), Part 2 LDAP detach / local `cmsupport` / service masks (v4, §4.3), Part 3 `link-watch` provisioning-NIC re-plug fix (§6.7). Lives in `/cm/local/apps/cmd/etc/htdocs/scripts/finalize/`. Part 3 header carries the full evidence trail. History: v1–v3 hosts fix → v4 merge → v5 link-watch → v6 address-change restart → v7 deferred, non-blocking restart. |
 | `NV-kernel-doca-compat-report.md` | draft, **not yet sent** | NV escalation report — needs updating per §10 before sending. |
 
 ---
@@ -814,6 +949,14 @@ This briefly cleared the symptom (`gpu_health_nvlink gpu0-3` all showed `PASS` i
 15. **Per-node identity regeneration (machine-id, SSH host keys, hostname) — not yet confirmed how/whether BCM's node-installer handles this automatically.** Check the BCM "Assigning Images to Nodes and Post Installation Configurations" documentation section directly rather than assuming.
 16. **`gpu_health_overall` FAIL despite all per-GPU sub-checks PASS** on at least one node (`rack01node01`) — cause unknown, not investigated. **Reproduced repeatedly since** (widely, 13-18 of 18 nodes on multiple rack01 runs, §5.6/§8.3) including on `rack01node11` even after its underlying GPU2 NVLink fault was cleared — still unexplained, but confirmed not simply a stale/cached sample (`systemctl restart cmd` forces a fresh check and the mismatch persists).
 17. **`finalize` subcommand of `rack_lifecycle.sh` — deliberately unimplemented**, pending a decision on what "production-ready" actually means for a handed-off node (rejoin BCM, or move to a separate production network keeping the off-cluster fixes).
+18. **`maxQ-1032-doca350` still `installmode FULL`** — reset to AUTO/NOSYNC (re-run `pre-diag` afterwards if a diag campaign is active, §4.4); check `maxQ-1014-doca321` too. §6.6.
+19. **Roll finalize v7 out to `maxQ-1032-doca350`** and `clear finalizescript` on `sn267548730002` so it follows the category; **run the one untested v7 case** (boot with cable out, plug in later) on a real node; dry-run `imageupdate -n <node>` to decide the `excludelistupdate` question. §6.7.
+20. **`cuda-dcgm` on `baseos-1032-doca350`** — daemon missing from the image; the health check still fails with service monitoring already off. Decide: install it (SOP 1.3a) or exclude the health check for categories where finalize masks it. §4.7.
+21. **BF3 port 2 now a PXE boot option, ranked first** on `sn267548730002` — needs an owner for BIOS/boot-order settings; check other nodes. §6.8.
+22. **BMC default credentials + virtual media** — security exposure, needs an owner. §6.9.
+23. **`resolved.conf` rewritten on every install** — `handoff`'s DNS fix is lost on reinstall; would need a finalize-time fix. §4.4.
+24. **SOP references** to the finalize script — now updated to v7 in the SOP; keep the two documents in step on future versions.
+25. **Optional — ask NVIDIA BCM support** whether a network daemon (netplan/`systemd-networkd`) is supported for Ubuntu nodes, or a supported way to bring the provisioning NIC up when link appears after boot. §6.7.
 
 ---
 
@@ -846,6 +989,14 @@ This briefly cleared the symptom (`gpu_health_nvlink gpu0-3` all showed `PASS` i
 | "Reboot required: Interfaces have been modified" warning immediately post-install | Universal, routine post-install artifact confirmed on effectively every node across every rack tested — no observed negative effect on subsequent health. |
 | `cuda-dcgm`/`mst` reported "died"/"not restarted" by CMDaemon on a node with no such systemd unit ever installed | For `mst`: fleet-wide, pre-existing, non-functional-impact condition — see §4.8. For `cuda-dcgm`: only benign if the real daemon package (`cuda-dcgm`, not just `-libs`) is confirmed installed and just caught mid-startup (§4.7) — if the package itself is missing, this is a real gap, not acceptable. |
 | A `provisioningslots` value of literal `0` on any provisioning pool member (including via a stale, never-unassigned role) | **Not acceptable — stalls the whole scheduler.** It finds providers (`cache size: N` includes the 0-slot node) but then dispatches nothing (`active requests: 0`) and sleeps ~2hrs. Set to `1` or fully `unassign` the role instead; a head node cannot fully unassign its own role, so `1` is its practical floor. §5.6. |
+| Provisioning NIC plugged in after boot; `journalctl -t link-watch` shows `has carrier but no IPv4 - running ifup` → `ifup succeeded` → `restarted cmd` | Expected on finalize v5+ — the watcher recovering the node. Up within ~15–45 s. §6.7. |
+| `link-watch` logs `cmd restart pending ... head node 'master' not reachable` | Expected (v7) when the NIC is on a non-BCM network; the restart happens once it's back on BCM. §6.7. |
+| Node `[ DOWN ], pingable` right after its provisioning NIC regained or changed address | Expected for up to ~30 s on v7 while `link-watch` restarts `cmd`. On a node **without** v5+, run `systemctl restart cmd` on the node. §6.7. |
+| `/etc/netplan/50-cloud-init.yaml` present on a node | Inert — no netplan backend runs (`systemd-networkd`/NetworkManager inactive); BCM's ifupdown config is what applies. §6.7. |
+| `ifup: waiting for lock on /run/network/ifstate.<if>` in the boot journal | Two ifupdown runs (`ifup@<if>` and `networking.service`) colliding at boot — not netplan, not harmful. §6.7. |
+| `Dropped protocol specifier '.dhcp' from '<if>.dhcp'` after `ifup` | Harmless — `dhcpcd`'s DNS hook handing DNS to `systemd-resolved`. §6.7. |
+| `dhcpcd: soliciting an IPv6 router` / `no IPv6 Routers available`, `fe80::` address on the provisioning NIC | Harmless — `dhcpcd` also tries IPv6 by default; no IPv6 router exists. |
+| `enx<MAC>` interface `DOWN`, no address; `UEFI PXE/HTTP (MAC:<that MAC>)` boot entries | The BMC's virtual USB Ethernet (OpenBMC gadget) and its auto-created boot entries — not a network, not BCM's. §6.9. |
 | TCP `cwnd:1` pinned with a retransmission ratio >3% and flat `bytes_acked` during a peer-provisioning transfer | **Not acceptable — real congestion collapse**, distinct from the healthy pattern (`cwnd` in the hundreds, `rwnd_limited` under ~2%, `bytes_acked` climbing steadily). Check via `ss -tni dst <target-subnet> \| grep -E "cwnd\|retrans"` on the sources. §5.6. |
 
 ## Appendix B — Quick Command Reference
@@ -879,4 +1030,19 @@ cmsh -c "device use <rack>node05; lastprovisioningnode"
 
 # Never do this (§6.4):
 # -power off followed shortly by any other power action on the same targets
+
+# Leftover installmode=FULL check — reset after verification passes (§6.6)
+cmsh -c "category use <category-name>; get installmode"
+cmsh -c "device foreach -c <category-name> (get hostname; get installmode)"
+
+# link-watch (finalize v5+, §6.7) — on a node
+systemctl is-active link-watch; sed -n 2p /usr/local/sbin/link-watch.sh
+journalctl -t link-watch -b --no-pager | tail
+systemctl stop link-watch          # before a deliberate ifdown of the provisioning NIC
+
+# What the node-installer itself wrote on this node during the last install (§4.4)
+cat /var/log/modified-by-node-installer.log
+
+# DHCP reservation for a node (head node) — the fixed address comes from here (§6.7)
+grep -B1 -A4 -i '<mac>' /etc/dhcpd.internalnet.conf
 ```

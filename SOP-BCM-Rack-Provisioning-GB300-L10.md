@@ -2,7 +2,7 @@
 
 **Scope:** one rack (18 nodes) per pass — build image, provision, verify.
 **Owner:** [assign engineering contact]
-**Full rationale/evidence for every step:** see `session-summary.md` (§6, §8, §9).
+**Full rationale/evidence for every step:** see `session-summary.md` (§6, §8, §9, §11), or the same content by topic in the Engineering Manual.
 **Node-range provisioning tool:** `pxe_rack_provision.sh` (supports `--rack N --node M-K` for staged rollout).
 
 Replace `<image-name>`, `<category-name>`, `<source-archive>` throughout. Run on the BCM head node unless noted. Image build takes up to ~8.5 hrs — expected, do not interrupt.
@@ -93,10 +93,17 @@ mkdir -p /cm/images/<image-name>/etc/ntpsec
 cmsh -c "category use <category-name>; get disksetup"
 # if empty, set via cmsh (layout in session-summary.md §8.10) then commit
 
-# 2.3 Hostname finalize script
+# 2.3 Finalize script (one combined script per category)
 cmsh -c "category use <category-name>; get finalizescript"
-# expect finalize-hosts-127-v3.sh — if not set:
-cmsh -c "category use <category-name>; set finalizescript finalize-hosts-127-v3.sh; commit"
+# expect finalize-hosts-127-v7.sh — if not set:
+cmsh -c "category use <category-name>; set finalizescript finalize-hosts-127-v7.sh; commit"
+#   Part 1  127.0.1.1 <hostname> in /etc/hosts            (was v3)
+#   Part 2  LDAP detach + local cmsupport + service masks (v4) - nodes come up with
+#           nsswitch 'files' and a local cmsupport BY DESIGN (not the old 8.8 regression)
+#   Part 3  link-watch: provisioning NIC plugged in after boot gets its address and
+#           the node reconnects to BCM on its own (v5-v7)
+# Use v3 instead only for a category that must NOT be LDAP-detached - ask engineering.
+# Never run the finalize script by hand on a live node - it applies all three parts.
 
 # 2.4 Suppress known false-positive service monitor (mst)
 # mst is never a real systemd service on this fleet (confirmed fleet-wide) —
@@ -116,9 +123,15 @@ cmsh
 cmsh -c "category use <category-name>; set softwareimage <image-name>; commit"
 ```
 1. Assign the 18 nodes to the category.
-2. Set installmode `FULL`, reboot nodes (PXE/IPMI).
+2. Set installmode `FULL`, reboot nodes (PXE/IPMI). `FULL` is for bring-up only — see step 5.
 3. Watch status in `cmsh`/Base View.
 4. Run L11 partnerdiag once all 18 are up.
+5. **Once Section 4 verification has passed, reset the category off `FULL` before the rack is power-cycled again for any reason:**
+   ```bash
+   cmsh -c "category use <category-name>; set installmode AUTO; commit"   # or NOSYNC — agree which with engineering
+   cmsh -c "category use <category-name>; get installmode"
+   ```
+   Left at `FULL`, every reboot or AC power event with the cable connected wipes and reinstalls the node (Section 6). **Do not unplug the provisioning cable as a workaround** — reset `installmode` instead. This is a category commit: if a diag campaign is running on these nodes, re-run `./rack_lifecycle.sh pre-diag --rack <N>` afterwards.
 
 ### Peer-Provisioning (optional, recommended for a full 18-node rollout)
 
@@ -186,6 +199,13 @@ exit
 cmsh -c "softwareimage; list"
 ```
 Ignore the image's own `grub.cfg` — never used; BCM regenerates boot config per-node.
+
+Then on **one provisioned node** (finalize v5+ only), confirm the cable watcher landed and stayed quiet:
+```bash
+sed -n 2p /usr/local/sbin/link-watch.sh       # names the finalize version that installed it (expect v7)
+systemctl is-active link-watch                # active
+journalctl -t link-watch -b --no-pager        # expect: -- No entries --  (normal boot, cable in)
+```
 
 ---
 
@@ -255,13 +275,17 @@ Any error not covered here → pull the exact output, escalate. Don't guess — 
 | `ldap` health check PASS but `nslcd` log shows `Can't contact LDAP server` | Inconsistent signal — confirm `cmsupport` is genuinely LDAP-backed (not a local `/etc/passwd` fallback) before trusting `ldap: PASS`. |
 | `cmsupport` missing after handoff | Known bug, not yet root-caused — see Section 5.2. Always verify with `status`, don't assume it worked. |
 | `/swap.img` bloats image ~8GB | Known, cosmetic/storage only. |
+| `cuda-dcgm` health check FAILs on `maxQ-1032-doca350` nodes even though `cuda-dcgm` monitoring is already `no`/`no` in `services` | The daemon isn't in the `baseos-1032-doca350` image, and finalize v4+ masks it anyway. The failing item is a separate health check, not service monitoring. Escalate — engineering decides whether to install `cuda-dcgm` (1.3a) or exclude the health check for the category. |
+| Network boot tries a BlueField-3 port first (`UEFI PXEv4 (MAC:DC73…)` at the top of the boot menu) | Seen on `sn267548730002`. Boot-order / option-ROM change needs sign-off — escalate, don't change it on the floor. |
+| A handed-off node is reinstalled | The node-installer rewrites `/etc/systemd/resolved.conf` on every install, so `handoff`'s DNS fix is lost. Re-run `handoff` (it is idempotent) or escalate. |
+| BMC login is still the default `root` / `0penBmc` | Anyone on the BMC network can mount an ISO (virtual media) and boot a node from it. Security owner to decide — don't change BMC settings on the floor. |
 
 **⚠️ Leftover category `installmode=FULL` reinstalls a whole rack on a plain power cycle — not just an explicit trigger. `pxelabel=localdrive` gives NO protection against this.** Confirmed 2026-09-30: a rack08 category still set to `installmode=FULL` from the original build pass (SOP §3) reinstalled 15/18 nodes from nothing more than a **plain AC power off/on** — no `pxe_rack_provision.sh` call, no manual PXE override, no explicit trigger of any kind. `pxelabel=localdrive` was set on every node at the time and made no difference at all. Check and verify:
 ```bash
 cmsh -c "device foreach -g <group> (get installmode)"          # per-node override, if any
 cmsh -c "category use <category-name>; get installmode"        # the real default most nodes inherit
 ```
-**If a category shows `FULL` after Section 4 verification has passed, reset it** (to `AUTO`, `NOSYNC`, or whatever your intended steady-state behavior is) **before the rack is power-cycled again for any reason** — including a routine AC power event, not just a deliberate reinstall command. Do not treat `pxelabel=localdrive` as protection here; it has no observed effect on this behavior. See Engineering Manual §6.5 for the full investigation, including the earlier (wrong) `pxelabel`-based theory this superseded.
+**If a category shows `FULL` after Section 4 verification has passed, reset it** (to `AUTO`, `NOSYNC`, or whatever your intended steady-state behavior is) **before the rack is power-cycled again for any reason** — including a routine AC power event, not just a deliberate reinstall command. Do not treat `pxelabel=localdrive` as protection here; it has no observed effect on this behavior. See Engineering Manual §6.6 for the full investigation, including the earlier (wrong) `pxelabel`-based theory this superseded. **Recurred 2026-11-12 on `maxQ-1032-doca350`** — operators were unplugging the provisioning cable before reboots to avoid it. Don't: reset `installmode` (Section 3 step 5). Unplugging leaves the node without an address on older finalize versions (see Section 7).
 
 ## 7. Known-Acceptable (do not re-investigate)
 
@@ -277,6 +301,12 @@ cmsh -c "category use <category-name>; get installmode"        # the real defaul
 | `mst died`/`not restarted` in event log | Fleet-wide, pre-existing — no real `mst.service` has ever existed on any rack. Suppress via 2.4, don't chase it further. |
 | `cuda-dcgm died`/crash loop right after fresh provisioning | Check if it clears within ~1-2 min on its own (stale health-check snapshot mid-startup) before assuming it's a real failure — confirm with a fresh `device latesthealthdata <node>` read. |
 | Freshly-reinstalled node's SSH host key mismatch warning | Expected — every reinstall regenerates host keys. `ssh-keygen -R <hostname>` before first connect. |
+| Provisioning cable plugged in after the node booted | Finalize v5+: `link-watch` runs `ifup` and restarts `cmd`; node is `UP` within ~15–45 s. Check `journalctl -t link-watch`. On a node **without** it: run `ifup enP5p9s0` then `systemctl restart cmd` on the node (from the BMC console). |
+| Node `[ DOWN ], pingable` right after its cable was moved or re-plugged | Normal for up to ~30 s on v7 while `link-watch` restarts `cmd`. If it persists, check `journalctl -t link-watch`, then escalate. |
+| `link-watch` logs `cmd restart pending ... 'master' not reachable` | Expected when the cable is on a non-BCM network (e.g. office); it restarts `cmd` once back on BCM. |
+| Need to `ifdown` the provisioning NIC on purpose | Run `systemctl stop link-watch` first — otherwise it brings the NIC back up within ~15–30 s. |
+| `/etc/netplan/50-cloud-init.yaml` on a node; `Dropped protocol specifier '.dhcp'` or `ifup: waiting for lock` in the journal | Harmless. Nodes use BCM's ifupdown config; the netplan file is inert. |
+| `enx<MAC>` interface down with no IP; PXE/HTTP boot entries for that MAC | The BMC's virtual USB network link — not a real network. Don't pick those entries in the boot menu. |
 
 ---
 
