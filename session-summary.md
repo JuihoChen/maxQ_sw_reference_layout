@@ -2031,7 +2031,7 @@ It changes nothing in BCM's config, does nothing while the NIC is healthy, never
 
 **Rollout steps used:** copy the script to the finalize directory, `chmod 755`, `bash -n`; set `finalizescript` on the **node** first (`device use <node>; set finalizescript ...; commit` — device-level, avoiding a category commit); reinstall the node; check `/var/log/node-installer` for the `link-watch` lines and `sed -n 2p /usr/local/sbin/link-watch.sh` for the version.
 
-**Not yet run on a real node with v7:** boot with the cable out, then plug in. Same code path as v5 plus the `master` check; passed in simulation.
+**Boot with the cable out, then plug in, on v7:** passed 2026-11-16 — see 11j.
 
 **Known side effect:** a deliberate `ifdown enP5p9s0` while the cable is connected gets undone within ~15-30s — run `systemctl stop link-watch` first.
 
@@ -2068,10 +2068,50 @@ It changes nothing in BCM's config, does nothing while the NIC is healthy, never
 
 1. **Move `maxQ-1032-doca350` off `installmode FULL`** (AUTO or NOSYNC); check `maxQ-1014-doca321` too. Re-run `pre-diag` afterwards if a diag campaign is active.
 2. **Roll v7 out to the category:** `category use maxQ-1032-doca350; set finalizescript finalize-hosts-127-v7.sh; commit`, then `clear finalizescript` on `sn267548730002` so it follows the category. Other nodes pick it up at their next install.
-3. **Run the one untested v7 case on a real node:** boot with the cable out, plug in later.
+3. ~~Run the one untested v7 case on a real node: boot with the cable out, plug in later.~~ **Done 2026-11-16, passed — 11j.**
 4. **Dry-run `imageupdate -n sn267548730002`** to see whether a live sync would delete the `link-watch` files (decides whether `excludelistupdate` needs them).
 5. **Disable the `cuda-dcgm` health check** for this category in the monitoring setup, or add `cuda-dcgm` to the image — decide which.
 6. **Update the SOP:** finalize script v3 → v7; the `nsswitch` check under v4+; a known-issue line — "provisioning NIC plugged in after boot → `link-watch` (finalize Part 3) runs `ifup` and restarts `cmd`; check `journalctl -t link-watch`".
 7. **Raise the BF3-first PXE boot entry** with whoever owns BIOS settings; check `efibootmgr -v` on the other nodes.
 8. **Raise the BMC default-credential / virtual-media exposure** with platform security.
 9. **Optional:** ask NVIDIA BCM support the 11f question (supported network daemon on Ubuntu nodes).
+
+### 11j. 2026-11-16 — v7 cable-out-at-boot test passed; head node is slow to mark such a node UP
+
+The last untested `link-watch` path, run on the real node with v7 (`finalize-hosts-127-v7.sh`, installed 2026-11-13 17:07).
+
+**Procedure:**
+1. Confirmed `sed -n 2p /usr/local/sbin/link-watch.sh` → v7, with the BMC SOL console open.
+2. With the provisioning RJ45 unplugged (`enP5p9s0: NO-CARRIER`), ran `reboot`. Network boot failed with no cable, the firmware fell through to `Ubuntu`, and the node booted its existing OS — no reinstall, because the node never reached BCM, despite the category being `installmode FULL`.
+3. At the login prompt: no IPv4 on `enP5p9s0`, `journalctl -t link-watch -b` → `-- No entries --`.
+4. Plugged the cable into the BCM switch.
+
+**Result:**
+```
+08:48:27  link-watch: enP5p9s0 has carrier but no IPv4 - running ifup
+08:48:38  link-watch: enP5p9s0: ifup succeeded
+08:48:38  link-watch: restarted cmd (after recovery ifup) so the head node reconnects
+08:48:40  cmd.service active (running)          (systemctl status; "No jobs running")
+08:48:39  cmd: CMDaemon::Connect ... https://10.141.255.254:8081
+08:48:42  head node: Synchronizing CA to sn267548730002 ...
+08:48:43  cmd: Session for sn267548730002 ... on https://master:8081
+inet 10.141.168.101/16 ... dynamic  (valid_lft 86372s)
+```
+Head node: `[ DOWN ], health check failed, pingable` at ~08:50, then `[ UP ], health check failed` by 08:57. The remaining `health check failed` is the separate `cuda-dcgm` item (11h). **No manual step was needed. Passed.**
+
+**Observations:**
+- **The node side was done in ~16 s** (carrier seen → `cmd` session registered). The 2–8 min until `[ UP ]` is on the head node's side. It apparently re-checks a node that has been DOWN since boot only periodically. This is inferred from timing, not confirmed — no BCM interval was found. On the 11-13 move test (node away only ~2.5 min), `[ UP ]` followed within seconds of the `cmd` restart. The exact UP moment wasn't captured: `cmsh -c "device; events"` returned nothing, and neither `/var/log/cmdaemon` nor the head's `cmd` journal logged the state change. **Next time, keep a `cmsh` session open in `device` mode — it prints the `[ UP ]` notice with a timestamp.**
+- **`Register node session with a bad node key: 00000000-0000-0000-0000-000000000000`** (node `cmd` journal) looked suspicious, but it is also present at 2026-11-13 17:59:19, on the reconnect that came UP within seconds. **Routine, not a fault.**
+- `DCGM: failed to connect` every ~60 s in the node's `cmd` log is expected: the `cuda-dcgm` daemon isn't in this image (11h).
+- `/var/log/cmdaemon` on the head node also contains the **node's own** `cmd` messages (forwarded via syslog), so a grep there for a node name shows node-side lines, not the head node's decisions.
+- Login banner on the node offers `do-release-upgrade` to 26.04 and "197 updates". **Do not apply** — the nodes run a pinned kernel/DOCA stack; image changes go through the build pipeline.
+
+**Status: all `link-watch` paths are now tested on a real node with v7:**
+
+| Path | Tested |
+|---|---|
+| Cable out at boot, plug in later | 2026-11-16 (this entry) |
+| Normal boot with cable in (silent) | 2026-11-13 |
+| BCM → office → BCM (pending restart on office, restart back on BCM) | 2026-11-13 |
+
+11g's code is unchanged; only the v7 header's test-results comment was updated with this run.

@@ -545,8 +545,18 @@ fi
 #   - Parts 1 and 2 verified identical to v4 (code diff + identical results
 #     on a test /localdisk); on the node: 127.0.1.1 line, local cmsupport,
 #     nsswitch files-only, nslcd masked - all present.
-#   Not yet run on a real node with v7: boot-with-cable-out (same code path
-#   as v5 plus the master check; passed in simulation).
+#   - Boot with cable out, plug in later (v7, 2026-11-16):
+#       08:48:27 has carrier but no IPv4 - running ifup
+#       08:48:38 ifup succeeded -> restarted cmd (after recovery ifup)
+#       08:48:40 cmd active; 08:48:43 cmd session to master registered
+#       node [ UP ] in cmsh at some point between 08:50 and 08:57 - the
+#       delay is on the head node's side (it re-checks a node that has been
+#       DOWN since boot only periodically - inferred, interval not
+#       confirmed); nothing further the node can do. No manual step needed.
+#   - cmd's "Register node session with a bad node key: 00000000-..."
+#     warning appears on every successful reconnect too (also 2026-11-13
+#     17:59:19) - routine, not a fault.
+#   All watcher paths now tested on the real node with v7.
 #
 # OPERATIONS
 #   Check:    systemctl is-active link-watch; journalctl -t link-watch -b

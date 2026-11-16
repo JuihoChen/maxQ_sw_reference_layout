@@ -793,7 +793,10 @@ It never touches BCM's config, does nothing while healthy, never restarts `cmd` 
 | v6 (11-13) | + restart on address change | BCM→office→BCM worked unaided but slowly: useless ~95 s restart on the office network (loop blocked), ~70 s to cmd up after moving back. |
 | v7 (11-13) | restart deferred until `master` reachable; non-blocking | BCM→office→BCM: `17:56:40` change → `17:56:42` "restart pending: 'master' not reachable" (none done); `17:59:11` back → cmd active `17:59:17` (~6 s) → UP. Normal boot: silent. |
 
-**Not yet run on a real node with v7:** boot with the cable out, then plug in. Same path as v5 plus the `master` check; passed in simulation.
+**v7, boot with the cable out, plug in later — passed 2026-11-16** (log §11j): `08:48:27` carrier, no IPv4 → `ifup` → `08:48:38` `ifup succeeded` → `restarted cmd (after recovery ifup)` → `cmd` active `08:48:40`, session to `master` registered `08:48:43`. The node showed `[ DOWN ], pingable` until somewhere between 08:50 and 08:57, then `[ UP ]` with no manual step.
+- **The delay is on the head node's side:** it appears to re-check a node that has been DOWN since boot only periodically (inferred from timing; BCM's interval not confirmed). On the 11-13 move test, where the node had only been away briefly, UP followed within seconds.
+- **`Register node session with a bad node key: 00000000-…` in the node's `cmd` journal is routine:** it is also present on the 11-13 reconnect that came UP at once.
+- **All watcher paths are now tested on a real node with v7.**
 
 **Operations:**
 - **Check:** `systemctl is-active link-watch`; `journalctl -t link-watch -b`; `sed -n 2p /usr/local/sbin/link-watch.sh` (shows the version).
@@ -950,7 +953,7 @@ This briefly cleared the symptom (`gpu_health_nvlink gpu0-3` all showed `PASS` i
 16. **`gpu_health_overall` FAIL despite all per-GPU sub-checks PASS** on at least one node (`rack01node01`) — cause unknown, not investigated. **Reproduced repeatedly since** (widely, 13-18 of 18 nodes on multiple rack01 runs, §5.6/§8.3) including on `rack01node11` even after its underlying GPU2 NVLink fault was cleared — still unexplained, but confirmed not simply a stale/cached sample (`systemctl restart cmd` forces a fresh check and the mismatch persists).
 17. **`finalize` subcommand of `rack_lifecycle.sh` — deliberately unimplemented**, pending a decision on what "production-ready" actually means for a handed-off node (rejoin BCM, or move to a separate production network keeping the off-cluster fixes).
 18. **`maxQ-1032-doca350` still `installmode FULL`** — reset to AUTO/NOSYNC (re-run `pre-diag` afterwards if a diag campaign is active, §4.4); check `maxQ-1014-doca321` too. §6.6.
-19. **Roll finalize v7 out to `maxQ-1032-doca350`** and `clear finalizescript` on `sn267548730002` so it follows the category; **run the one untested v7 case** (boot with cable out, plug in later) on a real node; dry-run `imageupdate -n <node>` to decide the `excludelistupdate` question. §6.7.
+19. **Roll finalize v7 out to `maxQ-1032-doca350`** and `clear finalizescript` on `sn267548730002` so it follows the category; dry-run `imageupdate -n <node>` to decide the `excludelistupdate` question. (All v7 watcher paths now tested on a real node — 2026-11-16.) §6.7.
 20. **`cuda-dcgm` on `baseos-1032-doca350`** — daemon missing from the image; the health check still fails with service monitoring already off. Decide: install it (SOP 1.3a) or exclude the health check for categories where finalize masks it. §4.7.
 21. **BF3 port 2 now a PXE boot option, ranked first** on `sn267548730002` — needs an owner for BIOS/boot-order settings; check other nodes. §6.8.
 22. **BMC default credentials + virtual media** — security exposure, needs an owner. §6.9.
@@ -991,7 +994,8 @@ This briefly cleared the symptom (`gpu_health_nvlink gpu0-3` all showed `PASS` i
 | A `provisioningslots` value of literal `0` on any provisioning pool member (including via a stale, never-unassigned role) | **Not acceptable — stalls the whole scheduler.** It finds providers (`cache size: N` includes the 0-slot node) but then dispatches nothing (`active requests: 0`) and sleeps ~2hrs. Set to `1` or fully `unassign` the role instead; a head node cannot fully unassign its own role, so `1` is its practical floor. §5.6. |
 | Provisioning NIC plugged in after boot; `journalctl -t link-watch` shows `has carrier but no IPv4 - running ifup` → `ifup succeeded` → `restarted cmd` | Expected on finalize v5+ — the watcher recovering the node. Up within ~15–45 s. §6.7. |
 | `link-watch` logs `cmd restart pending ... head node 'master' not reachable` | Expected (v7) when the NIC is on a non-BCM network; the restart happens once it's back on BCM. §6.7. |
-| Node `[ DOWN ], pingable` right after its provisioning NIC regained or changed address | Expected for up to ~30 s on v7 while `link-watch` restarts `cmd`. On a node **without** v5+, run `systemctl restart cmd` on the node. §6.7. |
+| Node `[ DOWN ], pingable` right after its provisioning NIC regained or changed address | Expected on v7 while `link-watch` restarts `cmd`: seconds after a brief absence, but **several minutes (seen: 2–8 min) after a boot with the cable out**, while the head node gets round to re-checking it. Check `journalctl -t link-watch` shows `restarted cmd`, then wait. On a node **without** v5+, run `systemctl restart cmd` on the node. §6.7. |
+| `Register node session with a bad node key: 00000000-…` in a node's `cmd` journal | Routine on every reconnect, including successful ones. Not a fault. §6.7. |
 | `/etc/netplan/50-cloud-init.yaml` present on a node | Inert — no netplan backend runs (`systemd-networkd`/NetworkManager inactive); BCM's ifupdown config is what applies. §6.7. |
 | `ifup: waiting for lock on /run/network/ifstate.<if>` in the boot journal | Two ifupdown runs (`ifup@<if>` and `networking.service`) colliding at boot — not netplan, not harmful. §6.7. |
 | `Dropped protocol specifier '.dhcp' from '<if>.dhcp'` after `ifup` | Harmless — `dhcpcd`'s DNS hook handing DNS to `systemd-resolved`. §6.7. |
